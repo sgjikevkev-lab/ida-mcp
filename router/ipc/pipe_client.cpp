@@ -41,7 +41,13 @@ namespace ipc {
             }
 
             DWORD err = GetLastError();
-            if (err != ERROR_PIPE_BUSY && err != ERROR_FILE_NOT_FOUND) {
+            bool is_transient = (err == ERROR_PIPE_BUSY ||
+                                 err == ERROR_FILE_NOT_FOUND ||
+                                 err == ERROR_ACCESS_DENIED ||
+                                 err == ERROR_BROKEN_PIPE ||
+                                 err == ERROR_BAD_NETPATH ||
+                                 err == ERROR_PIPE_NOT_CONNECTED);
+            if (!is_transient) {
                 return false;
             }
 
@@ -50,16 +56,14 @@ namespace ipc {
                 return false;
             }
 
-            if (err == ERROR_FILE_NOT_FOUND) {
+            if (err != ERROR_PIPE_BUSY) {
                 Sleep(20);
                 continue;
             }
 
-            DWORD wait_chunk = std::min<DWORD>(timeout_ms - elapsed, 500);
+            DWORD wait_chunk = std::min<DWORD>(timeout_ms - elapsed, 200);
             if (!WaitNamedPipeW(pipe_name.c_str(), wait_chunk)) {
-                if (GetLastError() != ERROR_SEM_TIMEOUT) {
-                    Sleep(20);
-                }
+                Sleep(20);
             }
         }
     }

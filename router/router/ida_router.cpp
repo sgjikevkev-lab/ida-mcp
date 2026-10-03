@@ -4,19 +4,30 @@
 #include "shared/ida_tools_schema.h"
 #include <chrono>
 #include <cmath>
+#include <filesystem>
 
 namespace router {
     void IdaRouter::RefreshInstances() {
         std::string cur = active_file_;
-        active_client_.Disconnect();
-        instances_ = ida::InstanceDiscovery::Discover();
-        if (instances_.empty() || (!cur.empty() && instances_.find(cur) == instances_.end())) {
-            active_file_.clear();
-        } else if (!cur.empty() && instances_.find(cur) != instances_.end()) {
+        std::wstring active_pipe = active_client_.IsConnected() ? active_client_.GetCurrentPipe() : L"";
+
+        instances_ = ida::InstanceDiscovery::Discover(active_pipe, &active_client_);
+
+        if (!cur.empty() && instances_.find(cur) != instances_.end()) {
             active_file_ = cur;
-        }
-        if (active_file_.empty() && instances_.size() == 1) {
+        } else if (!instances_.empty()) {
             active_file_ = instances_.begin()->first;
+        } else {
+            active_file_.clear();
+            active_client_.Disconnect();
+        }
+
+        if (!active_file_.empty()) {
+            const auto& target_pipe = instances_[active_file_].pipe_name;
+            if (!active_client_.IsConnected() || active_client_.GetCurrentPipe() != target_pipe) {
+                active_client_.Disconnect();
+                active_client_.Connect(target_pipe, 3000);
+            }
         }
     }
 
@@ -80,6 +91,10 @@ namespace router {
             busy_now = is_busy_;
         }
 
+        if (!busy_now && (active_file_.empty() || instances_.find(active_file_) == instances_.end())) {
+            RefreshInstances();
+        }
+
         if (!busy_now && !active_file_.empty() && instances_.find(active_file_) != instances_.end()) {
             const auto& inst = instances_[active_file_];
             if (active_client_.Connect(inst.pipe_name, 2000)) {
@@ -122,8 +137,16 @@ namespace router {
         }
 
         mcp::json files_arr = mcp::json::array();
+        mcp::json instances_arr = mcp::json::array();
         for (const auto& kv : instances_) {
             files_arr.push_back(kv.first);
+            instances_arr.push_back({
+                {"name", kv.first},
+                {"pid", kv.second.pid},
+                {"idb_path", kv.second.idb_path},
+                {"backend", kv.second.backend},
+                {"is_active", (kv.first == active_file_)}
+            });
         }
         auto t1 = std::chrono::steady_clock::now();
         double elapsed_sec = std::round(std::chrono::duration<double>(t1 - t0).count() * 1000.0) / 1000.0;
@@ -133,6 +156,7 @@ namespace router {
             {"active_file", active_file_.empty() ? nullptr : mcp::json(active_file_)},
             {"count", instances_.size()},
             {"files", files_arr},
+            {"instances", instances_arr},
             {"elapsed_sec", elapsed_sec}
         };
         mcp::StdioTransport::Send(mcp::MakeSuccessResponse(id, mcp::MakeToolCallResult(res.dump(2))));
@@ -160,17 +184,69 @@ namespace router {
 
         RefreshInstances();
 
+        // Smart matching:
+        // 1. Exact key match
+        std::string matched_key;
+        if (instances_.find(target) != instances_.end()) {
+            matched_key = target;
+        } else {
+            // 2. Case-insensitive key match
+            for (const auto& kv : instances_) {
+                if (_stricmp(kv.first.c_str(), target.c_str()) == 0) {
+                    matched_key = kv.first;
+                    break;
+                }
+            }
+            // 3. Match by PID
+            if (matched_key.empty()) {
+                for (const auto& kv : instances_) {
+                    if (std::to_string(kv.second.pid) == target) {
+                        matched_key = kv.first;
+                        break;
+                    }
+                }
+            }
+            // 4. Match stem without extension (e.g. "server" -> "server.dll")
+            if (matched_key.empty()) {
+                for (const auto& kv : instances_) {
+                    auto dot = kv.first.rfind('.');
+                    std::string stem = (dot != std::string::npos) ? kv.first.substr(0, dot) : kv.first;
+                    if (_stricmp(stem.c_str(), target.c_str()) == 0) {
+                        matched_key = kv.first;
+                        break;
+                    }
+                }
+            }
+            // 5. Match by IDB filename
+            if (matched_key.empty()) {
+                for (const auto& kv : instances_) {
+                    if (!kv.second.idb_path.empty()) {
+                        std::string idb_file = std::filesystem::path(kv.second.idb_path).filename().string();
+                        if (_stricmp(idb_file.c_str(), target.c_str()) == 0) {
+                            matched_key = kv.first;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         auto t1 = std::chrono::steady_clock::now();
         double elapsed_sec = std::round(std::chrono::duration<double>(t1 - t0).count() * 1000.0) / 1000.0;
 
-        if (instances_.find(target) != instances_.end()) {
-            active_client_.Disconnect();
-            active_file_ = target;
-            active_client_.Connect(instances_[target].pipe_name, 3000);
+        if (!matched_key.empty()) {
+            if (active_file_ != matched_key || !active_client_.IsConnected()) {
+                active_client_.Disconnect();
+                active_file_ = matched_key;
+                active_client_.Connect(instances_[matched_key].pipe_name, 3000);
+            }
 
+            const auto& inst = instances_[matched_key];
             mcp::json res = {
                 {"status", "success"},
-                {"active_file", target},
+                {"active_file", matched_key},
+                {"pid", inst.pid},
+                {"idb_path", inst.idb_path},
                 {"elapsed_sec", elapsed_sec}
             };
             mcp::StdioTransport::Send(mcp::MakeSuccessResponse(
@@ -340,6 +416,7 @@ namespace router {
                 if (ida::InstanceDiscovery::IsPidAlive(inst.pid)) {
                     res["active_file"] = active_file_;
                     res["pid"] = inst.pid;
+                    res["idb_path"] = inst.idb_path;
                     res["message"] = "idle";
                 } else {
                     active_client_.Disconnect();
@@ -481,6 +558,7 @@ namespace router {
     }
 
     void IdaRouter::Run() {
+        RefreshInstances();
         mcp::StdioTransport::RunLoop([this](const std::string& line) {
             ProcessMessage(line);
         });
