@@ -357,7 +357,8 @@ namespace mcp {
                     "properties": {
                         "pattern": {"type": "string", "description": "Class name pattern filter with optional wildcards (e.g. '*Camera*')"},
                         "cursor": {"type": "string", "description": "Cursor for pagination from previous next_cursor"},
-                        "count": {"type": "integer", "description": "Max classes to return (default 50)"}
+                        "count": {"type": "integer", "description": "Max classes to return (default 50)"},
+                        "refresh": {"type": "boolean", "description": "Force cache invalidation and fresh scan of RTTI structures"}
                     }
                 }
             },
@@ -367,9 +368,18 @@ namespace mcp {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "name": {"type": "string", "description": "Class name (mangled or demangled like 'std::exception') or vtable address (hex '0x143bf9b80')"}
+                        "name": {"type": "string", "description": "Class name (mangled or demangled like 'std::exception') or vtable address (hex '0x143bf9b80')"},
+                        "refresh": {"type": "boolean", "description": "Force cache invalidation and fresh scan of RTTI structures"}
                     },
                     "required": ["name"]
+                }
+            },
+            {
+                "name": "rtti_refresh",
+                "description": "Explicitly invalidate and rebuild the MSVC RTTI cache after new structures or names have been discovered by IDA auto-analysis.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
                 }
             },
             {

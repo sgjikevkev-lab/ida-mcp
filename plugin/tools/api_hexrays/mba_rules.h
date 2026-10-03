@@ -162,84 +162,84 @@ namespace tools::hexrays_ast {
             {
                 19,
                 "MBA Neg: (x ^ -1) + 1 => -x",
-                nlohmann::json::parse(R"({"op": "cot_add", "x": {"op": "cot_xor", "x": "$x", "y": {"op": "cot_num"}}, "y": {"op": "cot_num", "value": 1}})"),
+                nlohmann::json::parse(R"({"op": "cot_add", "x": {"op": "cot_xor", "x": "$x", "y": {"op": "cot_num", "value": -1}}, "y": {"op": "cot_num", "value": 1}})"),
                 [](const auto& b) { return "-" + ExtractBindingName(b.at("$x")); },
                 [](uint8_t x, uint8_t) { return uint8_t((x ^ 0xFF) + 1) == uint8_t(-x); }
             },
             {
                 20,
                 "MBA Xor: (x | y) - (x & y) => x ^ y",
-                nlohmann::json::parse(R"({"op": "cot_sub", "x": {"op": "cot_bor", "x": "$x", "y": "$y"}, "y": {"op": "cot_band", "x": "$x", "y": "$y"}})"),
+                nlohmann::json::parse(R"({"op": "cot_sub", "x": {"op": "cot_bor", "x": "$x", "y": "$y"}, "y": {"op": "cot_band", "x": "$x", "y": "$y"}})") ,
                 [](const auto& b) { return ExtractBindingName(b.at("$x")) + " ^ " + ExtractBindingName(b.at("$y")); },
                 [](uint8_t x, uint8_t y) { return uint8_t((x | y) - (x & y)) == uint8_t(x ^ y); }
             },
             {
                 21,
                 "Identity XOR: x ^ 0 => x",
-                nlohmann::json::parse(R"({"op": "cot_xor", "x": "$x", "y": {"op": "cot_num", "value": 0}})"),
+                nlohmann::json::parse(R"({"op": "cot_xor", "x": "$x", "y": {"op": "cot_num", "value": 0}})") ,
                 [](const auto& b) { return ExtractBindingName(b.at("$x")); },
                 [](uint8_t x, uint8_t) { return uint8_t(x ^ 0) == x; }
             },
             {
                 22,
                 "Identity AND: x & -1 => x",
-                nlohmann::json::parse(R"({"op": "cot_band", "x": "$x", "y": {"op": "cot_num"}})"),
+                nlohmann::json::parse(R"({"op": "cot_band", "x": "$x", "y": {"op": "cot_num", "value": -1}})") ,
                 [](const auto& b) { return ExtractBindingName(b.at("$x")); },
                 [](uint8_t x, uint8_t) { return uint8_t(x & 0xFF) == x; }
             },
             {
                 23,
                 "Identity OR: x | 0 => x",
-                nlohmann::json::parse(R"({"op": "cot_bor", "x": "$x", "y": {"op": "cot_num", "value": 0}})"),
+                nlohmann::json::parse(R"({"op": "cot_bor", "x": "$x", "y": {"op": "cot_num", "value": 0}})") ,
                 [](const auto& b) { return ExtractBindingName(b.at("$x")); },
                 [](uint8_t x, uint8_t) { return uint8_t(x | 0) == x; }
             },
             {
                 24,
                 "Annihilation AND: x & 0 => 0",
-                nlohmann::json::parse(R"({"op": "cot_band", "x": "$x", "y": {"op": "cot_num", "value": 0}})"),
+                nlohmann::json::parse(R"({"op": "cot_band", "x": "$x", "y": {"op": "cot_num", "value": 0}})") ,
                 [](const auto&) { return "0"; },
                 [](uint8_t x, uint8_t) { return uint8_t(x & 0) == 0; }
             },
             {
                 25,
                 "Double NOT: ~~x => x",
-                nlohmann::json::parse(R"({"op": "cot_bnot", "x": {"op": "cot_bnot", "x": "$x"}})"),
+                nlohmann::json::parse(R"({"op": "cot_bnot", "x": {"op": "cot_bnot", "x": "$x"}})") ,
                 [](const auto& b) { return ExtractBindingName(b.at("$x")); },
                 [](uint8_t x, uint8_t) { return uint8_t(~~x) == x; }
             },
             {
                 26,
                 "Complement Sub: x - x => 0",
-                nlohmann::json::parse(R"({"op": "cot_sub", "x": "$x", "y": "$x"})"),
+                nlohmann::json::parse(R"({"op": "cot_sub", "x": "$x", "y": "$x"}})") ,
                 [](const auto&) { return "0"; },
                 [](uint8_t x, uint8_t) { return uint8_t(x - x) == 0; }
             },
             {
                 27,
                 "MBA Neg: ~(x - 1) => -x",
-                nlohmann::json::parse(R"({"op": "cot_bnot", "x": {"op": "cot_sub", "x": "$x", "y": {"op": "cot_num", "value": 1}}})"),
+                nlohmann::json::parse(R"({"op": "cot_bnot", "x": {"op": "cot_sub", "x": "$x", "y": {"op": "cot_num", "value": 1}}})") ,
                 [](const auto& b) { return "-" + ExtractBindingName(b.at("$x")); },
                 [](uint8_t x, uint8_t) { return uint8_t(~(x - 1)) == uint8_t(-x); }
             },
             {
                 28,
                 "Distribute AND: (x & z) | (y & z) => (x | y) & z",
-                nlohmann::json::parse(R"({"op": "cot_bor", "x": {"op": "cot_band", "x": "$x", "y": "$z"}, "y": {"op": "cot_band", "x": "$y", "y": "$z"}})"),
+                nlohmann::json::parse(R"({"op": "cot_bor", "x": {"op": "cot_band", "x": "$x", "y": "$z"}, "y": {"op": "cot_band", "x": "$y", "y": "$z"}})") ,
                 [](const auto& b) { return "(" + ExtractBindingName(b.at("$x")) + " | " + ExtractBindingName(b.at("$y")) + ") & " + ExtractBindingName(b.at("$z")); },
                 [](uint8_t, uint8_t) { return true; } // structural rule, verified by pattern match
             },
             {
                 29,
                 "Distribute OR: (x | z) & (y | z) => (x & y) | z",
-                nlohmann::json::parse(R"({"op": "cot_band", "x": {"op": "cot_bor", "x": "$x", "y": "$z"}, "y": {"op": "cot_bor", "x": "$y", "y": "$z"}})"),
+                nlohmann::json::parse(R"({"op": "cot_band", "x": {"op": "cot_bor", "x": "$x", "y": "$z"}, "y": {"op": "cot_bor", "x": "$y", "y": "$z"}})") ,
                 [](const auto& b) { return "(" + ExtractBindingName(b.at("$x")) + " & " + ExtractBindingName(b.at("$y")) + ") | " + ExtractBindingName(b.at("$z")); },
                 [](uint8_t, uint8_t) { return true; }
             },
             {
                 30,
                 "MBA Sub: x + y*(-1) => x - y",
-                nlohmann::json::parse(R"({"op": "cot_add", "x": "$x", "y": {"op": "cot_mul", "x": "$y", "y": {"op": "cot_num"}}})"),
+                nlohmann::json::parse(R"({"op": "cot_add", "x": "$x", "y": {"op": "cot_mul", "x": "$y", "y": {"op": "cot_num", "value": -1}}})"),
                 [](const auto& b) { return ExtractBindingName(b.at("$x")) + " - " + ExtractBindingName(b.at("$y")); },
                 [](uint8_t, uint8_t) { return true; }
             },
@@ -296,6 +296,12 @@ namespace tools::hexrays_ast {
         return kRules;
     }
 
+    inline int64_t SignExtend(uint64_t val, int byte_size) {
+        if (byte_size <= 0 || byte_size >= 8) return static_cast<int64_t>(val);
+        int shift = 64 - (byte_size * 8);
+        return (static_cast<int64_t>(val << shift)) >> shift;
+    }
+
     // === Constant Folding Engine ===
     // Try to evaluate a pure-constant expression to a single value.
     inline std::optional<uint64_t> TryConstFold(const cexpr_t* expr) {
@@ -314,7 +320,11 @@ namespace tools::hexrays_ast {
         // Unary: -x
         if (expr->op == cot_neg && expr->x) {
             auto v = TryConstFold(expr->x);
-            if (v) return static_cast<uint64_t>(-static_cast<int64_t>(*v));
+            if (v) {
+                int x_sz = expr->x ? expr->x->type.get_size() : expr->type.get_size();
+                int64_t sv = SignExtend(*v, x_sz);
+                return static_cast<uint64_t>(-sv);
+            }
         }
 
         // Unary: !x
@@ -337,6 +347,11 @@ namespace tools::hexrays_ast {
             auto r = TryConstFold(expr->y);
             if (!l || !r) return std::nullopt;
 
+            int l_sz = expr->x ? expr->x->type.get_size() : expr->type.get_size();
+            int r_sz = expr->y ? expr->y->type.get_size() : expr->type.get_size();
+            int64_t sl = SignExtend(*l, l_sz);
+            int64_t sr = SignExtend(*r, r_sz);
+
             switch (expr->op) {
                 case cot_add:  return *l + *r;
                 case cot_sub:  return *l - *r;
@@ -345,17 +360,17 @@ namespace tools::hexrays_ast {
                 case cot_bor:  return *l | *r;
                 case cot_xor:  return *l ^ *r;
                 case cot_shl:  return *l << (*r & 63);
-                case cot_sshr: return static_cast<uint64_t>(static_cast<int64_t>(*l) >> (*r & 63));
+                case cot_sshr: return static_cast<uint64_t>(sl >> (*r & 63));
                 case cot_ushr: return *l >> (*r & 63);
                 case cot_eq:   return (*l == *r) ? 1 : 0;
                 case cot_ne:   return (*l != *r) ? 1 : 0;
-                case cot_slt:  return (static_cast<int64_t>(*l) < static_cast<int64_t>(*r)) ? 1 : 0;
+                case cot_slt:  return (sl < sr) ? 1 : 0;
                 case cot_ult:  return (*l < *r) ? 1 : 0;
-                case cot_sle:  return (static_cast<int64_t>(*l) <= static_cast<int64_t>(*r)) ? 1 : 0;
+                case cot_sle:  return (sl <= sr) ? 1 : 0;
                 case cot_ule:  return (*l <= *r) ? 1 : 0;
-                case cot_sgt:  return (static_cast<int64_t>(*l) > static_cast<int64_t>(*r)) ? 1 : 0;
+                case cot_sgt:  return (sl > sr) ? 1 : 0;
                 case cot_ugt:  return (*l > *r) ? 1 : 0;
-                case cot_sge:  return (static_cast<int64_t>(*l) >= static_cast<int64_t>(*r)) ? 1 : 0;
+                case cot_sge:  return (sl >= sr) ? 1 : 0;
                 case cot_uge:  return (*l >= *r) ? 1 : 0;
                 case cot_land: return (*l != 0 && *r != 0) ? 1 : 0;
                 case cot_lor:  return (*l != 0 || *r != 0) ? 1 : 0;
@@ -371,7 +386,7 @@ namespace tools::hexrays_ast {
     // to verify if the expression is equivalent to a simpler form.
     struct BruteForceResult {
         std::string simplified;
-        std::string confidence; // "brute_force_verified" or "const_fold"
+        std::string confidence; // "exact_constant", "exhaustive_8bit", "sampled_22"
     };
 
     // Count unique lvars used in an expression
@@ -417,7 +432,11 @@ namespace tools::hexrays_ast {
 
         if (expr->op == cot_neg && expr->x) {
             auto v = EvalExprWithSingleVar(expr->x, target_var_idx, var_val, mask);
-            if (v) return static_cast<uint64_t>(-static_cast<int64_t>(*v)) & mask;
+            if (v) {
+                int x_sz = expr->x ? expr->x->type.get_size() : expr->type.get_size();
+                int64_t sv = SignExtend(*v, x_sz);
+                return static_cast<uint64_t>(-sv) & mask;
+            }
             return std::nullopt;
         }
 
@@ -440,6 +459,11 @@ namespace tools::hexrays_ast {
             auto r = EvalExprWithSingleVar(expr->y, target_var_idx, var_val, mask);
             if (!l || !r) return std::nullopt;
 
+            int l_sz = expr->x ? expr->x->type.get_size() : expr->type.get_size();
+            int r_sz = expr->y ? expr->y->type.get_size() : expr->type.get_size();
+            int64_t sl = SignExtend(*l, l_sz);
+            int64_t sr = SignExtend(*r, r_sz);
+
             switch (expr->op) {
                 case cot_add:  return (*l + *r) & mask;
                 case cot_sub:  return (*l - *r) & mask;
@@ -448,17 +472,17 @@ namespace tools::hexrays_ast {
                 case cot_bor:  return (*l | *r) & mask;
                 case cot_xor:  return (*l ^ *r) & mask;
                 case cot_shl:  return (*l << (*r & 63)) & mask;
-                case cot_sshr: return static_cast<uint64_t>(static_cast<int64_t>(*l) >> (*r & 63)) & mask;
+                case cot_sshr: return static_cast<uint64_t>(sl >> (*r & 63)) & mask;
                 case cot_ushr: return (*l >> (*r & 63)) & mask;
                 case cot_eq:   return (*l == *r) ? 1 : 0;
                 case cot_ne:   return (*l != *r) ? 1 : 0;
-                case cot_slt:  return (static_cast<int64_t>(*l) < static_cast<int64_t>(*r)) ? 1 : 0;
+                case cot_slt:  return (sl < sr) ? 1 : 0;
                 case cot_ult:  return (*l < *r) ? 1 : 0;
-                case cot_sle:  return (static_cast<int64_t>(*l) <= static_cast<int64_t>(*r)) ? 1 : 0;
+                case cot_sle:  return (sl <= sr) ? 1 : 0;
                 case cot_ule:  return (*l <= *r) ? 1 : 0;
-                case cot_sgt:  return (static_cast<int64_t>(*l) > static_cast<int64_t>(*r)) ? 1 : 0;
+                case cot_sgt:  return (sl > sr) ? 1 : 0;
                 case cot_ugt:  return (*l > *r) ? 1 : 0;
-                case cot_sge:  return (static_cast<int64_t>(*l) >= static_cast<int64_t>(*r)) ? 1 : 0;
+                case cot_sge:  return (sl >= sr) ? 1 : 0;
                 case cot_uge:  return (*l >= *r) ? 1 : 0;
                 case cot_land: return (*l != 0 && *r != 0) ? 1 : 0;
                 case cot_lor:  return (*l != 0 || *r != 0) ? 1 : 0;
@@ -482,7 +506,7 @@ namespace tools::hexrays_ast {
             if (cf_val) {
                 std::ostringstream oss;
                 oss << "0x" << std::hex << *cf_val;
-                return BruteForceResult{oss.str(), "const_fold"};
+                return BruteForceResult{oss.str(), "exact_constant"};
             }
             return std::nullopt;
         }
@@ -508,6 +532,17 @@ namespace tools::hexrays_ast {
             0x100000000ULL, 0xDEADBEEFCAFEBABEULL
         };
 
+        std::vector<uint64_t> test_values;
+        std::string confidence;
+        if (sz == 1) {
+            confidence = "exhaustive_8bit";
+            test_values.reserve(256);
+            for (int v = 0; v < 256; ++v) test_values.push_back(v);
+        } else {
+            confidence = "sampled_22";
+            test_values.assign(std::begin(kTestValues), std::end(kTestValues));
+        }
+
         bool all_identity = true;
         bool all_neg = true;
         bool all_bnot = true;
@@ -516,7 +551,7 @@ namespace tools::hexrays_ast {
         bool all_same_const = true;
         std::optional<uint64_t> first_val = std::nullopt;
 
-        for (uint64_t raw_val : kTestValues) {
+        for (uint64_t raw_val : test_values) {
             uint64_t val = raw_val & mask;
             auto eval_res = EvalExprWithSingleVar(expr, target_var, val, mask);
             if (!eval_res) {
@@ -525,7 +560,8 @@ namespace tools::hexrays_ast {
             uint64_t out = *eval_res & mask;
 
             if (out != val) all_identity = false;
-            if (out != (static_cast<uint64_t>(-static_cast<int64_t>(val)) & mask)) all_neg = false;
+            int64_t sval = SignExtend(val, sz);
+            if (out != (static_cast<uint64_t>(-sval) & mask)) all_neg = false;
             if (out != ((~val) & mask)) all_bnot = false;
             if (out != 0) all_zero = false;
             if (out != mask) all_all_ones = false;
@@ -538,25 +574,25 @@ namespace tools::hexrays_ast {
         }
 
         if (all_identity) {
-            return BruteForceResult{var_name, "brute_force_verified"};
+            return BruteForceResult{var_name, confidence};
         }
         if (all_zero) {
-            return BruteForceResult{"0", "brute_force_verified"};
+            return BruteForceResult{"0", confidence};
         }
         if (all_neg) {
-            return BruteForceResult{"-" + var_name, "brute_force_verified"};
+            return BruteForceResult{"-" + var_name, confidence};
         }
         if (all_bnot) {
-            return BruteForceResult{"~" + var_name, "brute_force_verified"};
+            return BruteForceResult{"~" + var_name, confidence};
         }
         if (all_all_ones) {
-            return BruteForceResult{"~0", "brute_force_verified"};
+            return BruteForceResult{"~0", confidence};
         }
         if (all_same_const && first_val) {
             std::ostringstream oss;
             if (*first_val == 0) oss << "0";
             else oss << "0x" << std::hex << *first_val;
-            return BruteForceResult{oss.str(), "brute_force_verified"};
+            return BruteForceResult{oss.str(), confidence};
         }
 
         return std::nullopt;

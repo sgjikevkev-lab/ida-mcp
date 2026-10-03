@@ -12,6 +12,7 @@
 #include <demangle.hpp>
 #include <strlist.hpp>
 #include <typeinf.hpp>
+#include <auto.hpp>
 #include <algorithm>
 #include <regex>
 #include <unordered_set>
@@ -377,8 +378,13 @@ namespace tools::rtti {
             }
 
             const std::vector<RttiClassEntry>& GetClasses() {
-                if (!initialized_) {
+                if (!initialized_ || !auto_is_ok()) {
                     classes_ = CollectRttiClassesInternal();
+                    by_clean_name_.clear();
+                    by_raw_name_.clear();
+                    by_vtable_.clear();
+                    by_col_.clear();
+                    by_type_desc_.clear();
                     for (size_t i = 0; i < classes_.size(); ++i) {
                         const auto& e = classes_[i];
                         if (!e.clean_name.empty()) by_clean_name_[e.clean_name] = i;
@@ -387,7 +393,9 @@ namespace tools::rtti {
                         if (e.col_ea != BADADDR) by_col_[e.col_ea] = i;
                         if (e.type_desc_ea != BADADDR) by_type_desc_[e.type_desc_ea] = i;
                     }
-                    initialized_ = true;
+                    if (auto_is_ok()) {
+                        initialized_ = true;
+                    }
                 }
                 return classes_;
             }
@@ -428,6 +436,7 @@ namespace tools::rtti {
     bool ApiRtti::CanHandle(const std::string& name) const {
         return name == "rtti_list_classes" ||
                name == "rtti_get_class" ||
+               name == "rtti_refresh" ||
                name == "rtti_create_struct" ||
                name == "resolve_vcall";
     }
@@ -439,6 +448,7 @@ namespace tools::rtti {
     nlohmann::json ApiRtti::Dispatch(const nlohmann::json& id, const std::string& name, const nlohmann::json& args) {
         if (name == "rtti_list_classes") return RttiListClasses(id, args);
         if (name == "rtti_get_class") return RttiGetClass(id, args);
+        if (name == "rtti_refresh") return RttiRefresh(id, args);
         if (name == "rtti_create_struct") return RttiCreateStruct(id, args);
         if (name == "resolve_vcall") return ResolveVcall(id, args);
 
@@ -459,9 +469,13 @@ namespace tools::rtti {
         size_t count = static_cast<size_t>(tools::utils::GetIntArg(args, "count", 50));
         if (count <= 0) count = 50;
 
+        bool refresh = tools::utils::GetBoolArg(args, "refresh", false);
         std::vector<RttiClassEntry> all_classes;
         sync::SyncRead([&]() {
             try {
+                if (refresh) {
+                    RttiIndex::Instance().Invalidate();
+                }
                 all_classes = CollectRttiClasses();
             } catch (...) {
             }
@@ -512,6 +526,7 @@ namespace tools::rtti {
     nlohmann::json ApiRtti::RttiGetClass(const nlohmann::json& id, const nlohmann::json& args) {
         std::string query = tools::utils::GetStringArg(args, "name", tools::utils::GetStringArg(args, "addr", tools::utils::GetStringArg(args, "query")));
         ea_t query_ea = tools::utils::ParseAddress(query);
+        bool refresh = tools::utils::GetBoolArg(args, "refresh", false);
 
         RttiClassEntry target_copy;
         bool found = false;
@@ -519,6 +534,9 @@ namespace tools::rtti {
 
         sync::SyncRead([&]() {
             try {
+                if (refresh) {
+                    RttiIndex::Instance().Invalidate();
+                }
                 bool is64 = inf_is_64bit();
                 size_t ptr_size = is64 ? 8 : 4;
                 const auto* target = RttiIndex::Instance().FindClass(query, query_ea);
@@ -563,6 +581,22 @@ namespace tools::rtti {
             {"methods", methods_arr}
         };
         return tools::utils::MakeToolSuccessJson(id, res);
+    }
+
+    nlohmann::json ApiRtti::RttiRefresh(const nlohmann::json& id, const nlohmann::json& args) {
+        size_t count = 0;
+        sync::SyncRead([&]() {
+            try {
+                RttiIndex::Instance().Invalidate();
+                count = CollectRttiClasses().size();
+            } catch (...) {
+            }
+        });
+        return tools::utils::MakeToolSuccessJson(id, {
+            {"status", "success"},
+            {"refreshed", true},
+            {"classes_count", count}
+        });
     }
 
     nlohmann::json ApiRtti::RttiCreateStruct(const nlohmann::json& id, const nlohmann::json& args) {

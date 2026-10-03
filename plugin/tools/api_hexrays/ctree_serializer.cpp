@@ -475,9 +475,23 @@ namespace tools::hexrays_ast {
                 const cexpr_t* e = static_cast<const cexpr_t*>(node);
 
                 if (pattern.contains("value") && e->op == cot_num) {
-                    if (pattern["value"].is_number()) {
-                        uint64 v = pattern["value"].get<uint64>();
-                        if (e->n && e->n->value(e->type) != v) return false;
+                    if (pattern["value"].is_number() && e->n) {
+                        uint64 actual_val = e->n->value(e->type);
+                        size_t sz = e->type.get_size();
+                        uint64 mask = (sz >= 8 || sz == 0) ? ~0ULL : ((1ULL << (sz * 8)) - 1);
+
+                        if (pattern["value"].is_number_unsigned()) {
+                            uint64 exp_val = pattern["value"].get<uint64>();
+                            if ((actual_val & mask) != (exp_val & mask) && actual_val != exp_val) return false;
+                        } else {
+                            int64 exp_val = pattern["value"].get<int64>();
+                            if (exp_val == -1) {
+                                if (actual_val != ~0ULL && (actual_val & mask) != mask) return false;
+                            } else {
+                                int64 actual_signed = (sz > 0 && sz < 8) ? (static_cast<int64>(actual_val << (64 - sz * 8)) >> (64 - sz * 8)) : static_cast<int64>(actual_val);
+                                if (actual_signed != exp_val && actual_val != static_cast<uint64>(exp_val)) return false;
+                            }
+                        }
                     }
                 }
 

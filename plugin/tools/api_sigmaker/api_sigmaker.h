@@ -7,6 +7,8 @@
 #pragma warning(pop)
 
 namespace tools::sigmaker {
+    void InvalidateSegmentCache();
+
     class ApiSigmaker {
     public:
         ApiSigmaker() = default;

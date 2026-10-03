@@ -549,6 +549,10 @@ namespace tools::types {
                 struct_name = "Struct_" + clean_fn + "_" + target_var_name;
             }
 
+            // Local decompilation cache: function -> cfuncptr_t
+            std::unordered_map<ea_t, std::shared_ptr<cfuncptr_t>> cfunc_cache;
+            cfunc_cache[fn_start] = std::make_shared<cfuncptr_t>(cf);
+
             // Recursive function scanner with context tuple (func_ea, lvar_idx, base_offset)
             std::set<std::tuple<ea_t, int, uint64_t>> visited_contexts;
             std::function<void(func_t*, int, int, uint64_t)> scan_fn;
@@ -559,8 +563,17 @@ namespace tools::types {
                 if (visited_contexts.count(ctx_key)) return;
                 visited_contexts.insert(ctx_key);
 
-                hexrays_failure_t local_hf;
-                cfuncptr_t local_cf = decompile(cur_fn, &local_hf, DECOMP_WARNINGS | DECOMP_NO_WAIT);
+                cfuncptr_t local_cf(nullptr);
+                auto it = cfunc_cache.find(cur_fn->start_ea);
+                if (it != cfunc_cache.end() && it->second) {
+                    local_cf = *(it->second);
+                } else {
+                    hexrays_failure_t local_hf;
+                    local_cf = decompile(cur_fn, &local_hf, DECOMP_WARNINGS | DECOMP_NO_WAIT);
+                    if (local_cf) {
+                        cfunc_cache[cur_fn->start_ea] = std::make_shared<cfuncptr_t>(local_cf);
+                    }
+                }
                 if (!local_cf) return;
 
                 struct StructVisitor : public ctree_visitor_t {

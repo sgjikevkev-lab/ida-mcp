@@ -1,6 +1,7 @@
 #include "api_hexrays.h"
 #include "ctree_serializer.h"
 #include "mba_rules.h"
+#include "../api_sigmaker/api_sigmaker.h"
 #include "../utils/utils.h"
 #include "../../sync/sync.h"
 
@@ -301,7 +302,7 @@ namespace tools::hexrays_ast {
                                 {"expression", CleanItemText(expr, cf)},
                                 {"simplified", simplified_text},
                                 {"rule", rule.name},
-                                {"confidence", "verified"},
+                                {"confidence", "rule_verified"},
                                 {"method", "rule_match"}
                             });
                             return 0;
@@ -320,7 +321,7 @@ namespace tools::hexrays_ast {
                                 {"expression", CleanItemText(expr, cf)},
                                 {"simplified", oss.str()},
                                 {"rule", "Constant Folding"},
-                                {"confidence", "verified"},
+                                {"confidence", "exact_constant"},
                                 {"method", "const_fold"}
                             });
                             return 0;
@@ -548,7 +549,7 @@ namespace tools::hexrays_ast {
                         ea_t then_ea = (cif->ithen ? cif->ithen->ea : BADADDR);
                         ea_t else_ea = (cif->ielse ? cif->ielse->ea : BADADDR);
 
-                        bool taken_is_true = false;
+                        std::optional<bool> taken_is_true;
                         if (then_ea != BADADDR && taken_ea == then_ea) {
                             taken_is_true = true;
                         } else if (else_ea != BADADDR && taken_ea == else_ea) {
@@ -559,8 +560,19 @@ namespace tools::hexrays_ast {
                             taken_is_true = true;
                         }
 
+                        if (!taken_is_true.has_value()) {
+                            // Target branch could not be deterministically mapped: DO NOT patch IDB!
+                            modifications.push_back({
+                                {"predicate_addr", tools::utils::FormatAddress(req.pred_ea)},
+                                {"force_branch", req.force_branch},
+                                {"status", "skipped"},
+                                {"reason", "branch_mapping_failed"}
+                            });
+                            continue;
+                        }
+
                         bool want_true = (req.force_branch == "always_true");
-                        bool should_jump = (want_true == taken_is_true);
+                        bool should_jump = (want_true == *taken_is_true);
 
                         uint8_t op0 = get_byte(jcc_ea);
                         if (op0 >= 0x70 && op0 <= 0x7F) {
@@ -618,6 +630,9 @@ namespace tools::hexrays_ast {
                 tag_remove(&clean, new_sv[i].line);
                 out_code += clean.c_str();
                 out_code += "\n";
+            }
+            if (any_idb_patched) {
+                tools::sigmaker::InvalidateSegmentCache();
             }
         });
 

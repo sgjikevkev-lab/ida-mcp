@@ -19,6 +19,7 @@ namespace tools::rtti {
     private:
         nlohmann::json RttiListClasses(const nlohmann::json& id, const nlohmann::json& args);
         nlohmann::json RttiGetClass(const nlohmann::json& id, const nlohmann::json& args);
+        nlohmann::json RttiRefresh(const nlohmann::json& id, const nlohmann::json& args);
         nlohmann::json RttiCreateStruct(const nlohmann::json& id, const nlohmann::json& args);
         nlohmann::json ResolveVcall(const nlohmann::json& id, const nlohmann::json& args);
     };

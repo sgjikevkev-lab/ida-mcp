@@ -128,6 +128,7 @@ namespace tools {
         };
         reg_rtti("rtti_list_classes");
         reg_rtti("rtti_get_class");
+        reg_rtti("rtti_refresh");
         reg_rtti("rtti_create_struct");
         reg_rtti("resolve_vcall");
 
@@ -221,7 +222,7 @@ namespace tools {
                     {"protocolVersion", "2024-11-05"},
                     {"serverInfo", {
                         {"name", "ida-pro-mcp"},
-                        {"version", "1.0.0"}
+                        {"version", "1.1.1"}
                     }},
                     {"capabilities", {
                         {"tools", nlohmann::json::object()}
