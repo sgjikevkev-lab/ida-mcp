@@ -623,6 +623,8 @@ namespace tools::analysis {
             ea_t call_site_ea = BADADDR;
             ea_t callee_start_ea = BADADDR;
             bool is_thunk = false;
+            std::string caller_name;
+            std::string callee_name;
         };
 
         ea_t start_func_ea = BADADDR;
@@ -784,6 +786,14 @@ namespace tools::analysis {
 
                 if (full_path.empty() && start_func_ea != target_func_ea) break;
 
+                for (auto& edge : full_path) {
+                    qstring c_name, t_name;
+                    get_func_name(&c_name, edge.caller_start_ea);
+                    get_func_name(&t_name, edge.callee_start_ea);
+                    edge.caller_name = c_name.c_str();
+                    edge.callee_name = t_name.c_str();
+                }
+
                 all_found_paths.push_back(full_path);
 
                 if (!full_path.empty()) {
@@ -802,15 +812,12 @@ namespace tools::analysis {
             nlohmann::json steps = nlohmann::json::array();
             for (size_t i = 0; i < path.size(); ++i) {
                 const auto& edge = path[i];
-                qstring c_name, t_name;
-                get_func_name(&c_name, edge.caller_start_ea);
-                get_func_name(&t_name, edge.callee_start_ea);
                 steps.push_back({
                     {"step", i},
-                    {"caller", c_name.c_str()},
+                    {"caller", edge.caller_name},
                     {"caller_addr", tools::utils::FormatAddress(edge.caller_start_ea)},
                     {"call_site", tools::utils::FormatAddress(edge.call_site_ea)},
-                    {"callee", t_name.c_str()},
+                    {"callee", edge.callee_name},
                     {"callee_addr", tools::utils::FormatAddress(edge.callee_start_ea)},
                     {"is_thunk", edge.is_thunk}
                 });

@@ -225,6 +225,25 @@ namespace tools::types {
 
         // Recursive field reader (lambda defined inside SyncRead)
         sync::SyncRead([&]() {
+            tinfo_t tif = GetTypeByName(struct_name);
+            if (tif.empty()) return;
+
+            found = true;
+            struct_size = tif.get_size();
+
+            std::vector<uint8_t> bulk_buf;
+            bool has_bulk = false;
+            if (ea != BADADDR && struct_size > 0 && struct_size <= 0x100000) {
+                bulk_buf.resize(struct_size, 0);
+                ssize_t rb = get_bytes(bulk_buf.data(), struct_size, ea, GMB_READALL);
+                if (rb > 0) {
+                    has_bulk = true;
+                    if (static_cast<size_t>(rb) < struct_size) {
+                        bulk_buf.resize(rb);
+                    }
+                }
+            }
+
             // Forward-declare the recursive lambda via std::function
             std::function<nlohmann::json(ea_t, const tinfo_t&, const qstring&, size_t, size_t, int, int, int)> ReadFieldRecursive;
 
@@ -250,6 +269,22 @@ namespace tools::types {
                     {"offset_hex", tools::utils::FormatAddress(offset_bytes)},
                     {"size", f_size},
                     {"type", type_str.c_str()}
+                };
+
+                auto read_val = [&](size_t sz, uint64_t& out_val) -> bool {
+                    size_t root_off = (field_ea != BADADDR && ea != BADADDR && field_ea >= ea) ? static_cast<size_t>(field_ea - ea) : 0;
+                    if (has_bulk && root_off + sz <= bulk_buf.size()) {
+                        out_val = 0;
+                        memcpy(&out_val, bulk_buf.data() + root_off, sz);
+                        return true;
+                    }
+                    if (field_ea != BADADDR && is_mapped(field_ea)) {
+                        if (sz == 1) { out_val = get_byte(field_ea); return true; }
+                        if (sz == 2) { out_val = get_word(field_ea); return true; }
+                        if (sz == 4) { out_val = get_dword(field_ea); return true; }
+                        if (sz == 8) { out_val = get_qword(field_ea); return true; }
+                    }
+                    return false;
                 };
 
                 // 1. Nested struct/union: recurse
@@ -295,60 +330,55 @@ namespace tools::types {
                     }
                 }
                 // 3. Pointer: dereference if mapped
-                else if (ftype.is_ptr() && field_ea != BADADDR && is_mapped(field_ea)) {
-                    ea_t pointed = inf_is_64bit() ? get_qword(field_ea) : get_dword(field_ea);
-                    field_obj["value"] = tools::utils::FormatAddress(pointed);
-                    if (pointed != 0 && pointed != BADADDR && is_mapped(pointed)) {
-                        qstring pointed_name;
-                        get_ea_name(&pointed_name, pointed);
-                        if (!pointed_name.empty()) {
-                            field_obj["pointed_name"] = pointed_name.c_str();
+                else if (ftype.is_ptr() && field_ea != BADADDR) {
+                    size_t ptr_sz = inf_is_64bit() ? 8 : 4;
+                    uint64_t raw_ptr = 0;
+                    if (read_val(ptr_sz, raw_ptr)) {
+                        ea_t pointed = static_cast<ea_t>(raw_ptr);
+                        field_obj["value"] = tools::utils::FormatAddress(pointed);
+                        if (pointed != 0 && pointed != BADADDR && is_mapped(pointed)) {
+                            qstring pointed_name;
+                            get_ea_name(&pointed_name, pointed);
+                            if (!pointed_name.empty()) {
+                                field_obj["pointed_name"] = pointed_name.c_str();
+                            }
                         }
                     }
                 }
                 // 4. Enum: resolve constant name
-                else if (ftype.is_enum() && field_ea != BADADDR && is_mapped(field_ea)) {
+                else if (ftype.is_enum() && field_ea != BADADDR) {
                     uint64_t raw_val = 0;
-                    if (f_size == 1) raw_val = get_byte(field_ea);
-                    else if (f_size == 2) raw_val = get_word(field_ea);
-                    else if (f_size == 4) raw_val = get_dword(field_ea);
-                    else if (f_size == 8) raw_val = get_qword(field_ea);
-                    field_obj["value"] = tools::utils::FormatAddress(raw_val);
-
-                    // Try to get enum member name
-                    enum_type_data_t ei;
-                    if (ftype.get_enum_details(&ei)) {
-                        for (const auto& em : ei) {
-                            if (static_cast<uint64_t>(em.value) == raw_val) {
-                                field_obj["enum_name"] = em.name.c_str();
-                                break;
+                    if (read_val(f_size, raw_val)) {
+                        field_obj["value"] = tools::utils::FormatAddress(raw_val);
+                        enum_type_data_t ei;
+                        if (ftype.get_enum_details(&ei)) {
+                            for (const auto& em : ei) {
+                                if (static_cast<uint64_t>(em.value) == raw_val) {
+                                    field_obj["enum_name"] = em.name.c_str();
+                                    break;
+                                }
                             }
                         }
                     }
                 }
                 // 5. Scalar: read value for standard sizes
-                else if (field_ea != BADADDR && is_mapped(field_ea)) {
-                    if (f_size == 1) field_obj["value"] = tools::utils::FormatAddress(get_byte(field_ea));
-                    else if (f_size == 2) field_obj["value"] = tools::utils::FormatAddress(get_word(field_ea));
-                    else if (f_size == 4) field_obj["value"] = tools::utils::FormatAddress(get_dword(field_ea));
-                    else if (f_size == 8) field_obj["value"] = tools::utils::FormatAddress(get_qword(field_ea));
+                else if (field_ea != BADADDR) {
+                    uint64_t raw_val = 0;
+                    if (read_val(f_size, raw_val)) {
+                        field_obj["value"] = tools::utils::FormatAddress(raw_val);
+                    }
                 }
 
                 return field_obj;
             };
 
-            tinfo_t tif = GetTypeByName(struct_name);
-            if (!tif.empty()) {
-                found = true;
-                struct_size = tif.get_size();
-                udt_type_data_t udt;
-                if (tif.get_udt_details(&udt)) {
-                    for (const auto& m : udt) {
-                        size_t m_size = m.type.get_size();
-                        fields_arr.push_back(
-                            ReadFieldRecursive(ea, m.type, m.name, m.offset, m_size, 0, max_depth, array_limit)
-                        );
-                    }
+            udt_type_data_t udt;
+            if (tif.get_udt_details(&udt)) {
+                for (const auto& m : udt) {
+                    size_t m_size = m.type.get_size();
+                    fields_arr.push_back(
+                        ReadFieldRecursive(ea, m.type, m.name, m.offset, m_size, 0, max_depth, array_limit)
+                    );
                 }
             }
         });
@@ -458,7 +488,7 @@ namespace tools::types {
         std::string apply_error;
         uint64_t inferred_total_size = 0;
 
-        sync::SyncWrite([&]() {
+        sync::SyncRead([&]() {
             if (!init_hexrays_plugin()) return;
 
             func_t* pfn = get_func(ea);
@@ -519,13 +549,15 @@ namespace tools::types {
                 struct_name = "Struct_" + clean_fn + "_" + target_var_name;
             }
 
-            // Recursive function scanner
-            std::set<ea_t> visited_fns;
+            // Recursive function scanner with context tuple (func_ea, lvar_idx, base_offset)
+            std::set<std::tuple<ea_t, int, uint64_t>> visited_contexts;
             std::function<void(func_t*, int, int, uint64_t)> scan_fn;
 
             scan_fn = [&](func_t* cur_fn, int lvar_idx, int current_depth, uint64_t base_offset) {
-                if (!cur_fn || visited_fns.count(cur_fn->start_ea) || current_depth > max_depth) return;
-                visited_fns.insert(cur_fn->start_ea);
+                if (!cur_fn || current_depth > max_depth) return;
+                auto ctx_key = std::make_tuple(cur_fn->start_ea, lvar_idx, base_offset);
+                if (visited_contexts.count(ctx_key)) return;
+                visited_contexts.insert(ctx_key);
 
                 hexrays_failure_t local_hf;
                 cfuncptr_t local_cf = decompile(cur_fn, &local_hf, DECOMP_WARNINGS | DECOMP_NO_WAIT);
@@ -547,7 +579,7 @@ namespace tools::types {
                         : ctree_visitor_t(CV_FAST), cf(f), target_idx(tidx), fields(flds),
                           depth(d), max_d(md), base_off(bo), total_sz(tsz), recurse_fn(rf) {}
 
-                    bool IsTargetBase(const cexpr_t* e, uint64_t& out_off) {
+                    bool IsTargetBase(const cexpr_t* e, int64_t& out_off) {
                         if (!e) return false;
                         if (e->op == cot_var) {
                             if (e->v.idx == target_idx) {
@@ -560,20 +592,20 @@ namespace tools::types {
                             return IsTargetBase(e->x, out_off);
                         }
                         if (e->op == cot_add && e->x && e->y) {
-                            uint64_t sub_off = 0;
+                            int64_t sub_off = 0;
                             if (IsTargetBase(e->x, sub_off) && e->y->op == cot_num) {
-                                out_off = sub_off + e->y->numval();
+                                out_off = sub_off + static_cast<int64_t>(e->y->numval());
                                 return true;
                             }
                             if (IsTargetBase(e->y, sub_off) && e->x->op == cot_num) {
-                                out_off = sub_off + e->x->numval();
+                                out_off = sub_off + static_cast<int64_t>(e->x->numval());
                                 return true;
                             }
                         }
                         if (e->op == cot_sub && e->x && e->y) {
-                            uint64_t sub_off = 0;
+                            int64_t sub_off = 0;
                             if (IsTargetBase(e->x, sub_off) && e->y->op == cot_num) {
-                                out_off = sub_off - e->y->numval();
+                                out_off = sub_off - static_cast<int64_t>(e->y->numval());
                                 return true;
                             }
                         }
@@ -583,78 +615,86 @@ namespace tools::types {
                     int idaapi visit_expr(cexpr_t* e) override {
                         // 1. Pointer dereference: *(type*)(var + offset)
                         if (e->op == cot_ptr && e->x) {
-                            uint64_t off = 0;
+                            int64_t off = 0;
                             if (IsTargetBase(e->x, off)) {
-                                uint64_t final_off = base_off + off;
-                                size_t sz = e->type.get_size();
-                                if (sz <= 0 || sz > 16) sz = inf_is_64bit() ? 8 : 4;
+                                int64_t signed_final = static_cast<int64_t>(base_off) + off;
+                                if (signed_final >= 0) {
+                                    uint64_t final_off = static_cast<uint64_t>(signed_final);
+                                    size_t sz = e->type.get_size();
+                                    if (sz <= 0 || sz > 16) sz = inf_is_64bit() ? 8 : 4;
 
-                                bool is_flt = e->type.is_floating();
-                                bool is_p = e->type.is_ptr();
-                                bool is_vf = (final_off == 0 && sz == (inf_is_64bit() ? 8 : 4));
+                                    bool is_flt = e->type.is_floating();
+                                    bool is_p = e->type.is_ptr();
+                                    bool is_vf = (final_off == 0 && sz == (inf_is_64bit() ? 8 : 4));
 
-                                auto it = fields.find(final_off);
-                                if (it == fields.end()) {
-                                    InferredField f;
-                                    f.offset = final_off;
-                                    f.size = sz;
-                                    f.is_float = is_flt;
-                                    f.is_pointer = is_p;
-                                    f.is_vftable = is_vf;
-                                    fields[final_off] = f;
-                                } else {
-                                    if (sz > it->second.size) it->second.size = sz;
-                                    if (is_flt) it->second.is_float = true;
-                                    if (is_p) it->second.is_pointer = true;
-                                    if (is_vf) it->second.is_vftable = true;
+                                    auto it = fields.find(final_off);
+                                    if (it == fields.end()) {
+                                        InferredField f;
+                                        f.offset = final_off;
+                                        f.size = sz;
+                                        f.is_float = is_flt;
+                                        f.is_pointer = is_p;
+                                        f.is_vftable = is_vf;
+                                        fields[final_off] = f;
+                                    } else {
+                                        if (sz > it->second.size) it->second.size = sz;
+                                        if (is_flt) it->second.is_float = true;
+                                        if (is_p) it->second.is_pointer = true;
+                                        if (is_vf) it->second.is_vftable = true;
+                                    }
                                 }
                             }
                         }
 
                         // 2. Member pointer or reference: var->member or var.member
                         if ((e->op == cot_memptr || e->op == cot_memref) && e->x) {
-                            uint64_t off = 0;
+                            int64_t off = 0;
                             if (IsTargetBase(e->x, off)) {
-                                uint64_t final_off = base_off + off + e->m;
-                                size_t sz = e->type.get_size();
-                                if (sz <= 0 || sz > 16) sz = 4;
+                                int64_t signed_final = static_cast<int64_t>(base_off) + off + static_cast<int64_t>(e->m);
+                                if (signed_final >= 0) {
+                                    uint64_t final_off = static_cast<uint64_t>(signed_final);
+                                    size_t sz = e->type.get_size();
+                                    if (sz <= 0 || sz > 16) sz = 4;
 
-                                auto it = fields.find(final_off);
-                                if (it == fields.end()) {
-                                    InferredField f;
-                                    f.offset = final_off;
-                                    f.size = sz;
-                                    f.is_float = e->type.is_floating();
-                                    f.is_pointer = e->type.is_ptr();
-                                    fields[final_off] = f;
-                                } else if (sz > it->second.size) {
-                                    it->second.size = sz;
+                                    auto it = fields.find(final_off);
+                                    if (it == fields.end()) {
+                                        InferredField f;
+                                        f.offset = final_off;
+                                        f.size = sz;
+                                        f.is_float = e->type.is_floating();
+                                        f.is_pointer = e->type.is_ptr();
+                                        fields[final_off] = f;
+                                    } else if (sz > it->second.size) {
+                                        it->second.size = sz;
+                                    }
                                 }
                             }
                         }
 
                         // 3. Array indexing: var[i]
                         if (e->op == cot_idx && e->x && e->y && e->y->op == cot_num) {
-                            uint64_t off = 0;
+                            int64_t off = 0;
                             if (IsTargetBase(e->x, off)) {
                                 size_t elem_sz = e->type.get_size();
                                 if (elem_sz <= 0) elem_sz = 4;
-                                uint64_t final_off = base_off + off + (e->y->numval() * elem_sz);
-
-                                if (fields.find(final_off) == fields.end()) {
-                                    InferredField f;
-                                    f.offset = final_off;
-                                    f.size = elem_sz;
-                                    f.is_float = e->type.is_floating();
-                                    f.is_pointer = e->type.is_ptr();
-                                    fields[final_off] = f;
+                                int64_t signed_final = static_cast<int64_t>(base_off) + off + static_cast<int64_t>(e->y->numval() * elem_sz);
+                                if (signed_final >= 0) {
+                                    uint64_t final_off = static_cast<uint64_t>(signed_final);
+                                    if (fields.find(final_off) == fields.end()) {
+                                        InferredField f;
+                                        f.offset = final_off;
+                                        f.size = elem_sz;
+                                        f.is_float = e->type.is_floating();
+                                        f.is_pointer = e->type.is_ptr();
+                                        fields[final_off] = f;
+                                    }
                                 }
                             }
                         }
 
                         // 4. Sniff allocation size: var = operator new(N) or malloc(N)
                         if (e->op == cot_asg) {
-                            uint64_t off = 0;
+                            int64_t off = 0;
                             if (IsTargetBase(e->x, off) && off == 0) {
                                 const cexpr_t* rhs = e->y;
                                 while (rhs && rhs->op == cot_cast) rhs = rhs->x;
@@ -671,12 +711,13 @@ namespace tools::types {
 
                         // 5. Sniff memset(var, 0, N)
                         if (e->op == cot_call && e->a && e->a->size() >= 3) {
-                            uint64_t off = 0;
+                            int64_t off = 0;
                             if (IsTargetBase(&(*e->a)[0], off)) {
                                 if ((*e->a)[2].op == cot_num) {
                                     uint64_t set_sz = (*e->a)[2].numval();
-                                    if (set_sz > 0 && set_sz < 0x200000) {
-                                        total_sz = std::max(total_sz, base_off + off + set_sz);
+                                    int64_t signed_final = static_cast<int64_t>(base_off) + off + static_cast<int64_t>(set_sz);
+                                    if (signed_final > 0 && set_sz < 0x200000) {
+                                        total_sz = std::max(total_sz, static_cast<uint64_t>(signed_final));
                                     }
                                 }
                             }
@@ -689,21 +730,24 @@ namespace tools::types {
                                 func_t* callee_fn = get_func(callee_ea);
                                 if (callee_fn) {
                                     for (size_t a_idx = 0; a_idx < e->a->size(); ++a_idx) {
-                                        uint64_t off = 0;
+                                        int64_t off = 0;
                                         if (IsTargetBase(&(*e->a)[a_idx], off)) {
-                                            hexrays_failure_t c_hf;
-                                            cfuncptr_t callee_cf = decompile(callee_fn, &c_hf, DECOMP_WARNINGS | DECOMP_NO_WAIT);
-                                            if (callee_cf) {
-                                                const lvars_t* callee_lvars = callee_cf->get_lvars();
-                                                if (callee_lvars) {
-                                                    size_t arg_counter = 0;
-                                                    for (size_t k = 0; k < callee_lvars->size(); ++k) {
-                                                        if ((*callee_lvars)[k].is_arg_var()) {
-                                                            if (arg_counter == a_idx) {
-                                                                recurse_fn(callee_fn, static_cast<int>(k), depth + 1, base_off + off);
-                                                                break;
+                                            int64_t next_base = static_cast<int64_t>(base_off) + off;
+                                            if (next_base >= 0) {
+                                                hexrays_failure_t c_hf;
+                                                cfuncptr_t callee_cf = decompile(callee_fn, &c_hf, DECOMP_WARNINGS | DECOMP_NO_WAIT);
+                                                if (callee_cf) {
+                                                    const lvars_t* callee_lvars = callee_cf->get_lvars();
+                                                    if (callee_lvars) {
+                                                        size_t arg_counter = 0;
+                                                        for (size_t k = 0; k < callee_lvars->size(); ++k) {
+                                                            if ((*callee_lvars)[k].is_arg_var()) {
+                                                                if (arg_counter == a_idx) {
+                                                                    recurse_fn(callee_fn, static_cast<int>(k), depth + 1, static_cast<uint64_t>(next_base));
+                                                                    break;
+                                                                }
+                                                                arg_counter++;
                                                             }
-                                                            arg_counter++;
                                                         }
                                                     }
                                                 }
@@ -723,79 +767,81 @@ namespace tools::types {
             };
 
             scan_fn(pfn, target_idx, 0, 0);
+        });
 
-            // If apply requested and fields found: compile to TIL and update lvar
-            if (apply && !observed_fields.empty()) {
-                std::ostringstream hss;
-                hss << "#pragma pack(push, 1)\n";
-                hss << "struct " << struct_name << " {\n";
+        // If apply requested and fields found: compile to TIL and update lvar under SyncWrite
+        if (apply && !observed_fields.empty()) {
+            std::ostringstream hss;
+            hss << "#pragma pack(push, 1)\n";
+            hss << "struct " << struct_name << " {\n";
 
-                uint64_t cur_offset = 0;
-                for (const auto& [off, field] : observed_fields) {
-                    if (off > cur_offset) {
-                        uint64_t gap = off - cur_offset;
-                        std::ostringstream pss;
-                        pss << "0x" << std::hex << cur_offset;
-                        hss << "    /* " << pss.str() << " */ uint8_t _pad_" << pss.str() << "[" << std::dec << gap << "];\n";
-                        cur_offset = off;
-                    }
-
-                    std::ostringstream oss;
-                    oss << "0x" << std::hex << off;
-                    std::string f_type;
-                    std::string f_name;
-
-                    if (off == 0 && field.is_vftable) {
-                        f_type = "void**";
-                        f_name = "__vftable";
-                    } else if (field.is_pointer) {
-                        f_type = "void*";
-                        f_name = "ptr_" + oss.str();
-                    } else if (field.is_float) {
-                        f_type = (field.size == 8 ? "double" : "float");
-                        f_name = "flt_" + oss.str();
-                    } else {
-                        switch (field.size) {
-                            case 1: f_type = "uint8_t"; break;
-                            case 2: f_type = "uint16_t"; break;
-                            case 8: f_type = "uint64_t"; break;
-                            default: f_type = "uint32_t"; break;
-                        }
-                        f_name = "field_" + oss.str();
-                    }
-
-                    hss << "    /* " << oss.str() << " */ " << f_type << " " << f_name << ";\n";
-                    cur_offset = off + field.size;
-                }
-
-                if (inferred_total_size > cur_offset) {
-                    uint64_t gap = inferred_total_size - cur_offset;
+            uint64_t cur_offset = 0;
+            for (const auto& [off, field] : observed_fields) {
+                if (off > cur_offset) {
+                    uint64_t gap = off - cur_offset;
                     std::ostringstream pss;
                     pss << "0x" << std::hex << cur_offset;
-                    hss << "    /* " << pss.str() << " */ uint8_t _pad_tail[" << std::dec << gap << "];\n";
-                    cur_offset = inferred_total_size;
+                    hss << "    /* " << pss.str() << " */ uint8_t _pad_" << pss.str() << "[" << std::dec << gap << "];\n";
+                    cur_offset = off;
                 }
 
-                hss << "};\n";
-                hss << "#pragma pack(pop)\n";
+                std::ostringstream oss;
+                oss << "0x" << std::hex << off;
+                std::string f_type;
+                std::string f_name;
 
+                if (off == 0 && field.is_vftable) {
+                    f_type = "void**";
+                    f_name = "__vftable";
+                } else if (field.is_pointer) {
+                    f_type = "void*";
+                    f_name = "ptr_" + oss.str();
+                } else if (field.is_float) {
+                    f_type = (field.size == 8 ? "double" : "float");
+                    f_name = "flt_" + oss.str();
+                } else {
+                    switch (field.size) {
+                        case 1: f_type = "uint8_t"; break;
+                        case 2: f_type = "uint16_t"; break;
+                        case 8: f_type = "uint64_t"; break;
+                        default: f_type = "uint32_t"; break;
+                    }
+                    f_name = "field_" + oss.str();
+                }
+
+                hss << "    /* " << oss.str() << " */ " << f_type << " " << f_name << ";\n";
+                cur_offset = off + field.size;
+            }
+
+            if (inferred_total_size > cur_offset) {
+                uint64_t gap = inferred_total_size - cur_offset;
+                std::ostringstream pss;
+                pss << "0x" << std::hex << cur_offset;
+                hss << "    /* " << pss.str() << " */ uint8_t _pad_tail[" << std::dec << gap << "];\n";
+                cur_offset = inferred_total_size;
+            }
+
+            hss << "};\n";
+            hss << "#pragma pack(pop)\n";
+
+            sync::SyncWrite([&]() {
                 int parse_err = parse_decls(get_idati(), hss.str().c_str(), nullptr, HTI_DCL | HTI_PAKDEF | HTI_NWR);
                 if (parse_err == 0) {
                     lvar_saved_info_t info;
-                    if (locate_lvar(&info.ll, pfn->start_ea, target_var_name.c_str())) {
+                    if (locate_lvar(&info.ll, fn_start, target_var_name.c_str())) {
                         tinfo_t tif;
                         qstring nbuf;
                         std::string decl_str = "struct " + struct_name + "*;";
                         if (parse_decl(&tif, &nbuf, get_idati(), decl_str.c_str(), PT_SIL | PT_TYP)) {
                             info.type = tif;
-                            applied_ok = modify_user_lvar_info(pfn->start_ea, MLI_TYPE, info);
+                            applied_ok = modify_user_lvar_info(fn_start, MLI_TYPE, info);
                         }
                     }
                 } else {
                     apply_error = "TIL parse_decls failed with code " + std::to_string(parse_err);
                 }
-            }
-        });
+            });
+        }
 
         if (!found_fn) {
             return tools::utils::MakeToolErrorJson(id, "No function found containing address " + tools::utils::FormatAddress(ea), "function_not_found");

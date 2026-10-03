@@ -24,39 +24,50 @@ namespace sync {
             return code;
         }
 
-        struct async_exec_request_t : public exec_request_t {
+        struct JobState {
             std::function<void()> func;
             HANDLE hEvent = NULL;
+            std::atomic<bool> cancelled{false};
             std::atomic<bool> done{false};
-            std::atomic<bool> abandoned{false};
             DWORD exception_code = 0;
 
-            async_exec_request_t(std::function<void()> f) : func(std::move(f)) {
+            JobState(std::function<void()> f) : func(std::move(f)) {
                 hEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
             }
 
-            virtual ~async_exec_request_t() {
+            ~JobState() {
                 if (hEvent) {
                     CloseHandle(hEvent);
                     hEvent = NULL;
                 }
             }
+        };
+
+        struct async_exec_request_t : public exec_request_t {
+            std::shared_ptr<JobState> state;
+            std::atomic<bool> abandoned{false};
+
+            async_exec_request_t(std::shared_ptr<JobState> s) : state(std::move(s)) {}
+
+            virtual ~async_exec_request_t() = default;
 
             virtual ssize_t idaapi execute() override {
-                if (!abandoned.load()) {
+                if (state && !state->cancelled.load(std::memory_order_acquire)) {
                     try {
-                        exception_code = InvokeWithSeh(func);
+                        state->exception_code = InvokeWithSeh(state->func);
                     } catch (...) {
-                        exception_code = 0xE06D7363; // C++ exception code
+                        state->exception_code = 0xE06D7363; // C++ exception code
                     }
                 }
 
-                done.store(true);
-                if (hEvent) {
-                    SetEvent(hEvent);
+                if (state) {
+                    state->done.store(true, std::memory_order_release);
+                    if (state->hEvent) {
+                        SetEvent(state->hEvent);
+                    }
                 }
 
-                if (abandoned.load()) {
+                if (abandoned.load(std::memory_order_acquire)) {
                     delete this;
                 }
                 return 0;
@@ -80,23 +91,25 @@ namespace sync {
                 return code == 0;
             }
 
-            auto* req = new async_exec_request_t(std::move(func));
-            HANDLE hEvt = req->hEvent;
+            auto state = std::make_shared<JobState>(std::move(func));
+            HANDLE hEvt = state->hEvent;
+            auto* req = new async_exec_request_t(state);
             ssize_t req_id = execute_sync(*req, reqf | MFF_NOWAIT);
 
             DWORD wait_res = WaitForSingleObject(hEvt, timeout_ms);
             if (wait_res == WAIT_TIMEOUT) {
+                state->cancelled.store(true, std::memory_order_release);
                 bool cancelled = cancel_exec_request(static_cast<int>(req_id));
                 if (cancelled) {
                     delete req;
                 } else {
-                    req->abandoned.store(true);
+                    req->abandoned.store(true, std::memory_order_release);
                 }
                 if (out_exception_code) *out_exception_code = WAIT_TIMEOUT;
                 return false;
             }
 
-            DWORD exc = req->exception_code;
+            DWORD exc = state->exception_code;
             if (out_exception_code) *out_exception_code = exc;
             delete req;
             return exc == 0;

@@ -116,11 +116,18 @@ The agent discovers open databases, monitors their status, and switches working 
 
 ---
 
-### 4. `mba_simplify` & `simplify_predicate` — Microcode De-obfuscation
-- **The Challenge**: Obfuscated binaries employ opaque predicates and dead-code branches to thwart decompilation and analysis.
+### 4. `mba_simplify` & `simplify_predicate` — AST & Decompiler De-obfuscation
+- **The Challenge**: Obfuscated binaries employ Mixed Boolean-Arithmetic (MBA) expressions, opaque predicates, and synthetic dead-code branches to thwart decompilation and human analysis.
 - **The Implementation**:
-  - **Microcode Level Operation**: Operates directly on the intermediate representation of Hex-Rays (`mbl_array_t`) before final C pseudocode generation.
-  - **Algebraic Simplification**: Evaluates invariant boolean expressions, simplifies synthetic control-flow flattening, and eliminates unreachable basic blocks.
+  - **ctree AST Analysis**: Operates directly on Hex-Rays Abstract Syntax Tree expressions (`cfunc_t`, `cexpr_t`, `cinsn_t`), avoiding brittle textual regexes while inspecting high-level decompiled expressions.
+  - **Multi-Level MBA Simplification**: Implements a 3-tier simplification pipeline:
+    1. *Rule-based AST rewriting*: Recognises canonical MBA identities (e.g. `(x ^ y) + 2*(x & y) => x + y`, `(x | y) - y => x & ~y`).
+    2. *Constant folding*: Recursively folds compile-time known constants across nested bitwise and arithmetic operations.
+    3. *Truth-table equivalence*: Evaluates single-variable bitwise expressions across permutations to prove functional identity.
+  - **Opaque Predicate Elimination & IDB Patching**:
+    - Discovers invariant conditions evaluating unconditionally to `always_true` or `always_false`.
+    - Eliminates dead branches directly within the Hex-Rays AST pseudocode.
+    - Optionally persists patches into the IDA database (`persist: true`), accurately rewriting short (`0x7x`) and near (`0x0F 0x8x`) conditional jumps into unconditional jumps (`0xEB`, `0xE9`) or NOPs (`0x90`), recalculating displacement offsets and preserving branch polarity.
 
 ---
 
@@ -179,8 +186,8 @@ Store `router.exe` in a persistent directory (e.g. `C:\Tools\ida-mcp\router.exe`
 | `recompile` | Hex-Rays & Decompiler | Forces cache invalidation and recompilation of a previously decompiled function. |
 | `get_ast` | Hex-Rays & Decompiler | Extracts structured Abstract Syntax Trees (cfunc / citem) from decompiled code. |
 | `ast_match` | Hex-Rays & Decompiler | Matches structural patterns against Hex-Rays AST expressions. |
-| `mba_simplify` | Hex-Rays & Decompiler | Inspects Microcode Block Architecture (MBA) graphs and applies optimisation passes. |
-| `simplify_predicate` | Hex-Rays & Decompiler | Detects and simplifies opaque predicates and dead branches in microcode. |
+| `mba_simplify` | Hex-Rays & Decompiler | Simplifies Mixed Boolean-Arithmetic (MBA) and bitwise expressions in Hex-Rays AST via pattern rules and constant folding. |
+| `simplify_predicate` | Hex-Rays & Decompiler | Detects opaque predicates, eliminates dead AST branches in pseudocode, and optionally patches Jcc in IDB. |
 | `declare_type` | Types & Structures | Parses and registers forward C declarations, typedefs, or struct definitions into Local Types. |
 | `type_query` | Types & Structures | Searches the type library for registered structs, enums, unions, and typedefs. |
 | `type_inspect` | Types & Structures | Inspects struct definitions: field names, types, offsets, sizes, and alignment padding. |

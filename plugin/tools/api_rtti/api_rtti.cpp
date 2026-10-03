@@ -250,27 +250,62 @@ namespace tools::rtti {
             }
         }
 
-        std::vector<RttiClassEntry> CollectRttiClasses() {
-            std::vector<RttiClassEntry> classes;
-            std::unordered_set<ea_t> seen_vtables;
-            std::unordered_set<ea_t> seen_cols;
+        class RttiIndex {
+        private:
+            std::vector<RttiClassEntry> classes_;
+            std::unordered_map<std::string, size_t> by_clean_name_;
+            std::unordered_map<std::string, size_t> by_raw_name_;
+            std::unordered_map<ea_t, size_t> by_vtable_;
+            std::unordered_map<ea_t, size_t> by_col_;
+            std::unordered_map<ea_t, size_t> by_type_desc_;
+            bool initialized_ = false;
 
-            bool is64 = inf_is_64bit();
-            ea_t img_base = get_imagebase();
-            size_t ptr_size = is64 ? 8 : 4;
+            std::vector<RttiClassEntry> CollectRttiClassesInternal() {
+                std::vector<RttiClassEntry> classes;
+                std::unordered_set<ea_t> seen_vtables;
+                std::unordered_set<ea_t> seen_cols;
 
-            // Strategy 1: Scan IDA's Name List (instantaneous & accurate for symbols defined/analyzed by IDA)
-            size_t name_count = get_nlist_size();
-            for (size_t i = 0; i < name_count; ++i) {
-                const char* sym_name = get_nlist_name(i);
-                if (!sym_name) continue;
+                bool is64 = inf_is_64bit();
+                ea_t img_base = get_imagebase();
 
-                // Match vftable symbol: ??_7...
-                if (strncmp(sym_name, "??_7", 4) == 0) {
-                    ea_t vt_ea = get_nlist_ea(i);
-                    if (vt_ea != BADADDR && is_mapped(vt_ea) && seen_vtables.insert(vt_ea).second) {
-                        ea_t col_ea = is64 ? get_qword(vt_ea - 8) : get_dword(vt_ea - 4);
+                // Strategy 1: Scan IDA's Name List (instantaneous & accurate for symbols defined/analyzed by IDA)
+                size_t name_count = get_nlist_size();
+                for (size_t i = 0; i < name_count; ++i) {
+                    const char* sym_name = get_nlist_name(i);
+                    if (!sym_name) continue;
+
+                    // Match vftable symbol: ??_7...
+                    if (strncmp(sym_name, "??_7", 4) == 0) {
+                        ea_t vt_ea = get_nlist_ea(i);
+                        if (vt_ea != BADADDR && is_mapped(vt_ea) && seen_vtables.insert(vt_ea).second) {
+                            ea_t col_ea = is64 ? get_qword(vt_ea - 8) : get_dword(vt_ea - 4);
+                            if (col_ea != BADADDR && is_mapped(col_ea) && seen_cols.insert(col_ea).second) {
+                                RttiClassEntry entry;
+                                if (ParseColAndClass(col_ea, vt_ea, is64, img_base, entry)) {
+                                    classes.push_back(entry);
+                                }
+                            }
+                        }
+                    }
+                    // Match COL symbol: ??_R4...
+                    else if (strncmp(sym_name, "??_R4", 5) == 0) {
+                        ea_t col_ea = get_nlist_ea(i);
                         if (col_ea != BADADDR && is_mapped(col_ea) && seen_cols.insert(col_ea).second) {
+                            // Find vtable via xrefs to COL
+                            ea_t vt_ea = BADADDR;
+                            xrefblk_t cxb;
+                            for (bool cok = cxb.first_to(col_ea, XREF_DATA); cok; cok = cxb.next_to()) {
+                                ea_t cand = is64 ? (cxb.from + 8) : (cxb.from + 4);
+                                if (is_mapped(cand) && is_loaded(cand)) {
+                                    ea_t m0 = is64 ? get_qword(cand) : get_dword(cand);
+                                    if (m0 != 0 && m0 != BADADDR && is_mapped(m0)) {
+                                        vt_ea = cand;
+                                        seen_vtables.insert(vt_ea);
+                                        break;
+                                    }
+                                }
+                            }
+
                             RttiClassEntry entry;
                             if (ParseColAndClass(col_ea, vt_ea, is64, img_base, entry)) {
                                 classes.push_back(entry);
@@ -278,77 +313,113 @@ namespace tools::rtti {
                         }
                     }
                 }
-                // Match COL symbol: ??_R4...
-                else if (strncmp(sym_name, "??_R4", 5) == 0) {
-                    ea_t col_ea = get_nlist_ea(i);
-                    if (col_ea != BADADDR && is_mapped(col_ea) && seen_cols.insert(col_ea).second) {
-                        // Find vtable via xrefs to COL
-                        ea_t vt_ea = BADADDR;
-                        xrefblk_t cxb;
-                        for (bool cok = cxb.first_to(col_ea, XREF_DATA); cok; cok = cxb.next_to()) {
-                            ea_t cand = is64 ? (cxb.from + 8) : (cxb.from + 4);
-                            if (is_mapped(cand) && is_loaded(cand)) {
-                                ea_t m0 = is64 ? get_qword(cand) : get_dword(cand);
-                                if (m0 != 0 && m0 != BADADDR && is_mapped(m0)) {
-                                    vt_ea = cand;
-                                    seen_vtables.insert(vt_ea);
-                                    break;
-                                }
-                            }
-                        }
 
-                        RttiClassEntry entry;
-                        if (ParseColAndClass(col_ea, vt_ea, is64, img_base, entry)) {
-                            classes.push_back(entry);
-                        }
-                    }
-                }
-            }
+                // Strategy 2: If few classes found via nlist, scan String List for .?AV / .?AU
+                if (classes.size() < 5) {
+                    size_t str_qty = get_strlist_qty();
+                    for (size_t si_idx = 0; si_idx < str_qty; ++si_idx) {
+                        string_info_t si;
+                        if (!get_strlist_item(&si, si_idx)) continue;
+                        if (si.ea == BADADDR || !is_mapped(si.ea)) continue;
 
-            // Strategy 2: If few classes found via nlist, scan String List for .?AV / .?AU
-            if (classes.size() < 5) {
-                size_t str_qty = get_strlist_qty();
-                for (size_t si_idx = 0; si_idx < str_qty; ++si_idx) {
-                    string_info_t si;
-                    if (!get_strlist_item(&si, si_idx)) continue;
-                    if (si.ea == BADADDR || !is_mapped(si.ea)) continue;
+                        std::string s_text = ReadNullTermString(si.ea, 128);
+                        if (s_text.rfind(".?AV", 0) == 0 || s_text.rfind(".?AU", 0) == 0) {
+                            ea_t td_ea = is64 ? (si.ea - 16) : (si.ea - 8);
+                            if (!is_mapped(td_ea)) continue;
 
-                    std::string s_text = ReadNullTermString(si.ea, 128);
-                    if (s_text.rfind(".?AV", 0) == 0 || s_text.rfind(".?AU", 0) == 0) {
-                        ea_t td_ea = is64 ? (si.ea - 16) : (si.ea - 8);
-                        if (!is_mapped(td_ea)) continue;
-
-                        // Find COL referencing this TD
-                        xrefblk_t tdxb;
-                        for (bool tok = tdxb.first_to(td_ea, XREF_DATA); tok; tok = tdxb.next_to()) {
-                            if (tdxb.from == BADADDR) continue;
-                            ea_t col_cand = tdxb.from - 12;
-                            if (is_mapped(col_cand) && seen_cols.insert(col_cand).second) {
-                                ea_t vt_ea = BADADDR;
-                                xrefblk_t cxb;
-                                for (bool cok = cxb.first_to(col_cand, XREF_DATA); cok; cok = cxb.next_to()) {
-                                    ea_t cand = is64 ? (cxb.from + 8) : (cxb.from + 4);
-                                    if (is_mapped(cand) && is_loaded(cand)) {
-                                        ea_t m0 = is64 ? get_qword(cand) : get_dword(cand);
-                                        if (m0 != 0 && m0 != BADADDR && is_mapped(m0)) {
-                                            vt_ea = cand;
-                                            seen_vtables.insert(vt_ea);
-                                            break;
+                            // Find COL referencing this TD
+                            xrefblk_t tdxb;
+                            for (bool tok = tdxb.first_to(td_ea, XREF_DATA); tok; tok = tdxb.next_to()) {
+                                if (tdxb.from == BADADDR) continue;
+                                ea_t col_cand = tdxb.from - 12;
+                                if (is_mapped(col_cand) && seen_cols.insert(col_cand).second) {
+                                    ea_t vt_ea = BADADDR;
+                                    xrefblk_t cxb;
+                                    for (bool cok = cxb.first_to(col_cand, XREF_DATA); cok; cok = cxb.next_to()) {
+                                        ea_t cand = is64 ? (cxb.from + 8) : (cxb.from + 4);
+                                        if (is_mapped(cand) && is_loaded(cand)) {
+                                            ea_t m0 = is64 ? get_qword(cand) : get_dword(cand);
+                                            if (m0 != 0 && m0 != BADADDR && is_mapped(m0)) {
+                                                vt_ea = cand;
+                                                seen_vtables.insert(vt_ea);
+                                                break;
+                                            }
                                         }
                                     }
-                                }
 
-                                RttiClassEntry entry;
-                                if (ParseColAndClass(col_cand, vt_ea, is64, img_base, entry)) {
-                                    classes.push_back(entry);
+                                    RttiClassEntry entry;
+                                    if (ParseColAndClass(col_cand, vt_ea, is64, img_base, entry)) {
+                                        classes.push_back(entry);
+                                    }
                                 }
                             }
                         }
                     }
                 }
+
+                return classes;
             }
 
-            return classes;
+        public:
+            static RttiIndex& Instance() {
+                static RttiIndex inst;
+                return inst;
+            }
+
+            void Invalidate() {
+                classes_.clear();
+                by_clean_name_.clear();
+                by_raw_name_.clear();
+                by_vtable_.clear();
+                by_col_.clear();
+                by_type_desc_.clear();
+                initialized_ = false;
+            }
+
+            const std::vector<RttiClassEntry>& GetClasses() {
+                if (!initialized_) {
+                    classes_ = CollectRttiClassesInternal();
+                    for (size_t i = 0; i < classes_.size(); ++i) {
+                        const auto& e = classes_[i];
+                        if (!e.clean_name.empty()) by_clean_name_[e.clean_name] = i;
+                        if (!e.raw_name.empty()) by_raw_name_[e.raw_name] = i;
+                        if (e.vtable_ea != BADADDR) by_vtable_[e.vtable_ea] = i;
+                        if (e.col_ea != BADADDR) by_col_[e.col_ea] = i;
+                        if (e.type_desc_ea != BADADDR) by_type_desc_[e.type_desc_ea] = i;
+                    }
+                    initialized_ = true;
+                }
+                return classes_;
+            }
+
+            const RttiClassEntry* FindClass(const std::string& query, ea_t query_ea = BADADDR) {
+                const auto& clist = GetClasses();
+                if (query_ea != BADADDR) {
+                    auto it_vt = by_vtable_.find(query_ea);
+                    if (it_vt != by_vtable_.end()) return &clist[it_vt->second];
+                    auto it_col = by_col_.find(query_ea);
+                    if (it_col != by_col_.end()) return &clist[it_col->second];
+                    auto it_td = by_type_desc_.find(query_ea);
+                    if (it_td != by_type_desc_.end()) return &clist[it_td->second];
+                }
+                if (!query.empty()) {
+                    auto it_c = by_clean_name_.find(query);
+                    if (it_c != by_clean_name_.end()) return &clist[it_c->second];
+                    auto it_r = by_raw_name_.find(query);
+                    if (it_r != by_raw_name_.end()) return &clist[it_r->second];
+                    for (const auto& c : clist) {
+                        if (c.clean_name.find(query) != std::string::npos ||
+                            c.raw_name.find(query) != std::string::npos) {
+                            return &c;
+                        }
+                    }
+                }
+                return nullptr;
+            }
+        };
+
+        inline const std::vector<RttiClassEntry>& CollectRttiClasses() {
+            return RttiIndex::Instance().GetClasses();
         }
     }
 
@@ -440,66 +511,55 @@ namespace tools::rtti {
 
     nlohmann::json ApiRtti::RttiGetClass(const nlohmann::json& id, const nlohmann::json& args) {
         std::string query = tools::utils::GetStringArg(args, "name", tools::utils::GetStringArg(args, "addr", tools::utils::GetStringArg(args, "query")));
-        bool is64 = false;
-        std::vector<RttiClassEntry> all_classes;
+        ea_t query_ea = tools::utils::ParseAddress(query);
+
+        RttiClassEntry target_copy;
+        bool found = false;
+        nlohmann::json methods_arr = nlohmann::json::array();
 
         sync::SyncRead([&]() {
             try {
-                is64 = inf_is_64bit();
-                all_classes = CollectRttiClasses();
+                bool is64 = inf_is_64bit();
+                size_t ptr_size = is64 ? 8 : 4;
+                const auto* target = RttiIndex::Instance().FindClass(query, query_ea);
+                if (target) {
+                    found = true;
+                    target_copy = *target;
+
+                    if (target->vtable_ea != BADADDR && is_mapped(target->vtable_ea)) {
+                        for (size_t i = 0; i < target->methods_count; ++i) {
+                            ea_t entry_ea = target->vtable_ea + i * ptr_size;
+                            if (!is_mapped(entry_ea) || !is_loaded(entry_ea)) break;
+
+                            ea_t fn_ea = is64 ? get_qword(entry_ea) : get_dword(entry_ea);
+                            qstring fname;
+                            if (is_mapped(fn_ea)) {
+                                get_func_name(&fname, fn_ea);
+                                if (fname.empty()) get_name(&fname, fn_ea);
+                            }
+                            methods_arr.push_back({
+                                {"index", i},
+                                {"address", tools::utils::FormatAddress(fn_ea)},
+                                {"name", fname.c_str()}
+                            });
+                        }
+                    }
+                }
             } catch (...) {
             }
         });
 
-        ea_t query_ea = tools::utils::ParseAddress(query);
-        const RttiClassEntry* target = nullptr;
-
-        for (const auto& c : all_classes) {
-            if (query_ea != BADADDR && (c.vtable_ea == query_ea || c.col_ea == query_ea || c.type_desc_ea == query_ea)) {
-                target = &c;
-                break;
-            }
-            if (c.clean_name == query || c.raw_name == query) {
-                target = &c;
-                break;
-            }
-        }
-
-        if (!target) {
+        if (!found) {
             return tools::utils::MakeToolErrorJson(id, "No RTTI class matching query '" + query + "' was found in binary", "class_not_found");
         }
 
-        nlohmann::json methods_arr = nlohmann::json::array();
-        size_t ptr_size = is64 ? 8 : 4;
-
-        sync::SyncRead([&]() {
-            if (target->vtable_ea != BADADDR && is_mapped(target->vtable_ea)) {
-                for (size_t i = 0; i < target->methods_count; ++i) {
-                    ea_t entry_ea = target->vtable_ea + i * ptr_size;
-                    if (!is_mapped(entry_ea) || !is_loaded(entry_ea)) break;
-
-                    ea_t fn_ea = is64 ? get_qword(entry_ea) : get_dword(entry_ea);
-                    qstring fname;
-                    if (is_mapped(fn_ea)) {
-                        get_func_name(&fname, fn_ea);
-                        if (fname.empty()) get_name(&fname, fn_ea);
-                    }
-                    methods_arr.push_back({
-                        {"index", i},
-                        {"address", tools::utils::FormatAddress(fn_ea)},
-                        {"name", fname.c_str()}
-                    });
-                }
-            }
-        });
-
         nlohmann::json res = {
             {"status", "success"},
-            {"class", target->clean_name},
-            {"raw_name", target->raw_name},
-            {"vtable", tools::utils::FormatAddress(target->vtable_ea)},
-            {"methods_count", target->methods_count},
-            {"hierarchy", target->hierarchy},
+            {"class", target_copy.clean_name},
+            {"raw_name", target_copy.raw_name},
+            {"vtable", tools::utils::FormatAddress(target_copy.vtable_ea)},
+            {"methods_count", target_copy.methods_count},
+            {"hierarchy", target_copy.hierarchy},
             {"methods", methods_arr}
         };
         return tools::utils::MakeToolSuccessJson(id, res);
@@ -508,34 +568,27 @@ namespace tools::rtti {
     nlohmann::json ApiRtti::RttiCreateStruct(const nlohmann::json& id, const nlohmann::json& args) {
         std::string query = tools::utils::GetStringArg(args, "name", tools::utils::GetStringArg(args, "query"));
         std::string struct_prefix = tools::utils::GetStringArg(args, "struct_prefix");
+        ea_t query_ea = tools::utils::ParseAddress(query);
 
-        std::vector<RttiClassEntry> all_classes;
+        RttiClassEntry target_copy;
+        bool found = false;
+
         sync::SyncRead([&]() {
             try {
-                all_classes = CollectRttiClasses();
+                const auto* target = RttiIndex::Instance().FindClass(query, query_ea);
+                if (target) {
+                    found = true;
+                    target_copy = *target;
+                }
             } catch (...) {
             }
         });
 
-        ea_t query_ea = tools::utils::ParseAddress(query);
-        const RttiClassEntry* target = nullptr;
-
-        for (const auto& c : all_classes) {
-            if (query_ea != BADADDR && (c.vtable_ea == query_ea || c.col_ea == query_ea || c.type_desc_ea == query_ea)) {
-                target = &c;
-                break;
-            }
-            if (c.clean_name == query || c.raw_name == query) {
-                target = &c;
-                break;
-            }
-        }
-
-        if (!target) {
+        if (!found) {
             return tools::utils::MakeToolErrorJson(id, "No RTTI class matching query '" + query + "' was found in binary", "class_not_found");
         }
 
-        std::string base_struct_name = struct_prefix.empty() ? SanitizeCIdentifier(target->clean_name) : struct_prefix;
+        std::string base_struct_name = struct_prefix.empty() ? SanitizeCIdentifier(target_copy.clean_name) : struct_prefix;
         std::string vtable_struct_name = base_struct_name + "_vftable";
         std::string class_struct_name = base_struct_name;
 
@@ -544,7 +597,7 @@ namespace tools::rtti {
         ss << "struct " << class_struct_name << ";\n\n";
 
         ss << "struct " << vtable_struct_name << " {\n";
-        for (size_t i = 0; i < target->methods_count; ++i) {
+        for (size_t i = 0; i < target_copy.methods_count; ++i) {
             ss << "    void* vfunc_" << i << ";\n";
         }
         ss << "};\n\n";
@@ -603,16 +656,12 @@ namespace tools::rtti {
             is64 = inf_is_64bit();
             size_t ptr_size = is64 ? 8 : 4;
 
-            auto all_classes = CollectRttiClasses();
-
             if (!class_query.empty() && query_ea == BADADDR) {
-                for (const auto& c : all_classes) {
-                    if (c.clean_name == class_query || c.raw_name == class_query) {
-                        resolved_vtable_ea = c.vtable_ea;
-                        resolved_class_name = c.clean_name;
-                        class_hierarchy = c.hierarchy;
-                        break;
-                    }
+                const auto* c = RttiIndex::Instance().FindClass(class_query);
+                if (c) {
+                    resolved_vtable_ea = c->vtable_ea;
+                    resolved_class_name = c->clean_name;
+                    class_hierarchy = c->hierarchy;
                 }
             }
 
@@ -641,13 +690,11 @@ namespace tools::rtti {
                     }
 
                     if (resolved_vtable_ea == BADADDR && !class_query.empty()) {
-                        for (const auto& c : all_classes) {
-                            if (c.clean_name == class_query || c.raw_name == class_query) {
-                                resolved_vtable_ea = c.vtable_ea;
-                                resolved_class_name = c.clean_name;
-                                class_hierarchy = c.hierarchy;
-                                break;
-                            }
+                        const auto* c = RttiIndex::Instance().FindClass(class_query);
+                        if (c) {
+                            resolved_vtable_ea = c->vtable_ea;
+                            resolved_class_name = c->clean_name;
+                            class_hierarchy = c->hierarchy;
                         }
                     }
                 } else {
@@ -658,12 +705,10 @@ namespace tools::rtti {
 
             if (resolved_vtable_ea != BADADDR && is_mapped(resolved_vtable_ea)) {
                 if (resolved_class_name.empty()) {
-                    for (const auto& c : all_classes) {
-                        if (c.vtable_ea == resolved_vtable_ea) {
-                            resolved_class_name = c.clean_name;
-                            class_hierarchy = c.hierarchy;
-                            break;
-                        }
+                    const auto* c = RttiIndex::Instance().FindClass("", resolved_vtable_ea);
+                    if (c) {
+                        resolved_class_name = c->clean_name;
+                        class_hierarchy = c->hierarchy;
                     }
                 }
 

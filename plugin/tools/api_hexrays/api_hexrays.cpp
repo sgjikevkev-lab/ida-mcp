@@ -542,12 +542,34 @@ namespace tools::hexrays_ast {
                     }
 
                     if (jcc_ea != BADADDR) {
+                        ea_t taken_ea = insn.Op1.addr;
+                        ea_t fallthrough_ea = jcc_ea + insn.size;
+
+                        ea_t then_ea = (cif->ithen ? cif->ithen->ea : BADADDR);
+                        ea_t else_ea = (cif->ielse ? cif->ielse->ea : BADADDR);
+
+                        bool taken_is_true = false;
+                        if (then_ea != BADADDR && taken_ea == then_ea) {
+                            taken_is_true = true;
+                        } else if (else_ea != BADADDR && taken_ea == else_ea) {
+                            taken_is_true = false;
+                        } else if (then_ea != BADADDR && fallthrough_ea == then_ea) {
+                            taken_is_true = false;
+                        } else if (else_ea != BADADDR && fallthrough_ea == else_ea) {
+                            taken_is_true = true;
+                        }
+
+                        bool want_true = (req.force_branch == "always_true");
+                        bool should_jump = (want_true == taken_is_true);
+
                         uint8_t op0 = get_byte(jcc_ea);
                         if (op0 >= 0x70 && op0 <= 0x7F) {
-                            if (req.force_branch == "always_true") {
+                            if (!should_jump) {
+                                // Fallthrough: NOP out the 2-byte short Jcc
                                 patch_byte(jcc_ea, 0x90);
                                 patch_byte(jcc_ea + 1, 0x90);
                             } else {
+                                // Taken: Convert short Jcc (7x cb) to short JMP (EB cb)
                                 patch_byte(jcc_ea, 0xEB);
                             }
                             idb_patched = true;
@@ -555,11 +577,15 @@ namespace tools::hexrays_ast {
                         } else if (op0 == 0x0F) {
                             uint8_t op1 = get_byte(jcc_ea + 1);
                             if (op1 >= 0x80 && op1 <= 0x8F) {
-                                if (req.force_branch == "always_true") {
+                                if (!should_jump) {
+                                    // Fallthrough: NOP out the 6-byte near Jcc
                                     for (int k = 0; k < 6; ++k) patch_byte(jcc_ea + k, 0x90);
                                 } else {
+                                    // Taken: Convert near Jcc (0F 8x cd) to near JMP (E9 cd 90)
+                                    // Near JMP E9 is 5 bytes; displacement is relative to next insn (jcc_ea + 5)
+                                    int32_t new_disp = static_cast<int32_t>(taken_ea - (jcc_ea + 5));
                                     patch_byte(jcc_ea, 0xE9);
-                                    for (int k = 0; k < 4; ++k) patch_byte(jcc_ea + 1 + k, get_byte(jcc_ea + 2 + k));
+                                    patch_dword(jcc_ea + 1, static_cast<uint32>(new_disp));
                                     patch_byte(jcc_ea + 5, 0x90);
                                 }
                                 idb_patched = true;

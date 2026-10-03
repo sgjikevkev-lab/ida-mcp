@@ -77,37 +77,55 @@ namespace server {
             });
         }
 
-        struct tool_exec_request_t : public exec_request_t {
+        struct PipeJobState {
             std::function<void()> work;
             HANDLE hEvent = NULL;
             DWORD exception_code = 0;
             std::atomic<bool> done{false};
-            std::atomic<bool> abandoned{false};
+            std::atomic<bool> cancelled{false};
+            std::string response_json;
 
-            tool_exec_request_t(std::function<void()> w) : work(std::move(w)) {
+            PipeJobState() {
                 hEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
             }
 
-            virtual ~tool_exec_request_t() {
+            explicit PipeJobState(std::function<void()> w) : work(std::move(w)) {
+                hEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            }
+
+            ~PipeJobState() {
                 if (hEvent) {
                     CloseHandle(hEvent);
                     hEvent = NULL;
                 }
             }
+        };
+
+        struct tool_exec_request_t : public exec_request_t {
+            std::shared_ptr<PipeJobState> state;
+            std::atomic<bool> abandoned{false};
+
+            tool_exec_request_t(std::shared_ptr<PipeJobState> s) : state(std::move(s)) {}
+
+            virtual ~tool_exec_request_t() = default;
 
             virtual ssize_t idaapi execute() override {
-                if (!abandoned.load()) {
+                if (state && !state->cancelled.load(std::memory_order_acquire)) {
                     try {
-                        work();
+                        if (state->work) {
+                            state->work();
+                        }
                     } catch (...) {
-                        exception_code = 0xE06D7363;
+                        state->exception_code = 0xE06D7363;
                     }
                 }
-                done.store(true);
-                if (hEvent) {
-                    SetEvent(hEvent);
+                if (state) {
+                    state->done.store(true, std::memory_order_release);
+                    if (state->hEvent) {
+                        SetEvent(state->hEvent);
+                    }
                 }
-                if (abandoned.load()) {
+                if (abandoned.load(std::memory_order_acquire)) {
                     delete this;
                 }
                 return 0;
@@ -342,22 +360,23 @@ namespace server {
                     }
                     PluginStatusTracker::Instance().BeginTool(name, summary);
 
-                    std::string response_json;
-                    auto* exec_req = new tool_exec_request_t([&]() {
+                    auto job_state = std::make_shared<PipeJobState>();
+                    job_state->work = [this, line, id, job_state]() {
                         try {
-                            response_json = tool_registry_->HandleRequest(line);
+                            job_state->response_json = tool_registry_->HandleRequest(line);
                         } catch (const std::exception& e) {
-                            response_json = tools::utils::MakeToolErrorJson(id, std::string("Internal error: ") + e.what(), "internal_error").dump();
+                            job_state->response_json = tools::utils::MakeToolErrorJson(id, std::string("Internal error: ") + e.what(), "internal_error").dump();
                         } catch (...) {
-                            response_json = tools::utils::MakeToolErrorJson(id, "Unknown internal exception", "internal_error").dump();
+                            job_state->response_json = tools::utils::MakeToolErrorJson(id, "Unknown internal exception", "internal_error").dump();
                         }
-                    });
+                    };
 
+                    auto* exec_req = new tool_exec_request_t(job_state);
                     int reqf = IsWriteTool(name) ? MFF_WRITE : MFF_READ;
                     ssize_t req_id = execute_sync(*exec_req, reqf | MFF_NOWAIT);
 
                     // Wait for completion while servicing any concurrent get_status requests
-                    while (!exec_req->done.load() && running_) {
+                    while (!job_state->done.load(std::memory_order_acquire) && running_) {
                         OVERLAPPED ov_status{};
                         ov_status.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
                         char s_buf[4096];
@@ -367,21 +386,31 @@ namespace server {
 
                         if (!s_read_ok && s_err != ERROR_IO_PENDING) {
                             CloseHandle(ov_status.hEvent);
-                            WaitForSingleObject(exec_req->hEvent, INFINITE);
-                            delete exec_req;
+                            job_state->cancelled.store(true, std::memory_order_release);
+                            bool can = cancel_exec_request(static_cast<int>(req_id));
+                            if (can) {
+                                delete exec_req;
+                            } else {
+                                exec_req->abandoned.store(true, std::memory_order_release);
+                            }
                             PluginStatusTracker::Instance().EndTool();
                             goto client_disconnected;
                         }
 
-                        HANDLE wait_arr[3] = { shutdown_event_, exec_req->hEvent, ov_status.hEvent };
+                        HANDLE wait_arr[3] = { shutdown_event_, job_state->hEvent, ov_status.hEvent };
                         DWORD wr = WaitForMultipleObjects(3, wait_arr, FALSE, INFINITE);
 
                         if (wr == WAIT_OBJECT_0) {
                             // Server shutdown requested
                             CancelIo(hPipe);
                             CloseHandle(ov_status.hEvent);
-                            cancel_exec_request(static_cast<int>(req_id));
-                            exec_req->abandoned.store(true);
+                            job_state->cancelled.store(true, std::memory_order_release);
+                            bool can = cancel_exec_request(static_cast<int>(req_id));
+                            if (can) {
+                                delete exec_req;
+                            } else {
+                                exec_req->abandoned.store(true, std::memory_order_release);
+                            }
                             PluginStatusTracker::Instance().EndTool();
                             goto client_disconnected;
                         } else if (wr == WAIT_OBJECT_0 + 1) {
@@ -434,6 +463,8 @@ namespace server {
 
                     delete exec_req;
                     PluginStatusTracker::Instance().EndTool();
+
+                    std::string response_json = job_state->response_json;
 
                     response_json += "\n";
                     WriteToPipe(hPipe, response_json);

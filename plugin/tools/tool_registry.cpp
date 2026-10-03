@@ -150,14 +150,37 @@ namespace tools {
                     rpc_resp["result"].contains("content") &&
                     rpc_resp["result"]["content"].is_array() &&
                     !rpc_resp["result"]["content"].empty() &&
-                    rpc_resp["result"]["content"][0].contains("text")) {
+                    rpc_resp["result"]["content"][0].contains("text") &&
+                    rpc_resp["result"]["content"][0]["text"].is_string()) {
 
-                    std::string text = rpc_resp["result"]["content"][0]["text"].get<std::string>();
-                    nlohmann::json payload = nlohmann::json::parse(text);
-                    if (payload.is_object()) {
+                    std::string& text = rpc_resp["result"]["content"][0]["text"].get_ref<std::string&>();
+                    size_t first_brace = text.find('{');
+                    size_t last_brace = text.rfind('}');
+                    if (first_brace != std::string::npos && last_brace != std::string::npos && first_brace < last_brace) {
+                        bool is_empty = true;
+                        for (size_t i = first_brace + 1; i < last_brace; ++i) {
+                            if (!isspace(static_cast<unsigned char>(text[i]))) {
+                                is_empty = false;
+                                break;
+                            }
+                        }
+
+                        text.erase(last_brace);
+                        while (text.size() > first_brace + 1 && isspace(static_cast<unsigned char>(text.back()))) {
+                            text.pop_back();
+                        }
+
+                        char num_buf[32];
                         double rounded = std::round(elapsed_sec * 1000.0) / 1000.0;
-                        payload["elapsed_sec"] = rounded;
-                        rpc_resp["result"]["content"][0]["text"] = payload.dump(2);
+                        qsnprintf(num_buf, sizeof(num_buf), "%.3f", rounded);
+
+                        if (is_empty) {
+                            text.append("\n  \"elapsed_sec\": ");
+                        } else {
+                            text.append(",\n  \"elapsed_sec\": ");
+                        }
+                        text.append(num_buf);
+                        text.append("\n}");
                     }
                 }
             } catch (...) {
