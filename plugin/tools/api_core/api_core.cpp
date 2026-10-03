@@ -91,14 +91,14 @@ namespace tools::core {
             size_t start_idx = static_cast<size_t>(std::max(0, offset));
 
             if (cursor_ea != BADADDR) {
-                func_t* f_cur = get_func(cursor_ea);
-                if (f_cur) {
-                    for (size_t k = 0; k < total; ++k) {
-                        func_t* fn = getn_func(k);
-                        if (fn && fn->start_ea >= cursor_ea) {
-                            start_idx = k;
-                            break;
-                        }
+                int fn_num = get_func_num(cursor_ea);
+                if (fn_num >= 0) {
+                    start_idx = static_cast<size_t>(fn_num);
+                } else {
+                    func_t* nxt = get_next_func(cursor_ea);
+                    if (nxt) {
+                        int nxt_num = get_func_num(nxt->start_ea);
+                        if (nxt_num >= 0) start_idx = static_cast<size_t>(nxt_num);
                     }
                 }
             }
@@ -387,14 +387,19 @@ namespace tools::core {
             total_strings = get_strlist_qty();
             size_t start_idx = static_cast<size_t>(std::max(0, offset));
 
-            if (cursor_ea != BADADDR) {
-                for (size_t k = 0; k < total_strings; ++k) {
+            if (cursor_ea != BADADDR && total_strings > 0) {
+                size_t low = 0;
+                size_t high = total_strings;
+                while (low < high) {
+                    size_t mid = low + (high - low) / 2;
                     string_info_t si;
-                    if (get_strlist_item(&si, k) && si.ea >= cursor_ea) {
-                        start_idx = k;
-                        break;
+                    if (get_strlist_item(&si, mid) && si.ea < cursor_ea) {
+                        low = mid + 1;
+                    } else {
+                        high = mid;
                     }
                 }
+                start_idx = low;
             }
 
             int fetched = 0;

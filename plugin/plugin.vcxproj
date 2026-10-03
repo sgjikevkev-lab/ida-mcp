@@ -112,7 +112,6 @@
     <ClInclude Include="tools\api_python\api_python.h" />
     <ClInclude Include="tools\api_rtti\api_rtti.h" />
     <ClInclude Include="tools\api_sigmaker\api_sigmaker.h" />
-    <ClInclude Include="tools\api_sigmaker\qis\signature.hpp" />
     <ClInclude Include="tools\api_types\api_types.h" />
     <ClInclude Include="tools\api_hexrays\api_hexrays.h" />
     <ClInclude Include="tools\api_hexrays\ctree_serializer.h" />

@@ -93,9 +93,6 @@
     <ClInclude Include="tools\api_sigmaker\api_sigmaker.h">
       <Filter>tools\api_sigmaker</Filter>
     </ClInclude>
-    <ClInclude Include="tools\api_sigmaker\qis\signature.hpp">
-      <Filter>tools\api_sigmaker</Filter>
-    </ClInclude>
     <ClInclude Include="tools\api_python\api_python.h">
       <Filter>tools\api_python</Filter>
     </ClInclude>

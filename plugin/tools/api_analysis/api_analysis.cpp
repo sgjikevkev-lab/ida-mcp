@@ -159,19 +159,32 @@ namespace tools::analysis {
 
         sync::SyncRead([&]() {
             func_t* fn = get_func(start_ea);
-            ea_t cur = start_ea;
             size_t fetched = 0;
 
-            while (cur != BADADDR && is_mapped(cur) && fetched < count) {
-                std::string dis = CleanDisasmLine(cur);
-                if (dis.empty()) break;
+            if (fn) {
+                func_item_iterator_t fii;
+                for (bool ok = fii.set(fn, start_ea); ok && fetched < count; ok = fii.next_head()) {
+                    ea_t cur = fii.current();
+                    if (!is_mapped(cur)) break;
+                    std::string dis = CleanDisasmLine(cur);
+                    if (dis.empty()) break;
 
-                instructions.push_back(tools::utils::FormatAddress(cur) + ":  " + dis);
-                decoded_any = true;
-                fetched++;
+                    instructions.push_back(tools::utils::FormatAddress(cur) + ":  " + dis);
+                    decoded_any = true;
+                    fetched++;
+                }
+            } else {
+                ea_t cur = start_ea;
+                while (cur != BADADDR && is_mapped(cur) && fetched < count) {
+                    std::string dis = CleanDisasmLine(cur);
+                    if (dis.empty()) break;
 
-                cur = get_item_end(cur);
-                if (fn && cur >= fn->end_ea) break;
+                    instructions.push_back(tools::utils::FormatAddress(cur) + ":  " + dis);
+                    decoded_any = true;
+                    fetched++;
+
+                    cur = get_item_end(cur);
+                }
             }
         });
 
@@ -374,9 +387,11 @@ namespace tools::analysis {
                 qstring caller_name;
                 get_func_name(&caller_name, fn->start_ea);
 
-                for (ea_t cur = fn->start_ea; cur < fn->end_ea; cur = get_item_end(cur)) {
+                func_item_iterator_t fii;
+                for (bool ok = fii.set(fn, fn->start_ea); ok; ok = fii.next_head()) {
+                    ea_t cur = fii.current();
                     xrefblk_t xb;
-                    for (bool ok = xb.first_from(cur, XREF_ALL); ok; ok = xb.next_from()) {
+                    for (bool xok = xb.first_from(cur, XREF_ALL); xok; xok = xb.next_from()) {
                         if (xb.iscode && xb.type == fl_CN) {
                             qstring target_name;
                             get_func_name(&target_name, xb.to);
@@ -434,90 +449,50 @@ namespace tools::analysis {
         if (count <= 0) count = 50;
         if (count > 1000) count = 1000;
 
-        std::vector<int16_t> pat;
-        std::stringstream ss(pattern_str);
-        std::string tok;
-        while (ss >> tok) {
-            if (tok == "?" || tok == "??") {
-                pat.push_back(-1);
-            } else {
-                try {
-                    pat.push_back(static_cast<int16_t>(std::stoul(tok, nullptr, 16)));
-                } catch (...) {
-                }
-            }
-        }
-
-        if (pat.empty()) {
-            return tools::utils::MakeToolErrorJson(id, "Pattern contains no valid byte tokens", "invalid_pattern");
-        }
-
         nlohmann::json matches = nlohmann::json::array();
         int next_offset = -1;
         ea_t next_cursor_ea = BADADDR;
+        std::string parse_err;
 
         sync::SyncRead([&]() {
-            size_t seg_qty = get_segm_qty();
-            constexpr size_t CHUNK_SIZE = 65536;
-            size_t overlap = pat.size() > 0 ? (pat.size() - 1) : 0;
-            std::vector<uint8_t> chunk(CHUNK_SIZE + overlap);
+            compiled_binpat_vec_t bbv;
+            qstring errbuf;
+            ea_t start_scope = (cursor_ea != BADADDR) ? cursor_ea : inf_get_min_ea();
+            if (!parse_binpat_str(&bbv, start_scope, pattern_str.c_str(), 16, PBSENC_DEF1BPU, &errbuf)) {
+                parse_err = errbuf.empty() ? "Failed to parse binary pattern string" : errbuf.c_str();
+                return;
+            }
+
+            ea_t search_cur = start_scope;
+            ea_t max_ea = inf_get_max_ea();
             size_t current_idx = 0;
             size_t fetched = 0;
 
-            for (size_t s = 0; s < seg_qty && fetched < count; ++s) {
-                segment_t* seg = getnseg(s);
-                if (!seg) continue;
+            while (search_cur != BADADDR && search_cur < max_ea && fetched < count) {
+                ea_t match_ea = bin_search(search_cur, max_ea, bbv, BIN_SEARCH_FORWARD | BIN_SEARCH_NOBREAK | BIN_SEARCH_NOSHOW);
+                if (match_ea == BADADDR) break;
 
-                if (cursor_ea != BADADDR && seg->end_ea <= cursor_ea) continue;
+                if (current_idx >= offset) {
+                    segment_t* seg = getseg(match_ea);
+                    qstring seg_name;
+                    if (seg) get_segm_name(&seg_name, seg);
 
-                size_t seg_size = seg->end_ea - seg->start_ea;
-                if (seg_size < pat.size()) continue;
-
-                ea_t seg_start = seg->start_ea;
-                if (cursor_ea != BADADDR && cursor_ea > seg_start) {
-                    seg_start = cursor_ea;
+                    matches.push_back({
+                        {"address", tools::utils::FormatAddress(match_ea)},
+                        {"segment", seg_name.c_str()}
+                    });
+                    fetched++;
+                    next_offset = static_cast<int>(current_idx + 1);
+                    next_cursor_ea = match_ea + 1;
                 }
-
-                for (ea_t cur = seg_start; cur < seg->end_ea && fetched < count; ) {
-                    size_t to_read = std::min<size_t>(CHUNK_SIZE + overlap, static_cast<size_t>(seg->end_ea - cur));
-                    if (to_read < pat.size()) break;
-
-                    ssize_t bytes_read = get_bytes(chunk.data(), to_read, cur);
-                    if (bytes_read <= 0) break;
-
-                    for (size_t i = 0; i + pat.size() <= static_cast<size_t>(bytes_read) && fetched < count; ++i) {
-                        ea_t match_ea = cur + i;
-                        if (cursor_ea != BADADDR && match_ea < cursor_ea) continue;
-
-                        bool match = true;
-                        for (size_t p = 0; p < pat.size(); ++p) {
-                            if (pat[p] != -1 && chunk[i + p] != static_cast<uint8_t>(pat[p])) {
-                                match = false;
-                                break;
-                            }
-                        }
-
-                        if (match) {
-                            if (current_idx >= offset) {
-                                qstring seg_name;
-                                get_segm_name(&seg_name, seg);
-                                matches.push_back({
-                                    {"address", tools::utils::FormatAddress(match_ea)},
-                                    {"segment", seg_name.c_str()}
-                                });
-                                fetched++;
-                                next_offset = static_cast<int>(current_idx + 1);
-                                next_cursor_ea = match_ea + 1;
-                            }
-                            current_idx++;
-                        }
-                    }
-
-                    if (bytes_read <= static_cast<ssize_t>(CHUNK_SIZE)) break;
-                    cur += CHUNK_SIZE;
-                }
+                current_idx++;
+                search_cur = match_ea + 1;
             }
         });
+
+        if (!parse_err.empty()) {
+            return tools::utils::MakeToolErrorJson(id, parse_err, "invalid_pattern");
+        }
 
         nlohmann::json res = {
             {"status", "success"},

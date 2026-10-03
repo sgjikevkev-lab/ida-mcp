@@ -419,15 +419,18 @@ namespace mcp {
             },
             {
                 "name": "make_signature",
-                "description": "Generate unique pattern signature for function or range with automatic operand wildcards. Useful for pattern scanning.",
+                "description": "Generate unique pattern signatures for functions, global variables, or explicit address ranges with automatic operand wildcards ('?').\n\nHow to use:\n1. Standard Function Signature: Pass 'addr' of the function. Generates a unique signature starting from function entry.\n2. Shortest / Resilient Signature (Recommended): Pass 'addr' and set 'shortest': true. Deep-searches the function body, caller call sites, and variable XREFs to find the absolute shortest unique signature slice. Returns the pattern, 'offset' relative to target, and signature 'type'.\n3. Global Variable Signature: Pass 'addr' of a global variable in .data/.bss. Automatically locates code XREFs referencing the variable, masks displacement bytes, and returns a signature targeting the reference with 'disp_offset'.\n4. Explicit Range: Pass 'start' and 'end' addresses to generate a pattern for an exact byte/instruction slice.\n\nCRITICAL RULE FOR 'continue_outside_function':\nUse 'continue_outside_function': true ONLY in the absolute last resort when it is impossible to find a unique signature within the function boundary (e.g. tiny 1-2 instruction thunks or stubs). Crossing function boundaries makes signatures extremely fragile to compiler reordering and layout shifts across binary updates.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "addr": {"type": "string", "description": "Function address (hex '0x140001000', integer, or symbol name)"},
+                        "addr": {"type": "string", "description": "Target address of function or global variable (hex '0x140001000', integer, or symbol name)"},
                         "start": {"type": "string", "description": "Optional explicit range start address"},
                         "end": {"type": "string", "description": "Optional explicit range end address"},
+                        "shortest": {"type": "boolean", "description": "Deep search for the shortest unique signature across the function body, caller sites, or code references for global variables (default false, recommended true)"},
                         "max_length": {"type": "integer", "description": "Max pattern length in bytes (default 250)"},
-                        "wildcard_operands": {"type": "boolean", "description": "Mask variable operands with '?' (default true)"}
+                        "candidate_limit": {"type": "integer", "description": "Max candidate starting positions inside function to evaluate when shortest=true (default 64)"},
+                        "wildcard_operands": {"type": "boolean", "description": "Mask variable operands, relative offsets, and displacement bytes with '?' (default true)"},
+                        "continue_outside_function": {"type": "boolean", "description": "Allow pattern search to cross function boundary into adjacent code. CRITICAL: Use ONLY as an absolute last resort when a unique pattern cannot be found within the function (e.g. tiny 1-2 instruction stubs), as crossing boundaries makes signatures extremely fragile across binary updates (default false)"}
                     }
                 }
             },

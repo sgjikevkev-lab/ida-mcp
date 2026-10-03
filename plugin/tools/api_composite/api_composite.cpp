@@ -151,9 +151,11 @@ namespace tools::composite {
 
             nlohmann::json callees_arr = nlohmann::json::array();
             std::set<ea_t> callees_seen;
-            for (ea_t cur = fn->start_ea; cur < fn->end_ea; cur = get_item_end(cur)) {
+            func_item_iterator_t fii;
+            for (bool ok = fii.set(fn, fn->start_ea); ok; ok = fii.next_head()) {
+                ea_t cur = fii.current();
                 xrefblk_t xb_from;
-                for (bool ok = xb_from.first_from(cur, XREF_ALL); ok; ok = xb_from.next_from()) {
+                for (bool xok = xb_from.first_from(cur, XREF_ALL); xok; xok = xb_from.next_from()) {
                     if (xb_from.iscode && xb_from.type == fl_CN && callees_seen.find(xb_from.to) == callees_seen.end()) {
                         callees_seen.insert(xb_from.to);
                         qstring callee_name;
