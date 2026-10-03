@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="!ibs">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="ipc">
+      <UniqueIdentifier>{a1b2c3d4-1111-4444-8888-000000000001}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="ida">
+      <UniqueIdentifier>{a1b2c3d4-2222-4444-8888-000000000002}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="mcp">
+      <UniqueIdentifier>{a1b2c3d4-3333-4444-8888-000000000003}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="router">
+      <UniqueIdentifier>{a1b2c3d4-4444-4444-8888-000000000004}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="ipc\pipe_client.cpp">
+      <Filter>ipc</Filter>
+    </ClCompile>
+    <ClCompile Include="ida\discovery.cpp">
+      <Filter>ida</Filter>
+    </ClCompile>
+    <ClCompile Include="router\ida_router.cpp">
+      <Filter>router</Filter>
+    </ClCompile>
+    <ClCompile Include="main.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="!ibs\json.h">
+      <Filter>!ibs</Filter>
+    </ClInclude>
+    <ClInclude Include="ipc\pipe_client.h">
+      <Filter>ipc</Filter>
+    </ClInclude>
+    <ClInclude Include="ida\discovery.h">
+      <Filter>ida</Filter>
+    </ClInclude>
+    <ClInclude Include="ida\instance.h">
+      <Filter>ida</Filter>
+    </ClInclude>
+    <ClInclude Include="..\shared\ida_tools_schema.h">
+    </ClInclude>
+    <ClInclude Include="mcp\protocol.h">
+      <Filter>mcp</Filter>
+    </ClInclude>
+    <ClInclude Include="mcp\transport.h">
+      <Filter>mcp</Filter>
+    </ClInclude>
+    <ClInclude Include="router\ida_router.h">
+      <Filter>router</Filter>
+    </ClInclude>
+  </ItemGroup>
+</Project>

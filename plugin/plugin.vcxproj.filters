@@ -1,0 +1,165 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="!ibs">
+      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="discovery">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="server">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="sync">
+      <UniqueIdentifier>{8e52a919-61bf-4b9b-9ff9-7231c5188f61}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="tools">
+      <UniqueIdentifier>{a983b632-15f1-4db5-b8aa-67e43690d512}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="tools\api_core">
+      <UniqueIdentifier>{11111111-2222-3333-4444-555555555555}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="tools\api_memory">
+      <UniqueIdentifier>{22222222-3333-4444-5555-666666666666}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="tools\api_analysis">
+      <UniqueIdentifier>{33333333-4444-5555-6666-777777777777}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="tools\api_modify">
+      <UniqueIdentifier>{44444444-5555-6666-7777-888888888888}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="tools\api_types">
+      <UniqueIdentifier>{55555555-6666-7777-8888-999999999999}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="tools\api_composite">
+      <UniqueIdentifier>{88888888-9999-0000-1111-222222222222}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="tools\api_sigmaker">
+      <UniqueIdentifier>{99999999-0000-1111-2222-333333333333}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="tools\api_python">
+      <UniqueIdentifier>{00000000-1111-2222-3333-444444444444}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="tools\api_rtti">
+      <UniqueIdentifier>{77777777-8888-9999-0000-111111111111}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="tools\api_hexrays">
+      <UniqueIdentifier>{aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="tools\utils">
+      <UniqueIdentifier>{66666666-7777-8888-9999-000000000000}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="!ibs\json.h">
+      <Filter>!ibs</Filter>
+    </ClInclude>
+    <ClInclude Include="discovery\registration.h">
+      <Filter>discovery</Filter>
+    </ClInclude>
+    <ClInclude Include="server\pipe_server.h">
+      <Filter>server</Filter>
+    </ClInclude>
+    <ClInclude Include="sync\sync.h">
+      <Filter>sync</Filter>
+    </ClInclude>
+    <ClInclude Include="tools\tool_registry.h">
+      <Filter>tools</Filter>
+    </ClInclude>
+    <ClInclude Include="tools\utils\utils.h">
+      <Filter>tools\utils</Filter>
+    </ClInclude>
+    <ClInclude Include="tools\api_core\api_core.h">
+      <Filter>tools\api_core</Filter>
+    </ClInclude>
+    <ClInclude Include="tools\api_memory\api_memory.h">
+      <Filter>tools\api_memory</Filter>
+    </ClInclude>
+    <ClInclude Include="tools\api_analysis\api_analysis.h">
+      <Filter>tools\api_analysis</Filter>
+    </ClInclude>
+    <ClInclude Include="tools\api_modify\api_modify.h">
+      <Filter>tools\api_modify</Filter>
+    </ClInclude>
+    <ClInclude Include="tools\api_types\api_types.h">
+      <Filter>tools\api_types</Filter>
+    </ClInclude>
+    <ClInclude Include="tools\api_composite\api_composite.h">
+      <Filter>tools\api_composite</Filter>
+    </ClInclude>
+    <ClInclude Include="tools\api_composite\crypto_consts.h">
+      <Filter>tools\api_composite</Filter>
+    </ClInclude>
+    <ClInclude Include="tools\api_sigmaker\api_sigmaker.h">
+      <Filter>tools\api_sigmaker</Filter>
+    </ClInclude>
+    <ClInclude Include="tools\api_sigmaker\qis\signature.hpp">
+      <Filter>tools\api_sigmaker</Filter>
+    </ClInclude>
+    <ClInclude Include="tools\api_python\api_python.h">
+      <Filter>tools\api_python</Filter>
+    </ClInclude>
+    <ClInclude Include="tools\api_rtti\api_rtti.h">
+      <Filter>tools\api_rtti</Filter>
+    </ClInclude>
+    <ClInclude Include="tools\api_hexrays\api_hexrays.h">
+      <Filter>tools\api_hexrays</Filter>
+    </ClInclude>
+    <ClInclude Include="tools\api_hexrays\ctree_serializer.h">
+      <Filter>tools\api_hexrays</Filter>
+    </ClInclude>
+    <ClInclude Include="tools\api_hexrays\mba_rules.h">
+      <Filter>tools\api_hexrays</Filter>
+    </ClInclude>
+    <ClInclude Include="..\shared\ida_tools_schema.h">
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="discovery\registration.cpp">
+      <Filter>discovery</Filter>
+    </ClCompile>
+    <ClCompile Include="main.cpp" />
+    <ClCompile Include="server\pipe_server.cpp">
+      <Filter>server</Filter>
+    </ClCompile>
+    <ClCompile Include="tools\tool_registry.cpp">
+      <Filter>tools</Filter>
+    </ClCompile>
+    <ClCompile Include="tools\utils\utils.cpp">
+      <Filter>tools\utils</Filter>
+    </ClCompile>
+    <ClCompile Include="tools\api_core\api_core.cpp">
+      <Filter>tools\api_core</Filter>
+    </ClCompile>
+    <ClCompile Include="tools\api_memory\api_memory.cpp">
+      <Filter>tools\api_memory</Filter>
+    </ClCompile>
+    <ClCompile Include="tools\api_analysis\api_analysis.cpp">
+      <Filter>tools\api_analysis</Filter>
+    </ClCompile>
+    <ClCompile Include="tools\api_modify\api_modify.cpp">
+      <Filter>tools\api_modify</Filter>
+    </ClCompile>
+    <ClCompile Include="tools\api_python\api_python.cpp">
+      <Filter>tools\api_python</Filter>
+    </ClCompile>
+    <ClCompile Include="tools\api_rtti\api_rtti.cpp">
+      <Filter>tools\api_rtti</Filter>
+    </ClCompile>
+    <ClCompile Include="tools\api_sigmaker\api_sigmaker.cpp">
+      <Filter>tools\api_sigmaker</Filter>
+    </ClCompile>
+    <ClCompile Include="tools\api_types\api_types.cpp">
+      <Filter>tools\api_types</Filter>
+    </ClCompile>
+    <ClCompile Include="tools\api_composite\api_composite.cpp">
+      <Filter>tools\api_composite</Filter>
+    </ClCompile>
+    <ClCompile Include="tools\api_hexrays\api_hexrays.cpp">
+      <Filter>tools\api_hexrays</Filter>
+    </ClCompile>
+    <ClCompile Include="tools\api_hexrays\ctree_serializer.cpp">
+      <Filter>tools\api_hexrays</Filter>
+    </ClCompile>
+  </ItemGroup>
+</Project>

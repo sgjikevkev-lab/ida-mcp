@@ -1,0 +1,145 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>18.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{98b722af-f061-498b-9446-d77d4a09f231}</ProjectGuid>
+    <RootNamespace>idamcp</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <PreferredToolArchitecture>x64</PreferredToolArchitecture>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <TargetName>ida_mcp64</TargetName>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <TargetName>ida_mcp64</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>false</SDLCheck>
+      <PreprocessorDefinitions>_DEBUG;__NT__;__EA64__;__IDP__;WIN32_LEAN_AND_MEAN;NOMINMAX;_WINDOWS;_USRDLL;_WINSOCK_DEPRECATED_NO_WARNINGS;_SILENCE_ALL_CXX20_DEPRECATION_WARNINGS;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <AdditionalIncludeDirectories>$(ProjectDir)!ibs;$(ProjectDir)!ibs\ida_92\include;$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
+      <DisableAnalyzeExternalHeader>true</DisableAnalyzeExternalHeader>
+      <DisableSpecificWarnings>4267;4244;4018;4005;4996</DisableSpecificWarnings>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <EnableUAC>false</EnableUAC>
+      <AdditionalLibraryDirectories>$(ProjectDir)!ibs\ida_92\lib;$(ProjectDir)!ibs\ida_92\lib\x64_win_vc_64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>ida.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>false</SDLCheck>
+      <PreprocessorDefinitions>NDEBUG;__NT__;__EA64__;__IDP__;WIN32_LEAN_AND_MEAN;NOMINMAX;_WINDOWS;_USRDLL;_WINSOCK_DEPRECATED_NO_WARNINGS;_SILENCE_ALL_CXX20_DEPRECATION_WARNINGS;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <AdditionalIncludeDirectories>$(ProjectDir)!ibs;$(ProjectDir)!ibs\ida_92\include;$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
+      <DisableAnalyzeExternalHeader>true</DisableAnalyzeExternalHeader>
+      <DisableSpecificWarnings>4267;4244;4018;4005;4996</DisableSpecificWarnings>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <EnableUAC>false</EnableUAC>
+      <AdditionalLibraryDirectories>$(ProjectDir)!ibs\ida_92\lib;$(ProjectDir)!ibs\ida_92\lib\x64_win_vc_64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>ida.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="!ibs\json.h" />
+    <ClInclude Include="discovery\registration.h" />
+    <ClInclude Include="server\pipe_server.h" />
+    <ClInclude Include="sync\sync.h" />
+    <ClInclude Include="tools\api_analysis\api_analysis.h" />
+    <ClInclude Include="tools\api_composite\api_composite.h" />
+    <ClInclude Include="tools\api_composite\crypto_consts.h" />
+    <ClInclude Include="tools\api_core\api_core.h" />
+    <ClInclude Include="tools\api_memory\api_memory.h" />
+    <ClInclude Include="tools\api_modify\api_modify.h" />
+    <ClInclude Include="tools\api_python\api_python.h" />
+    <ClInclude Include="tools\api_rtti\api_rtti.h" />
+    <ClInclude Include="tools\api_sigmaker\api_sigmaker.h" />
+    <ClInclude Include="tools\api_sigmaker\qis\signature.hpp" />
+    <ClInclude Include="tools\api_types\api_types.h" />
+    <ClInclude Include="tools\api_hexrays\api_hexrays.h" />
+    <ClInclude Include="tools\api_hexrays\ctree_serializer.h" />
+    <ClInclude Include="tools\api_hexrays\mba_rules.h" />
+    <ClInclude Include="tools\tool_registry.h" />
+    <ClInclude Include="tools\utils\utils.h" />
+    <ClInclude Include="..\shared\ida_tools_schema.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="discovery\registration.cpp" />
+    <ClCompile Include="main.cpp" />
+    <ClCompile Include="server\pipe_server.cpp" />
+    <ClCompile Include="tools\api_analysis\api_analysis.cpp" />
+    <ClCompile Include="tools\api_composite\api_composite.cpp" />
+    <ClCompile Include="tools\api_core\api_core.cpp" />
+    <ClCompile Include="tools\api_memory\api_memory.cpp" />
+    <ClCompile Include="tools\api_modify\api_modify.cpp" />
+    <ClCompile Include="tools\api_python\api_python.cpp" />
+    <ClCompile Include="tools\api_rtti\api_rtti.cpp" />
+    <ClCompile Include="tools\api_sigmaker\api_sigmaker.cpp" />
+    <ClCompile Include="tools\api_types\api_types.cpp" />
+    <ClCompile Include="tools\api_hexrays\api_hexrays.cpp" />
+    <ClCompile Include="tools\api_hexrays\ctree_serializer.cpp" />
+    <ClCompile Include="tools\tool_registry.cpp" />
+    <ClCompile Include="tools\utils\utils.cpp" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>

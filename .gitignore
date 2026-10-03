@@ -1,0 +1,28 @@
+# Visual Studio temporary files & user-specific settings
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Build outputs & Intermediate files
+bin/
+obj/
+x64/
+x86/
+Debug/
+Release/
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.iobj
+*.ipdb
+*.tlog
+*.log
+*.recipe
+*.lastbuildstate
+
+# OS files
+Thumbs.db
+Desktop.ini
