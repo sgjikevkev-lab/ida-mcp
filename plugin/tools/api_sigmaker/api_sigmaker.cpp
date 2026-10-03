@@ -14,6 +14,7 @@
 #include "api_sigmaker.h"
 #include "tools/utils/utils.h"
 #include "sync/sync.h"
+#include "sync/cache_manager.h"
 
 #include <ida.hpp>
 #include <idp.hpp>
@@ -372,6 +373,14 @@ namespace tools::sigmaker {
 
     void InvalidateSegmentCache() {
         SegmentSnapshotCache::Instance().Invalidate();
+    }
+
+    namespace {
+        struct SigmakerCacheAutoReg {
+            SigmakerCacheAutoReg() {
+                cache::CacheManager::Instance().RegisterByteInvalidator(&InvalidateSegmentCache);
+            }
+        } s_sigmaker_cache_reg;
     }
 
     bool ApiSigmaker::CanHandle(const std::string& name) const {

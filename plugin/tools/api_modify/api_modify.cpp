@@ -9,6 +9,7 @@
 #include "api_modify.h"
 #include "tools/utils/utils.h"
 #include "sync/sync.h"
+#include "sync/cache_manager.h"
 
 #include <ida.hpp>
 #include <bytes.hpp>
@@ -105,6 +106,10 @@ namespace tools::modify {
                 }
             });
 
+            if (succeeded > 0) {
+                cache::InvalidateIDBAnalysis();
+            }
+
             nlohmann::json res = {
                 {"status", "success"},
                 {"total", items.size()},
@@ -141,6 +146,8 @@ namespace tools::modify {
                 "rename_failed"
             );
         }
+
+        cache::InvalidateIDBAnalysis();
 
         nlohmann::json res = {
             {"status", "success"},
@@ -212,6 +219,8 @@ namespace tools::modify {
             );
         }
 
+        cache::InvalidateIDBAnalysis();
+
         nlohmann::json res = {
             {"status", "success"},
             {"address", tools::utils::FormatAddress(ea)},
@@ -271,6 +280,8 @@ namespace tools::modify {
         if (!asm_ok && !hexrays_ok) {
             return tools::utils::MakeToolErrorJson(id, "Failed to set comment at address " + tools::utils::FormatAddress(ea), "set_comment_failed");
         }
+
+        cache::InvalidateIDBAnalysis();
 
         nlohmann::json res = {
             {"status", "success"},
@@ -334,6 +345,8 @@ namespace tools::modify {
             );
         }
 
+        cache::InvalidateIDBAnalysis();
+
         nlohmann::json res = {
             {"status", "success"},
             {"function", tools::utils::FormatAddress(fn_start)},
@@ -393,6 +406,8 @@ namespace tools::modify {
             );
         }
 
+        cache::InvalidateIDBAnalysis();
+
         nlohmann::json res = {
             {"status", "success"},
             {"function", tools::utils::FormatAddress(fn_start)},
@@ -417,6 +432,7 @@ namespace tools::modify {
             }
         });
 
+        cache::InvalidateIDBAnalysis();
         return tools::utils::MakeToolSuccessJson(id);
     }
 }

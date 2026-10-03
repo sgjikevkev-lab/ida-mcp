@@ -10,6 +10,16 @@
 #include <ida.hpp>
 #include <kernwin.hpp>
 
+#ifdef wait
+#undef wait
+#endif
+#ifdef waitid
+#undef waitid
+#endif
+#ifdef waitpid
+#undef waitpid
+#endif
+
 namespace sync {
     namespace detail {
         template <typename F>

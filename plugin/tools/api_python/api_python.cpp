@@ -8,6 +8,7 @@
 #include "api_python.h"
 #include "tools/utils/utils.h"
 #include "sync/sync.h"
+#include "sync/cache_manager.h"
 
 #include <ida.hpp>
 #include <expr.hpp>
@@ -139,6 +140,8 @@ namespace tools::python {
                 );
             }
 
+            cache::InvalidateIDBDependentCaches();
+
             nlohmann::json res = {
                 {"status", "success"},
                 {"file", file_path},
@@ -241,6 +244,8 @@ namespace tools::python {
                 "py_eval_failed"
             );
         }
+
+        cache::InvalidateIDBDependentCaches();
 
         nlohmann::json res = {
             {"status", "success"},

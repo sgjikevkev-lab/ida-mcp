@@ -63,6 +63,9 @@
     <ClInclude Include="sync\sync.h">
       <Filter>sync</Filter>
     </ClInclude>
+    <ClInclude Include="sync\cache_manager.h">
+      <Filter>sync</Filter>
+    </ClInclude>
     <ClInclude Include="tools\tool_registry.h">
       <Filter>tools</Filter>
     </ClInclude>
@@ -110,6 +113,7 @@
     </ClInclude>
     <ClInclude Include="..\shared\ida_tools_schema.h">
     </ClInclude>
+    <ClInclude Include="server\status_tracker.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="discovery\registration.cpp">

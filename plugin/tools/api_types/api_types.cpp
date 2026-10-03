@@ -14,6 +14,7 @@
 #include "api_types.h"
 #include "tools/utils/utils.h"
 #include "sync/sync.h"
+#include "sync/cache_manager.h"
 
 #include <ida.hpp>
 #include <typeinf.hpp>
@@ -93,6 +94,7 @@ namespace tools::types {
             );
         }
 
+        cache::InvalidateIDBAnalysis();
         return tools::utils::MakeToolSuccessJson(id);
     }
 
@@ -958,6 +960,9 @@ namespace tools::types {
         };
         if (!apply_error.empty()) {
             res["apply_error"] = apply_error;
+        }
+        if (applied_ok) {
+            cache::InvalidateIDBAnalysis();
         }
         return tools::utils::MakeToolSuccessJson(id, res);
     }

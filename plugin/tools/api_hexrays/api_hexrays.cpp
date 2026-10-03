@@ -4,6 +4,7 @@
 #include "../api_sigmaker/api_sigmaker.h"
 #include "../utils/utils.h"
 #include "../../sync/sync.h"
+#include "../../sync/cache_manager.h"
 
 #include <ida.hpp>
 #include <idp.hpp>
@@ -632,7 +633,7 @@ namespace tools::hexrays_ast {
                 out_code += "\n";
             }
             if (any_idb_patched) {
-                tools::sigmaker::InvalidateSegmentCache();
+                cache::InvalidateIDBDependentCaches();
             }
         });
 

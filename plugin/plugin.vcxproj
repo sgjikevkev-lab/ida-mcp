@@ -102,7 +102,9 @@
     <ClInclude Include="!ibs\json.h" />
     <ClInclude Include="discovery\registration.h" />
     <ClInclude Include="server\pipe_server.h" />
+    <ClInclude Include="server\status_tracker.h" />
     <ClInclude Include="sync\sync.h" />
+    <ClInclude Include="sync\cache_manager.h" />
     <ClInclude Include="tools\api_analysis\api_analysis.h" />
     <ClInclude Include="tools\api_composite\api_composite.h" />
     <ClInclude Include="tools\api_composite\crypto_consts.h" />

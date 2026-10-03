@@ -20,6 +20,7 @@
 
 #include "api_rtti.h"
 #include "../../sync/sync.h"
+#include "../../sync/cache_manager.h"
 #include "../utils/utils.h"
 
 namespace tools::rtti {
@@ -429,6 +430,14 @@ namespace tools::rtti {
         inline const std::vector<RttiClassEntry>& CollectRttiClasses() {
             return RttiIndex::Instance().GetClasses();
         }
+
+        struct RttiCacheAutoReg {
+            RttiCacheAutoReg() {
+                cache::CacheManager::Instance().RegisterAnalysisInvalidator([]() {
+                    RttiIndex::Instance().Invalidate();
+                });
+            }
+        } s_rtti_cache_reg;
     }
 
     ApiRtti::ApiRtti() = default;
@@ -585,13 +594,25 @@ namespace tools::rtti {
 
     nlohmann::json ApiRtti::RttiRefresh(const nlohmann::json& id, const nlohmann::json& args) {
         size_t count = 0;
+        bool ok = false;
+        std::string err_msg;
+
         sync::SyncRead([&]() {
             try {
                 RttiIndex::Instance().Invalidate();
                 count = CollectRttiClasses().size();
+                ok = true;
+            } catch (const std::exception& e) {
+                err_msg = e.what();
             } catch (...) {
+                err_msg = "Unknown error during RTTI refresh";
             }
         });
+
+        if (!ok) {
+            return tools::utils::MakeToolErrorJson(id, "Failed to refresh RTTI index: " + err_msg, "rtti_refresh_failed");
+        }
+
         return tools::utils::MakeToolSuccessJson(id, {
             {"status", "success"},
             {"refreshed", true},
