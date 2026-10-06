@@ -15,7 +15,7 @@ namespace mcp {
         constexpr const char* JSONRPC_VERSION = "2.0";
         constexpr const char* DEFAULT_PROTOCOL_VERSION = "2024-11-05";
         constexpr const char* SERVER_NAME = "ida-multi-mcp-router-cpp";
-        constexpr const char* SERVER_VERSION = "1.1.3";
+        constexpr const char* SERVER_VERSION = "1.2.0";
     }
 
     inline json MakeSuccessResponse(const json& id, const json& result) {
