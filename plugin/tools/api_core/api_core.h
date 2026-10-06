@@ -14,12 +14,13 @@ namespace tools::core {
         nlohmann::json Dispatch(const nlohmann::json& id, const std::string& name, const nlohmann::json& args);
 
     private:
-        nlohmann::json IdbSave(const nlohmann::json& id);
+        nlohmann::json IdbSave(const nlohmann::json& id, const nlohmann::json& args = nlohmann::json::object());
         nlohmann::json ListFuncs(const nlohmann::json& id, const nlohmann::json& args);
         nlohmann::json ListGlobals(const nlohmann::json& id, const nlohmann::json& args);
         nlohmann::json ImportsQuery(const nlohmann::json& id, const nlohmann::json& args);
-        nlohmann::json GetExports(const nlohmann::json& id);
-        nlohmann::json GetSegments(const nlohmann::json& id);
+        nlohmann::json GetExports(const nlohmann::json& id, const nlohmann::json& args);
+        nlohmann::json GetSegments(const nlohmann::json& id, const nlohmann::json& args);
         nlohmann::json SearchStrings(const nlohmann::json& id, const nlohmann::json& args);
+        nlohmann::json Strings(const nlohmann::json& id, const nlohmann::json& args);
     };
 }

@@ -112,6 +112,7 @@ namespace tools::sigmaker {
             return result;
         }
 
+
         bool GetOperandWildcardBits(const insn_t& instruction, uint32_t* wildcardBits) {
             if (!wildcardBits) return false;
             *wildcardBits = 0;
@@ -448,14 +449,9 @@ namespace tools::sigmaker {
                     ss.start_ea = seg->start_ea;
                     ss.end_ea = seg->end_ea;
                     ss.size = static_cast<size_t>(seg->size());
-                    ss.data.resize(ss.size);
+                    ss.data.resize(ss.size, 0);
 
-                    ssize_t read_bytes = get_bytes(ss.data.data(), ss.size, ss.start_ea, GMB_READALL);
-                    if (read_bytes <= 0) continue;
-                    if (static_cast<size_t>(read_bytes) < ss.size) {
-                        ss.size = static_cast<size_t>(read_bytes);
-                        ss.data.resize(ss.size);
-                    }
+                    get_bytes(ss.data.data(), ss.size, ss.start_ea, GMB_READALL);
                     segs->push_back(std::move(ss));
                 }
                 SegmentSnapshotCache::Instance().SetSegments(segs);
@@ -654,20 +650,20 @@ namespace tools::sigmaker {
         int disp_off_in_sig = -1;
 
         // --- STEP 2: Worker Thread Phase (CPU-Intensive Scanning Outside Main Thread) ---
+        FastPattern final_pat;
 
         // 1. Explicit range mode
         if (is_range_mode) {
-            FastPattern pat;
             for (const auto& di : range_insns) {
-                if (pat.size() >= max_len) break;
+                if (final_pat.size() >= max_len) break;
                 const uint8_t* raw = GetSegmentPtr(segments, di.ea);
-                pat.add_raw_bytes(raw, di.len, di.wildcard_bits);
+                final_pat.add_raw_bytes(raw, di.len, di.wildcard_bits);
             }
-            pat.trim();
-            sig_str = BuildIDASignatureString(pat);
-            sig_len = pat.size();
+            final_pat.trim();
+            sig_str = BuildIDASignatureString(final_pat);
+            sig_len = final_pat.size();
             sig_ea = eaStart;
-            unique = IsPatternUniqueFast(segments, pat);
+            unique = IsPatternUniqueFast(segments, final_pat);
             if (sig_len == 0 || sig_str.empty()) {
                 return tools::utils::MakeToolErrorJson(id, "No valid bytes or instructions found in range", "empty_signature");
             }
@@ -675,7 +671,8 @@ namespace tools::sigmaker {
         // 2. Standard mode (from start address)
         else if (!shortest) {
             GrowResult r = GrowCandSignature(segments, direct_candidate, max_len, max_len + 1);
-            sig_str = BuildIDASignatureString(r.pat);
+            final_pat = std::move(r.pat);
+            sig_str = BuildIDASignatureString(final_pat);
             unique = r.unique;
             sig_len = r.length;
             sig_ea = ea;
@@ -707,7 +704,8 @@ namespace tools::sigmaker {
             }
 
             if (best_cand && best_res.unique) {
-                sig_str = BuildIDASignatureString(best_res.pat);
+                final_pat = std::move(best_res.pat);
+                sig_str = BuildIDASignatureString(final_pat);
                 unique = true;
                 sig_len = best_res.length;
                 sig_ea = best_cand->cand_ea;
@@ -716,9 +714,10 @@ namespace tools::sigmaker {
                 xref_site_ea = best_cand->xref_ea;
                 disp_off_in_sig = best_cand->disp_off;
             } else if (fallback_cand && fallback_res.pat.size() > 0) {
-                sig_str = BuildIDASignatureString(fallback_res.pat);
+                final_pat = std::move(fallback_res.pat);
+                sig_str = BuildIDASignatureString(final_pat);
                 unique = false;
-                sig_len = fallback_res.pat.size();
+                sig_len = final_pat.size();
                 sig_ea = fallback_cand->cand_ea;
                 target_offset = fallback_cand->offset;
                 sig_type = fallback_cand->type;
@@ -728,7 +727,8 @@ namespace tools::sigmaker {
                 CandidateMetadata entry_cm;
                 entry_cm.cand_ea = ea;
                 GrowResult r = GrowCandSignature(segments, entry_cm, max_len, max_len + 1);
-                sig_str = BuildIDASignatureString(r.pat);
+                final_pat = std::move(r.pat);
+                sig_str = BuildIDASignatureString(final_pat);
                 unique = r.unique;
                 sig_len = r.length;
                 sig_ea = ea;
@@ -744,15 +744,25 @@ namespace tools::sigmaker {
             }
         }
 
-        nlohmann::json res = {
-            {"status", "success"},
-            {"signature", sig_str},
-            {"unique", unique},
-            {"length", sig_len},
-            {"address", tools::utils::FormatAddress(sig_ea)},
-            {"target", tools::utils::FormatAddress(ea)},
-            {"type", sig_type}
-        };
+        nlohmann::ordered_json res;
+        res["status"] = "success";
+        res["signature"] = sig_str;
+        res["unique"] = unique;
+        res["length"] = sig_len;
+        res["address"] = tools::utils::FormatAddress(sig_ea);
+        res["target"] = tools::utils::FormatAddress(ea != BADADDR ? ea : eaStart);
+        res["type"] = sig_type;
+
+        if (!unique) {
+            ScanResult sr = ScanPattern(segments, final_pat, 10, true);
+            res["matches_count"] = sr.count;
+            nlohmann::json matches_arr = nlohmann::json::array();
+            for (ea_t m : sr.matches) {
+                matches_arr.push_back(tools::utils::FormatAddress(m));
+            }
+            res["matches"] = std::move(matches_arr);
+            res["hint"] = "Signature has duplicate occurrences in binary. Try setting 'shortest': true or 'candidate_limit': 128.";
+        }
 
         if (shortest) {
             res["shortest"] = true;

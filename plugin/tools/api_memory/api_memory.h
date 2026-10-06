@@ -16,6 +16,5 @@ namespace tools::memory {
 
     private:
         nlohmann::json GetBytes(const nlohmann::json& id, const nlohmann::json& args);
-        nlohmann::json GetString(const nlohmann::json& id, const nlohmann::json& args);
     };
 }

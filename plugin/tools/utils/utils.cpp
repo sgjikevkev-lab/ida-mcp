@@ -78,6 +78,15 @@ namespace tools::utils {
         return buf;
     }
 
+    std::string Demangle(const std::string& name) {
+        if (name.empty()) return "";
+        qstring dem;
+        if (demangle_name(&dem, name.c_str(), 0, DQT_FULL) > 0) {
+            return SanitizeUtf8(dem.c_str());
+        }
+        return "";
+    }
+
     ea_t GetAddressArg(const nlohmann::json& args, const std::string& key, ea_t default_ea) {
         auto it = args.find(key);
         if (it == args.end() || it->is_null()) {

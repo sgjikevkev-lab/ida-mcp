@@ -24,25 +24,23 @@ namespace tools::hexrays_ast {
 
     bool ApiHexrays::CanHandle(const std::string& name) const {
         return name == "get_ast" ||
-               name == "ast_match" ||
                name == "mba_simplify" ||
                name == "simplify_predicate";
     }
 
     nlohmann::json ApiHexrays::Dispatch(const nlohmann::json& id, const std::string& name, const nlohmann::json& args) {
         if (name == "get_ast") return GetAst(id, args);
-        if (name == "ast_match") return AstMatch(id, args);
         if (name == "mba_simplify") return MbaSimplify(id, args);
         if (name == "simplify_predicate") return SimplifyPredicate(id, args);
 
-        return nlohmann::json({
-            {"jsonrpc", "2.0"},
-            {"id", id},
-            {"error", {{"code", -32601}, {"message", "Method not found"}}}
-        });
+        return tools::utils::MakeToolErrorJson(id, "Method not found: " + name, "method_not_found");
     }
 
     nlohmann::json ApiHexrays::GetAst(const nlohmann::json& id, const nlohmann::json& args) {
+        if (args.contains("pattern")) {
+            return AstMatch(id, args);
+        }
+
         ea_t ea = tools::utils::GetAddressArg(args, "addr");
         int max_depth = static_cast<int>(tools::utils::GetIntArg(args, "max_depth", 128));
 
@@ -131,12 +129,16 @@ namespace tools::hexrays_ast {
                     if (count >= max_matches) return 1;
                     std::map<std::string, nlohmann::json> bindings;
                     if (MatchPattern(insn, cf, pattern, bindings)) {
-                        matches.push_back({
+                        nlohmann::ordered_json match_item = {
                             {"function", func_name},
                             {"address", tools::utils::FormatAddress(insn->ea)},
                             {"op", CTypeToString(insn->op)},
                             {"expr", CleanItemText(insn, cf)}
-                        });
+                        };
+                        if (!bindings.empty()) {
+                            match_item["bindings"] = bindings;
+                        }
+                        matches.push_back(std::move(match_item));
                         count++;
                         if (count >= max_matches) return 1;
                     }
@@ -147,12 +149,16 @@ namespace tools::hexrays_ast {
                     if (count >= max_matches) return 1;
                     std::map<std::string, nlohmann::json> bindings;
                     if (MatchPattern(expr, cf, pattern, bindings)) {
-                        matches.push_back({
+                        nlohmann::ordered_json match_item = {
                             {"function", func_name},
                             {"address", tools::utils::FormatAddress(expr->ea)},
                             {"op", CTypeToString(expr->op)},
                             {"expr", CleanItemText(expr, cf)}
-                        });
+                        };
+                        if (!bindings.empty()) {
+                            match_item["bindings"] = bindings;
+                        }
+                        matches.push_back(std::move(match_item));
                         count++;
                         if (count >= max_matches) return 1;
                     }
@@ -283,7 +289,12 @@ namespace tools::hexrays_ast {
                     : ctree_visitor_t(CV_FAST), cf(f), rules(r), matches(m), target_expr_ea(tea) {}
 
                 int idaapi visit_expr(cexpr_t* expr) override {
-                    if (target_expr_ea != BADADDR && expr->ea != target_expr_ea) return 0;
+                    if (target_expr_ea != BADADDR) {
+                        if (expr->ea != target_expr_ea &&
+                            (expr->ea == BADADDR || get_item_head(expr->ea) != get_item_head(target_expr_ea))) {
+                            return 0;
+                        }
+                    }
 
                     bool is_candidate = (expr->op == cot_add || expr->op == cot_sub ||
                                          expr->op == cot_bor || expr->op == cot_xor ||
@@ -482,6 +493,17 @@ namespace tools::hexrays_ast {
                 };
                 opaque_detector_t detector(cf, detected_opaques);
                 detector.apply_to(&cf->body, nullptr);
+            }
+
+            // Auto-populate requests from detected opaques if no manual requests were specified
+            if (requests.empty() && auto_detect) {
+                for (const auto& det : detected_opaques) {
+                    ea_t pea = tools::utils::ParseAddress(det["predicate_addr"].get<std::string>());
+                    std::string fb = det["evaluation"].get<std::string>();
+                    if (pea != BADADDR && (fb == "always_true" || fb == "always_false")) {
+                        requests.push_back({pea, fb});
+                    }
+                }
             }
 
             bool any_idb_patched = false;

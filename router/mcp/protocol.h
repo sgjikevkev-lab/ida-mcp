@@ -9,6 +9,7 @@
 
 namespace mcp {
     using json = nlohmann::json;
+    using ordered_json = nlohmann::ordered_json;
 
     namespace constants {
         constexpr const char* JSONRPC_VERSION = "2.0";

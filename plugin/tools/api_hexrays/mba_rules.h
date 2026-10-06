@@ -406,10 +406,9 @@ namespace tools::hexrays_ast {
         }
     }
 
-    inline std::optional<uint64_t> EvalExprWithSingleVar(
+    inline std::optional<uint64_t> EvalExprWithVars(
         const cexpr_t* expr,
-        int target_var_idx,
-        uint64_t var_val,
+        const std::map<int, uint64_t>& var_map,
         uint64_t mask) {
         if (!expr) return std::nullopt;
 
@@ -418,20 +417,21 @@ namespace tools::hexrays_ast {
         }
 
         if (expr->op == cot_var) {
-            if (expr->v.idx == target_var_idx) {
-                return var_val & mask;
+            auto it = var_map.find(expr->v.idx);
+            if (it != var_map.end()) {
+                return it->second & mask;
             }
             return std::nullopt;
         }
 
         if (expr->op == cot_bnot && expr->x) {
-            auto v = EvalExprWithSingleVar(expr->x, target_var_idx, var_val, mask);
+            auto v = EvalExprWithVars(expr->x, var_map, mask);
             if (v) return (~(*v)) & mask;
             return std::nullopt;
         }
 
         if (expr->op == cot_neg && expr->x) {
-            auto v = EvalExprWithSingleVar(expr->x, target_var_idx, var_val, mask);
+            auto v = EvalExprWithVars(expr->x, var_map, mask);
             if (v) {
                 int x_sz = expr->x ? expr->x->type.get_size() : expr->type.get_size();
                 int64_t sv = SignExtend(*v, x_sz);
@@ -441,7 +441,7 @@ namespace tools::hexrays_ast {
         }
 
         if (expr->op == cot_lnot && expr->x) {
-            auto v = EvalExprWithSingleVar(expr->x, target_var_idx, var_val, mask);
+            auto v = EvalExprWithVars(expr->x, var_map, mask);
             if (v) return (*v == 0) ? 1 : 0;
             return std::nullopt;
         }
@@ -449,14 +449,14 @@ namespace tools::hexrays_ast {
         if (expr->op == cot_cast && expr->x) {
             int sz = expr->type.get_size();
             uint64_t cast_mask = (sz >= 8 || sz <= 0) ? ~0ULL : ((1ULL << (sz * 8)) - 1);
-            auto v = EvalExprWithSingleVar(expr->x, target_var_idx, var_val, cast_mask);
+            auto v = EvalExprWithVars(expr->x, var_map, cast_mask);
             if (v) return (*v) & mask;
             return std::nullopt;
         }
 
         if (is_binary(expr->op) && expr->x && expr->y) {
-            auto l = EvalExprWithSingleVar(expr->x, target_var_idx, var_val, mask);
-            auto r = EvalExprWithSingleVar(expr->y, target_var_idx, var_val, mask);
+            auto l = EvalExprWithVars(expr->x, var_map, mask);
+            auto r = EvalExprWithVars(expr->y, var_map, mask);
             if (!l || !r) return std::nullopt;
 
             int l_sz = expr->x ? expr->x->type.get_size() : expr->type.get_size();
@@ -493,6 +493,14 @@ namespace tools::hexrays_ast {
         return std::nullopt;
     }
 
+    inline std::optional<uint64_t> EvalExprWithSingleVar(
+        const cexpr_t* expr,
+        int target_var_idx,
+        uint64_t var_val,
+        uint64_t mask) {
+        return EvalExprWithVars(expr, {{target_var_idx, var_val}}, mask);
+    }
+
     inline std::optional<BruteForceResult> BruteForceSimplify(
         const cexpr_t* expr,
         const cfunc_t* cf) {
@@ -508,6 +516,59 @@ namespace tools::hexrays_ast {
                 oss << "0x" << std::hex << *cf_val;
                 return BruteForceResult{oss.str(), "exact_constant"};
             }
+            return std::nullopt;
+        }
+
+        // 2-variable algebraic identity solver (e.g. (x ^ y) + 2*(x & y) => x + y)
+        if (lvar_indices.size() == 2) {
+            auto it = lvar_indices.begin();
+            int var1_idx = *it++;
+            int var2_idx = *it;
+            const lvars_t* lvs = const_cast<cfunc_t*>(cf)->get_lvars();
+            if (!lvs || var1_idx < 0 || var1_idx >= static_cast<int>(lvs->size()) ||
+                var2_idx < 0 || var2_idx >= static_cast<int>(lvs->size())) {
+                return std::nullopt;
+            }
+            std::string x_name = (*lvs)[var1_idx].name.c_str();
+            std::string y_name = (*lvs)[var2_idx].name.c_str();
+
+            int sz = expr->type.get_size();
+            uint64_t mask = (sz >= 8 || sz <= 0) ? ~0ULL : ((1ULL << (sz * 8)) - 1);
+
+            static const uint64_t kSample2[] = {
+                0, 1, 2, 7, 0x42, 0x7F, 0x80, 0xAA, 0x55, 0xFF,
+                0x100, 0x7FFF, 0x8000, 0xFFFF, 0x12345678, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF
+            };
+
+            bool is_add = true, is_sub = true, is_sub_rev = true;
+            bool is_and = true, is_or = true, is_xor = true, is_zero = true;
+
+            for (uint64_t vx : kSample2) {
+                uint64_t x_val = vx & mask;
+                for (uint64_t vy : kSample2) {
+                    uint64_t y_val = vy & mask;
+                    auto eval_res = EvalExprWithVars(expr, {{var1_idx, x_val}, {var2_idx, y_val}}, mask);
+                    if (!eval_res) return std::nullopt;
+                    uint64_t out = *eval_res & mask;
+
+                    if (out != ((x_val + y_val) & mask)) is_add = false;
+                    if (out != ((x_val - y_val) & mask)) is_sub = false;
+                    if (out != ((y_val - x_val) & mask)) is_sub_rev = false;
+                    if (out != ((x_val & y_val) & mask)) is_and = false;
+                    if (out != ((x_val | y_val) & mask)) is_or = false;
+                    if (out != ((x_val ^ y_val) & mask)) is_xor = false;
+                    if (out != 0) is_zero = false;
+                }
+            }
+
+            if (is_add) return BruteForceResult{x_name + " + " + y_name, "sampled_2var"};
+            if (is_sub) return BruteForceResult{x_name + " - " + y_name, "sampled_2var"};
+            if (is_sub_rev) return BruteForceResult{y_name + " - " + x_name, "sampled_2var"};
+            if (is_and) return BruteForceResult{x_name + " & " + y_name, "sampled_2var"};
+            if (is_or) return BruteForceResult{x_name + " | " + y_name, "sampled_2var"};
+            if (is_xor) return BruteForceResult{x_name + " ^ " + y_name, "sampled_2var"};
+            if (is_zero) return BruteForceResult{"0", "sampled_2var"};
+
             return std::nullopt;
         }
 

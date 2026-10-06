@@ -46,7 +46,7 @@ namespace tools {
         reg_core("get_segments");
         reg_core("get_exports");
         reg_core("imports_query");
-        reg_core("search_strings");
+        reg_core("strings");
         reg_core("list_funcs");
         reg_core("list_globals");
 
@@ -57,7 +57,6 @@ namespace tools {
             };
         };
         reg_mem("get_bytes");
-        reg_mem("get_string");
 
         // api_analysis
         auto reg_ana = [this](const char* name) {
@@ -80,12 +79,7 @@ namespace tools {
                 return api_modify_->Dispatch(id, name, args);
             };
         };
-        reg_mod("rename");
-        reg_mod("set_type");
-        reg_mod("set_comment");
-        reg_mod("rename_lvar");
-        reg_mod("set_lvar_type");
-        reg_mod("recompile");
+        reg_mod("refactor");
 
         // api_types
         auto reg_typ = [this](const char* name) {
@@ -93,10 +87,7 @@ namespace tools {
                 return api_types_->Dispatch(id, name, args);
             };
         };
-        reg_typ("declare_type");
-        reg_typ("type_query");
-        reg_typ("type_inspect");
-        reg_typ("read_struct");
+        reg_typ("types");
         reg_typ("stack_frame");
         reg_typ("reconstruct_struct");
 
@@ -126,10 +117,7 @@ namespace tools {
                 return api_rtti_->Dispatch(id, name, args);
             };
         };
-        reg_rtti("rtti_list_classes");
-        reg_rtti("rtti_get_class");
-        reg_rtti("rtti_refresh");
-        reg_rtti("rtti_create_struct");
+        reg_rtti("rtti");
         reg_rtti("resolve_vcall");
 
         // api_hexrays
@@ -139,7 +127,6 @@ namespace tools {
             };
         };
         reg_hex("get_ast");
-        reg_hex("ast_match");
         reg_hex("mba_simplify");
         reg_hex("simplify_predicate");
     }
@@ -156,32 +143,27 @@ namespace tools {
 
                     std::string& text = rpc_resp["result"]["content"][0]["text"].get_ref<std::string&>();
                     size_t first_brace = text.find('{');
-                    size_t last_brace = text.rfind('}');
-                    if (first_brace != std::string::npos && last_brace != std::string::npos && first_brace < last_brace) {
-                        bool is_empty = true;
-                        for (size_t i = first_brace + 1; i < last_brace; ++i) {
-                            if (!isspace(static_cast<unsigned char>(text[i]))) {
-                                is_empty = false;
-                                break;
+                    if (first_brace == std::string::npos) return;
+
+                    nlohmann::ordered_json parsed = nlohmann::ordered_json::parse(text.substr(first_brace));
+                    if (parsed.is_object()) {
+                        nlohmann::ordered_json canonical;
+                        if (parsed.contains("status")) {
+                            canonical["status"] = parsed["status"];
+                        } else {
+                            canonical["status"] = "success";
+                        }
+
+                        for (auto it = parsed.begin(); it != parsed.end(); ++it) {
+                            if (it.key() != "status" && it.key() != "elapsed_sec") {
+                                canonical[it.key()] = std::move(it.value());
                             }
                         }
 
-                        text.erase(last_brace);
-                        while (text.size() > first_brace + 1 && isspace(static_cast<unsigned char>(text.back()))) {
-                            text.pop_back();
-                        }
-
-                        char num_buf[32];
                         double rounded = std::round(elapsed_sec * 1000.0) / 1000.0;
-                        qsnprintf(num_buf, sizeof(num_buf), "%.3f", rounded);
+                        canonical["elapsed_sec"] = rounded;
 
-                        if (is_empty) {
-                            text.append("\n  \"elapsed_sec\": ");
-                        } else {
-                            text.append(",\n  \"elapsed_sec\": ");
-                        }
-                        text.append(num_buf);
-                        text.append("\n}");
+                        text = canonical.dump(2);
                     }
                 }
             } catch (...) {

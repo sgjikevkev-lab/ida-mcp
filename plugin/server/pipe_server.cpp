@@ -30,14 +30,9 @@ namespace server {
 
         bool IsWriteTool(const std::string& name) {
             return name == "idb_save" ||
-                   name == "rename" ||
-                   name == "set_type" ||
-                   name == "set_comment" ||
-                   name == "rename_lvar" ||
-                   name == "set_lvar_type" ||
-                   name == "recompile" ||
-                   name == "declare_type" ||
-                   name == "rtti_create_struct" ||
+                   name == "refactor" ||
+                   name == "types" ||
+                   name == "rtti" ||
                    name == "py";
         }
 

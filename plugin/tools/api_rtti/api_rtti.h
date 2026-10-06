@@ -17,6 +17,7 @@ namespace tools::rtti {
         nlohmann::json Dispatch(const nlohmann::json& id, const std::string& name, const nlohmann::json& args);
 
     private:
+        nlohmann::json UnifiedRtti(const nlohmann::json& id, const nlohmann::json& args);
         nlohmann::json RttiListClasses(const nlohmann::json& id, const nlohmann::json& args);
         nlohmann::json RttiGetClass(const nlohmann::json& id, const nlohmann::json& args);
         nlohmann::json RttiRefresh(const nlohmann::json& id, const nlohmann::json& args);

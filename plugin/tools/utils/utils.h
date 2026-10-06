@@ -15,6 +15,7 @@ namespace tools::utils {
     std::string FormatSize(size_t size);
     bool PatternMatch(const std::string& text, const std::string& pattern, bool case_sensitive = false);
     std::string SanitizeUtf8(const std::string& input);
+    std::string Demangle(const std::string& name);
 
     ea_t GetAddressArg(const nlohmann::json& args, const std::string& key, ea_t default_ea = BADADDR);
     int64_t GetIntArg(const nlohmann::json& args, const std::string& key, int64_t default_val = 0);

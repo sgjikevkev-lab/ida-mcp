@@ -35,7 +35,7 @@ namespace router {
         return mcp::json::array({
             {
                 {"name", "get_available_files"},
-                {"description", "List all currently open binaries/IDBs across active IDA Pro instances and show active selection."},
+                {"description", "List all currently open binaries across active IDA Pro instances and show active selection."},
                 {"inputSchema", {
                     {"type", "object"},
                     {"properties", mcp::json::object()}
@@ -49,7 +49,7 @@ namespace router {
                     {"properties", {
                         {"filename", {
                             {"type", "string"},
-                            {"description", "Target binary filename (e.g. 'target.exe')"}
+                            {"description", "Target binary filename to activate (e.g. 'target.exe')"}
                         }}
                     }},
                     {"required", {"filename"}}
@@ -137,26 +137,16 @@ namespace router {
         }
 
         mcp::json files_arr = mcp::json::array();
-        mcp::json instances_arr = mcp::json::array();
         for (const auto& kv : instances_) {
             files_arr.push_back(kv.first);
-            instances_arr.push_back({
-                {"name", kv.first},
-                {"pid", kv.second.pid},
-                {"idb_path", kv.second.idb_path},
-                {"backend", kv.second.backend},
-                {"is_active", (kv.first == active_file_)}
-            });
         }
         auto t1 = std::chrono::steady_clock::now();
         double elapsed_sec = std::round(std::chrono::duration<double>(t1 - t0).count() * 1000.0) / 1000.0;
 
-        mcp::json res = {
+        mcp::ordered_json res = {
             {"status", "success"},
             {"active_file", active_file_.empty() ? nullptr : mcp::json(active_file_)},
-            {"count", instances_.size()},
             {"files", files_arr},
-            {"instances", instances_arr},
             {"elapsed_sec", elapsed_sec}
         };
         mcp::StdioTransport::Send(mcp::MakeSuccessResponse(id, mcp::MakeToolCallResult(res.dump(2))));
@@ -164,12 +154,35 @@ namespace router {
 
     void IdaRouter::HandleSwitchFile(const mcp::json& id, const mcp::json& args) {
         auto t0 = std::chrono::steady_clock::now();
-        std::string target = args.value("filename", "");
+
+        if (!args.is_object() || !args.contains("filename") || !args["filename"].is_string()) {
+            mcp::json files_arr = mcp::json::array();
+            for (const auto& kv : instances_) {
+                files_arr.push_back(kv.first);
+            }
+            mcp::ordered_json res = {
+                {"status", "error"},
+                {"message", "Argument 'filename' is required and must be a string"},
+                {"available_files", files_arr},
+                {"elapsed_sec", 0.0}
+            };
+            mcp::StdioTransport::Send(mcp::MakeSuccessResponse(
+                id,
+                mcp::MakeToolCallResult(res.dump(2), true)
+            ));
+            return;
+        }
+
+        std::string target = args["filename"].get<std::string>();
+        auto sep = target.find_last_of("\\/");
+        if (sep != std::string::npos) {
+            target = target.substr(sep + 1);
+        }
 
         {
             std::lock_guard<std::mutex> lock(status_mtx_);
             if (is_busy_) {
-                mcp::json res = {
+                mcp::ordered_json res = {
                     {"status", "error"},
                     {"error_code", "busy"},
                     {"message", "Cannot switch file while tool '" + active_tool_ + "' is executing in IDA Pro."}
@@ -197,16 +210,7 @@ namespace router {
                     break;
                 }
             }
-            // 3. Match by PID
-            if (matched_key.empty()) {
-                for (const auto& kv : instances_) {
-                    if (std::to_string(kv.second.pid) == target) {
-                        matched_key = kv.first;
-                        break;
-                    }
-                }
-            }
-            // 4. Match stem without extension (e.g. "server" -> "server.dll")
+            // 3. Match stem without extension (e.g. "server" -> "server.dll")
             if (matched_key.empty()) {
                 for (const auto& kv : instances_) {
                     auto dot = kv.first.rfind('.');
@@ -217,7 +221,7 @@ namespace router {
                     }
                 }
             }
-            // 5. Match by IDB filename
+            // 4. Match by IDB filename
             if (matched_key.empty()) {
                 for (const auto& kv : instances_) {
                     if (!kv.second.idb_path.empty()) {
@@ -241,12 +245,9 @@ namespace router {
                 active_client_.Connect(instances_[matched_key].pipe_name, 3000);
             }
 
-            const auto& inst = instances_[matched_key];
-            mcp::json res = {
+            mcp::ordered_json res = {
                 {"status", "success"},
                 {"active_file", matched_key},
-                {"pid", inst.pid},
-                {"idb_path", inst.idb_path},
                 {"elapsed_sec", elapsed_sec}
             };
             mcp::StdioTransport::Send(mcp::MakeSuccessResponse(
@@ -258,7 +259,7 @@ namespace router {
             for (const auto& kv : instances_) {
                 files_arr.push_back(kv.first);
             }
-            mcp::json res = {
+            mcp::ordered_json res = {
                 {"status", "error"},
                 {"message", "Target binary '" + target + "' is not loaded in any active IDA Pro instance"},
                 {"available_files", files_arr},
@@ -387,26 +388,19 @@ namespace router {
     }
 
     void IdaRouter::HandleGetStatus(const mcp::json& id) {
+        auto t0 = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> lock(status_mtx_);
-        mcp::json res = {
-            {"status", "success"},
-            {"busy", is_busy_}
-        };
+        mcp::ordered_json res;
+        res["status"] = "success";
+        res["busy"] = is_busy_;
 
         if (is_busy_) {
             auto now = std::chrono::steady_clock::now();
             auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - active_tool_start_).count();
+            double elapsed_sec = std::round(elapsed_ms / 10.0) / 100.0;
             res["active_file"] = active_file_.empty() ? nullptr : mcp::json(active_file_);
-            if (!active_file_.empty() && instances_.find(active_file_) != instances_.end()) {
-                res["pid"] = instances_[active_file_].pid;
-            }
-            res["current_tool"] = active_tool_;
-            if (!active_tool_args_.empty()) {
-                res["tool_args"] = active_tool_args_;
-            }
-            res["elapsed_ms"] = elapsed_ms;
-            res["elapsed_sec"] = std::round(elapsed_ms / 10.0) / 100.0;
             res["message"] = "executing " + active_tool_;
+            res["elapsed_sec"] = elapsed_sec;
         } else {
             if (active_file_.empty() || instances_.find(active_file_) == instances_.end()) {
                 RefreshInstances();
@@ -415,8 +409,6 @@ namespace router {
                 const auto& inst = instances_[active_file_];
                 if (ida::InstanceDiscovery::IsPidAlive(inst.pid)) {
                     res["active_file"] = active_file_;
-                    res["pid"] = inst.pid;
-                    res["idb_path"] = inst.idb_path;
                     res["message"] = "idle";
                 } else {
                     active_client_.Disconnect();
@@ -428,6 +420,9 @@ namespace router {
                 res["active_file"] = nullptr;
                 res["message"] = "idle (no active IDA instance, use get_available_files / switch_file)";
             }
+            auto t1 = std::chrono::steady_clock::now();
+            double elapsed_sec = std::round(std::chrono::duration<double>(t1 - t0).count() * 1000.0) / 1000.0;
+            res["elapsed_sec"] = elapsed_sec;
         }
 
         mcp::StdioTransport::Send(mcp::MakeSuccessResponse(
@@ -533,10 +528,13 @@ namespace router {
     void IdaRouter::ProcessMessage(const std::string& raw_message) {
         if (raw_message.empty()) return;
 
+        mcp::json id = nullptr;
         try {
             mcp::json req = mcp::json::parse(raw_message);
+            if (req.contains("id")) {
+                id = req["id"];
+            }
             std::string method = req.value("method", "");
-            auto id = req.contains("id") ? req["id"] : nlohmann::json(nullptr);
 
             if (method == "initialize") {
                 HandleInitialize(req, id);
@@ -552,8 +550,12 @@ namespace router {
             } else if (!id.is_null()) {
                 mcp::StdioTransport::Send(mcp::MakeErrorResponse(id, -32601, "Method not found: " + method));
             }
+        } catch (const mcp::json::parse_error& e) {
+            mcp::StdioTransport::Send(mcp::MakeErrorResponse(nullptr, -32700, std::string("Parse error: Invalid JSON: ") + e.what()));
+        } catch (const std::exception& e) {
+            mcp::StdioTransport::Send(mcp::MakeErrorResponse(id, -32602, std::string("Invalid params or request: ") + e.what()));
         } catch (...) {
-            mcp::StdioTransport::Send(mcp::MakeErrorResponse(nullptr, -32700, "Parse error: Invalid JSON"));
+            mcp::StdioTransport::Send(mcp::MakeErrorResponse(id, -32603, "Internal server error"));
         }
     }
 

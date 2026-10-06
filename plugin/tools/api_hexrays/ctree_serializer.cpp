@@ -255,7 +255,9 @@ namespace tools::hexrays_ast {
             switch (e->op) {
                 case cot_num:
                     if (e->n) {
-                        res["value"] = e->n->value(e->type);
+                        uint64 val = e->n->value(e->type);
+                        res["value"] = val;
+                        res["value_hex"] = tools::utils::FormatAddress(val);
                     }
                     break;
 
@@ -287,7 +289,13 @@ namespace tools::hexrays_ast {
                     if (cf) {
                         const lvars_t* lvs = const_cast<cfunc_t*>(cf)->get_lvars();
                         if (lvs && e->v.idx < lvs->size()) {
-                            res["var_name"] = tools::utils::SafeJsonString((*lvs)[e->v.idx].name.c_str());
+                            const lvar_t& lv = (*lvs)[e->v.idx];
+                            res["var_name"] = tools::utils::SafeJsonString(lv.name.c_str());
+                            qstring lvt_str;
+                            lv.type().print(&lvt_str);
+                            if (!lvt_str.empty()) {
+                                res["var_type"] = tools::utils::SafeJsonString(lvt_str.c_str());
+                            }
                         }
                     }
                     break;
@@ -316,6 +324,14 @@ namespace tools::hexrays_ast {
                 case cot_call:
                     if (e->x) {
                         res["x"] = SerializeCItem(e->x, cf, max_depth, current_depth + 1);
+                        if (e->x->op == cot_obj) {
+                            res["callee_ea"] = tools::utils::FormatAddress(e->x->obj_ea);
+                            qstring cname;
+                            get_name(&cname, e->x->obj_ea);
+                            res["callee_name"] = tools::utils::SafeJsonString(cname.c_str());
+                        } else if (e->x->op == cot_helper) {
+                            res["callee_name"] = tools::utils::SafeJsonString(e->x->helper ? e->x->helper : "");
+                        }
                     }
                     if (e->a) {
                         nlohmann::json args_arr = nlohmann::json::array();
@@ -342,6 +358,9 @@ namespace tools::hexrays_ast {
         } else {
             const cinsn_t* insn = static_cast<const cinsn_t*>(item);
             res["kind"] = "stmt";
+            if (insn->op != cit_block) {
+                res["text"] = CleanItemText(insn, cf);
+            }
 
             switch (insn->op) {
                 case cit_block:
@@ -475,11 +494,11 @@ namespace tools::hexrays_ast {
                 const cexpr_t* e = static_cast<const cexpr_t*>(node);
 
                 if (pattern.contains("value") && e->op == cot_num) {
-                    if (pattern["value"].is_number() && e->n) {
-                        uint64 actual_val = e->n->value(e->type);
-                        size_t sz = e->type.get_size();
-                        uint64 mask = (sz >= 8 || sz == 0) ? ~0ULL : ((1ULL << (sz * 8)) - 1);
+                    uint64 actual_val = e->n ? e->n->value(e->type) : 0;
+                    size_t sz = e->type.get_size();
+                    uint64 mask = (sz >= 8 || sz == 0) ? ~0ULL : ((1ULL << (sz * 8)) - 1);
 
+                    if (pattern["value"].is_number()) {
                         if (pattern["value"].is_number_unsigned()) {
                             uint64 exp_val = pattern["value"].get<uint64>();
                             if ((actual_val & mask) != (exp_val & mask) && actual_val != exp_val) return false;
@@ -490,6 +509,21 @@ namespace tools::hexrays_ast {
                             } else {
                                 int64 actual_signed = (sz > 0 && sz < 8) ? (static_cast<int64>(actual_val << (64 - sz * 8)) >> (64 - sz * 8)) : static_cast<int64>(actual_val);
                                 if (actual_signed != exp_val && actual_val != static_cast<uint64>(exp_val)) return false;
+                            }
+                        }
+                    } else if (pattern["value"].is_string()) {
+                        std::string val_str = pattern["value"].get<std::string>();
+                        if (val_str.rfind("$", 0) == 0 && val_str != "$_") {
+                            auto it = bindings.find(val_str);
+                            if (it != bindings.end()) {
+                                if (it->second != actual_val) return false;
+                            } else {
+                                bindings[val_str] = actual_val;
+                            }
+                        } else if (val_str != "$_") {
+                            ea_t parsed_val = tools::utils::ParseAddress(val_str);
+                            if (parsed_val != BADADDR && (actual_val & mask) != (parsed_val & mask) && actual_val != parsed_val) {
+                                return false;
                             }
                         }
                     }
@@ -511,8 +545,10 @@ namespace tools::hexrays_ast {
                         } else {
                             bindings[expected_var] = actual_var;
                         }
-                    } else if (expected_var != "$_" && expected_var != actual_var) {
-                        return false;
+                    } else if (expected_var != "$_") {
+                        if (!tools::utils::PatternMatch(actual_var, expected_var) && actual_var != expected_var) {
+                            return false;
+                        }
                     }
                 }
 
@@ -528,8 +564,45 @@ namespace tools::hexrays_ast {
                         } else {
                             bindings[expected_name] = actual_name;
                         }
-                    } else if (expected_name != "$_" && expected_name != actual_name) {
-                        return false;
+                    } else if (expected_name != "$_") {
+                        if (!tools::utils::PatternMatch(actual_name, expected_name) && actual_name != expected_name) {
+                            return false;
+                        }
+                    }
+                }
+
+                if (pattern.contains("callee") && e->op == cot_call) {
+                    std::string expected_callee = pattern["callee"].get<std::string>();
+                    std::string actual_callee;
+                    if (e->x) {
+                        if (e->x->op == cot_obj) {
+                            qstring cname;
+                            get_name(&cname, e->x->obj_ea);
+                            actual_callee = cname.c_str();
+                        } else if (e->x->op == cot_helper && e->x->helper) {
+                            actual_callee = e->x->helper;
+                        } else {
+                            actual_callee = CleanItemText(e->x, cf);
+                        }
+                    }
+                    if (expected_callee.rfind("$", 0) == 0 && expected_callee != "$_") {
+                        auto it = bindings.find(expected_callee);
+                        if (it != bindings.end()) {
+                            if (it->second != actual_callee) return false;
+                        } else {
+                            bindings[expected_callee] = actual_callee;
+                        }
+                    } else if (expected_callee != "$_") {
+                        if (!tools::utils::PatternMatch(actual_callee, expected_callee) && actual_callee != expected_callee) {
+                            return false;
+                        }
+                    }
+                }
+
+                if (pattern.contains("member_offset") && (e->op == cot_memptr || e->op == cot_memref)) {
+                    if (pattern["member_offset"].is_number()) {
+                        uint64 exp_off = pattern["member_offset"].get<uint64>();
+                        if (static_cast<uint64>(e->m) != exp_off) return false;
                     }
                 }
 
