@@ -358,14 +358,30 @@ namespace tools::composite {
                 if (cf) {
                     used_hexrays = true;
 
-                    // If target_var is empty, try to deduce it from start_ea or function arguments
-                    // If target_var is empty or index, try to deduce it from start_ea or function arguments
+                    struct VarRef {
+                        ea_t func_ea = BADADDR;
+                        int lvar_idx = -1;
+                        std::string name;
+
+                        bool operator<(const VarRef& o) const {
+                            if (func_ea != o.func_ea) return func_ea < o.func_ea;
+                            return lvar_idx < o.lvar_idx;
+                        }
+                        bool operator==(const VarRef& o) const {
+                            return func_ea == o.func_ea && lvar_idx == o.lvar_idx;
+                        }
+                    };
+
+                    VarRef root_var;
+                    root_var.func_ea = pfn->start_ea;
                     const lvars_t* lvars = cf->get_lvars();
                     if (lvars && !lvars->empty()) {
                         bool var_found = false;
                         if (!target_var.empty()) {
                             for (size_t i = 0; i < lvars->size(); ++i) {
                                 if ((*lvars)[i].name == target_var.c_str()) {
+                                    root_var.lvar_idx = static_cast<int>(i);
+                                    root_var.name = (*lvars)[i].name.c_str();
                                     var_found = true;
                                     break;
                                 }
@@ -378,166 +394,379 @@ namespace tools::composite {
                                     try { arg_idx = std::stoi(target_var); } catch (...) {}
                                 }
                                 if (arg_idx >= 0) {
-                                    int cur_arg = 0;
-                                    for (size_t i = 0; i < lvars->size(); ++i) {
-                                        if ((*lvars)[i].is_arg_var()) {
-                                            if (cur_arg == arg_idx) {
-                                                target_var = (*lvars)[i].name.c_str();
-                                                var_found = true;
-                                                break;
+                                    if (arg_idx < static_cast<int>(cf->argidx.size())) {
+                                        root_var.lvar_idx = cf->argidx[arg_idx];
+                                        if (root_var.lvar_idx >= 0 && root_var.lvar_idx < static_cast<int>(lvars->size())) {
+                                            root_var.name = (*lvars)[root_var.lvar_idx].name.c_str();
+                                            var_found = true;
+                                        }
+                                    } else {
+                                        int cur_arg = 0;
+                                        for (size_t i = 0; i < lvars->size(); ++i) {
+                                            if ((*lvars)[i].is_arg_var()) {
+                                                if (cur_arg == arg_idx) {
+                                                    root_var.lvar_idx = static_cast<int>(i);
+                                                    root_var.name = (*lvars)[i].name.c_str();
+                                                    var_found = true;
+                                                    break;
+                                                }
+                                                cur_arg++;
                                             }
-                                            cur_arg++;
                                         }
                                     }
                                 }
                             }
                         }
-                        if (target_var.empty() || !var_found) {
-                            for (size_t i = 0; i < lvars->size(); ++i) {
-                                if ((*lvars)[i].is_arg_var()) {
-                                    target_var = (*lvars)[i].name.c_str();
-                                    break;
+                        if (root_var.lvar_idx < 0) {
+                            if (!cf->argidx.empty()) {
+                                root_var.lvar_idx = cf->argidx[0];
+                                if (root_var.lvar_idx >= 0 && root_var.lvar_idx < static_cast<int>(lvars->size())) {
+                                    root_var.name = (*lvars)[root_var.lvar_idx].name.c_str();
                                 }
-                            }
-                            if (target_var.empty()) {
-                                target_var = (*lvars)[0].name.c_str();
+                            } else {
+                                for (size_t i = 0; i < lvars->size(); ++i) {
+                                    if ((*lvars)[i].is_arg_var()) {
+                                        root_var.lvar_idx = static_cast<int>(i);
+                                        root_var.name = (*lvars)[i].name.c_str();
+                                        break;
+                                    }
+                                }
+                                if (root_var.lvar_idx < 0) {
+                                    root_var.lvar_idx = 0;
+                                    root_var.name = (*lvars)[0].name.c_str();
+                                }
                             }
                         }
                     }
-                    root_var_name = target_var;
+                    root_var_name = root_var.name;
 
-                    // Trace function with recursion for inter-procedural calls
-                    std::set<ea_t> visited_funcs;
-                    std::function<void(func_t*, const std::string&, int)> trace_fn;
+                    auto ResolveCallTarget = [](const cexpr_t* call_expr, const cfunc_t* cf_ptr) -> ea_t {
+                        if (!call_expr || call_expr->op != cot_call || !call_expr->x) return BADADDR;
+                        if (call_expr->x->op == cot_obj) {
+                            if (is_mapped(call_expr->x->obj_ea)) {
+                                func_t* f = get_func(call_expr->x->obj_ea);
+                                if (f && f->start_ea == call_expr->x->obj_ea) return f->start_ea;
+                                segment_t* seg = getseg(call_expr->x->obj_ea);
+                                if (seg && !(seg->perm & SEGPERM_EXEC)) {
+                                    ea_t target = inf_is_64bit() ? get_qword(call_expr->x->obj_ea) : get_dword(call_expr->x->obj_ea);
+                                    if (target != BADADDR && is_mapped(target) && get_func(target)) {
+                                        return get_func(target)->start_ea;
+                                    }
+                                }
+                            }
+                        }
+                        if (call_expr->ea != BADADDR && is_mapped(call_expr->ea)) {
+                            xrefblk_t xb;
+                            for (bool ok = xb.first_from(call_expr->ea, XREF_ALL); ok; ok = xb.next_from()) {
+                                if (xb.iscode && xb.to != BADADDR && xb.to != call_expr->ea) {
+                                    func_t* f = get_func(xb.to);
+                                    if (f) return f->start_ea;
+                                }
+                            }
+                        }
+                        return BADADDR;
+                    };
 
-                    trace_fn = [&](func_t* fn, const std::string& var_name, int current_depth) {
-                        if (!fn || visited_funcs.count(fn->start_ea) || current_depth > max_depth) return;
-                        visited_funcs.insert(fn->start_ea);
+                    auto GetArgLvarIdx = [](const cfunc_t* cf_ptr, size_t arg_i) -> int {
+                        if (!cf_ptr) return -1;
+                        if (arg_i < cf_ptr->argidx.size()) {
+                            return cf_ptr->argidx[arg_i];
+                        }
+                        const lvars_t* lvs = const_cast<cfunc_t*>(cf_ptr)->get_lvars();
+                        if (!lvs) return -1;
+                        size_t cur = 0;
+                        for (size_t k = 0; k < lvs->size(); ++k) {
+                            if ((*lvs)[k].is_arg_var()) {
+                                if (cur == arg_i) return static_cast<int>(k);
+                                cur++;
+                            }
+                        }
+                        return -1;
+                    };
+
+                    auto GetAbstractMemLoc = [](const cexpr_t* e, const cfunc_t* cf_ptr) -> std::string {
+                        if (!e) return "";
+                        if (e->op == cot_memptr || e->op == cot_memref) {
+                            std::string base = hexrays_ast::CleanItemText(e->x, cf_ptr);
+                            std::stringstream ss;
+                            ss << "Memory[" << base << " + 0x" << std::hex << e->m << "]";
+                            return ss.str();
+                        }
+                        if (e->op == cot_ptr) {
+                            if (e->x && e->x->op == cot_add && e->x->y && e->x->y->op == cot_num) {
+                                std::string base = hexrays_ast::CleanItemText(e->x->x, cf_ptr);
+                                std::stringstream ss;
+                                ss << "Memory[" << base << " + 0x" << std::hex << e->x->y->numval() << "]";
+                                return ss.str();
+                            }
+                            std::string base = hexrays_ast::CleanItemText(e->x, cf_ptr);
+                            return "Memory[" + base + "]";
+                        }
+                        return "";
+                    };
+
+                    std::set<std::pair<ea_t, int>> visited_func_vars;
+                    std::function<void(func_t*, const VarRef&, int)> trace_fn;
+
+                    trace_fn = [&](func_t* fn, const VarRef& cur_var, int current_depth) {
+                        if (!fn || current_depth > max_depth) return;
+                        auto visit_key = std::make_pair(fn->start_ea, cur_var.lvar_idx);
+                        if (visited_func_vars.count(visit_key)) return;
+                        visited_func_vars.insert(visit_key);
 
                         hexrays_failure_t local_hf;
                         cfuncptr_t local_cf = decompile(fn, &local_hf, DECOMP_WARNINGS | DECOMP_NO_WAIT);
                         if (!local_cf) return;
 
-                        std::set<std::string> active_vars = {var_name};
+                        std::set<int> active_lvars;
+                        if (cur_var.lvar_idx >= 0) active_lvars.insert(cur_var.lvar_idx);
+                        std::map<int, int> pointer_aliases;
+                        std::set<std::string> active_mem_locs;
 
                         if (direction == "forward") {
                             struct ForwardVisitor : public ctree_visitor_t {
                                 const cfunc_t* cf;
-                                std::set<std::string>& active_vars;
+                                std::set<int>& active_lvars;
+                                std::map<int, int>& pointer_aliases;
+                                std::set<std::string>& active_mem_locs;
                                 nlohmann::json& flow;
                                 int depth;
                                 bool inc_calls;
                                 int max_d;
-                                std::function<void(func_t*, const std::string&, int)> recurse_fn;
+                                std::function<void(func_t*, const VarRef&, int)> recurse_fn;
+                                std::function<ea_t(const cexpr_t*, const cfunc_t*)> resolve_call_fn;
+                                std::function<int(const cfunc_t*, size_t)> get_arg_fn;
+                                std::function<std::string(const cexpr_t*, const cfunc_t*)> get_mem_loc_fn;
 
-                                ForwardVisitor(const cfunc_t* f, std::set<std::string>& av, nlohmann::json& fl,
-                                               int d, bool ic, int md, std::function<void(func_t*, const std::string&, int)> rf)
-                                    : ctree_visitor_t(CV_FAST), cf(f), active_vars(av), flow(fl),
-                                      depth(d), inc_calls(ic), max_d(md), recurse_fn(rf) {}
+                                ForwardVisitor(const cfunc_t* f,
+                                               std::set<int>& al,
+                                               std::map<int, int>& pa,
+                                               std::set<std::string>& am,
+                                               nlohmann::json& fl,
+                                               int d, bool ic, int md,
+                                               std::function<void(func_t*, const VarRef&, int)> rf,
+                                               std::function<ea_t(const cexpr_t*, const cfunc_t*)> rcf,
+                                               std::function<int(const cfunc_t*, size_t)> gaf,
+                                               std::function<std::string(const cexpr_t*, const cfunc_t*)> gmf)
+                                    : ctree_visitor_t(CV_FAST | CV_PARENTS), cf(f), active_lvars(al),
+                                      pointer_aliases(pa), active_mem_locs(am), flow(fl),
+                                      depth(d), inc_calls(ic), max_d(md), recurse_fn(rf),
+                                      resolve_call_fn(rcf), get_arg_fn(gaf), get_mem_loc_fn(gmf) {}
 
-                                bool UsesActiveVar(const cexpr_t* e, std::string& out_name) {
+                                std::string GetCondition() const {
+                                    for (int k = static_cast<int>(parents.size()) - 1; k >= 0; --k) {
+                                        citem_t* p = parents[k];
+                                        if (!p->is_expr() && static_cast<cinsn_t*>(p)->op == cit_if) {
+                                            const cinsn_t* if_insn = static_cast<const cinsn_t*>(p);
+                                            if (if_insn->cif) {
+                                                std::string cond = hexrays_ast::CleanItemText(&if_insn->cif->expr, cf);
+                                                if (k + 1 < static_cast<int>(parents.size())) {
+                                                    citem_t* child = parents[k + 1];
+                                                    if (if_insn->cif->ielse && child == if_insn->cif->ielse) {
+                                                        return "!(" + cond + ")";
+                                                    }
+                                                }
+                                                return cond;
+                                            }
+                                        }
+                                    }
+                                    return "";
+                                }
+
+                                bool UsesActiveVar(const cexpr_t* e, VarRef& out_v) {
                                     if (!e) return false;
                                     if (e->op == cot_var) {
-                                        const lvars_t* lvars = const_cast<cfunc_t*>(cf)->get_lvars();
-                                        if (lvars && e->v.idx >= 0 && e->v.idx < static_cast<int>(lvars->size())) {
-                                            std::string vname = (*lvars)[e->v.idx].name.c_str();
-                                            if (active_vars.count(vname)) {
-                                                out_name = vname;
+                                        const lvars_t* lvs = const_cast<cfunc_t*>(cf)->get_lvars();
+                                        if (lvs && e->v.idx >= 0 && e->v.idx < static_cast<int>(lvs->size())) {
+                                            if (active_lvars.count(e->v.idx)) {
+                                                out_v = VarRef{ cf->entry_ea, e->v.idx, (*lvs)[e->v.idx].name.c_str() };
+                                                return true;
+                                            }
+                                            auto it = pointer_aliases.find(e->v.idx);
+                                            if (it != pointer_aliases.end() && active_lvars.count(it->second)) {
+                                                out_v = VarRef{ cf->entry_ea, it->second, (*lvs)[it->second].name.c_str() };
                                                 return true;
                                             }
                                         }
                                         return false;
                                     }
-                                    if (op_uses_x(e->op) && e->x && UsesActiveVar(e->x, out_name)) return true;
-                                    if (op_uses_y(e->op) && e->y && UsesActiveVar(e->y, out_name)) return true;
-                                    if (op_uses_z(e->op) && e->z && UsesActiveVar(e->z, out_name)) return true;
+                                    if (op_uses_x(e->op) && e->x && UsesActiveVar(e->x, out_v)) return true;
+                                    if (op_uses_y(e->op) && e->y && UsesActiveVar(e->y, out_v)) return true;
+                                    if (op_uses_z(e->op) && e->z && UsesActiveVar(e->z, out_v)) return true;
                                     if (e->op == cot_call && e->a) {
                                         for (const auto& arg : *e->a) {
-                                            if (UsesActiveVar(&arg, out_name)) return true;
+                                            if (UsesActiveVar(&arg, out_v)) return true;
                                         }
                                     }
                                     return false;
                                 }
 
                                 int idaapi visit_expr(cexpr_t* e) override {
-                                    if (flow.size() >= 150) return 1;
+                                    if (flow.size() >= 200) return 1;
 
-                                    // 1. Assignment / Store: lhs = rhs
                                     if (e->op == cot_asg || e->op == cot_asgbor || e->op == cot_asgband ||
                                         e->op == cot_asgadd || e->op == cot_asgsub || e->op == cot_asgmul) {
-                                        std::string used_var_rhs;
-                                        // Case A: Active var on RHS -> propagates into lhs
-                                        if (UsesActiveVar(e->y, used_var_rhs)) {
-                                            if (e->x && e->x->op == cot_var) {
-                                                const lvars_t* lvars = const_cast<cfunc_t*>(cf)->get_lvars();
-                                                if (lvars && e->x->v.idx >= 0 && e->x->v.idx < static_cast<int>(lvars->size())) {
-                                                    std::string to_var = (*lvars)[e->x->v.idx].name.c_str();
-                                                    flow.push_back({
+
+                                        // Alias creation (p = &x)
+                                        if (e->x && e->x->op == cot_var && e->y) {
+                                            const cexpr_t* y_val = e->y;
+                                            if (y_val->op == cot_cast && y_val->x) y_val = y_val->x;
+                                            if (y_val->op == cot_ref && y_val->x && y_val->x->op == cot_var) {
+                                                int p_idx = e->x->v.idx;
+                                                int target_idx = y_val->x->v.idx;
+                                                pointer_aliases[p_idx] = target_idx;
+                                                const lvars_t* lvs = const_cast<cfunc_t*>(cf)->get_lvars();
+                                                if (lvs && active_lvars.count(target_idx)) {
+                                                    nlohmann::ordered_json item = {
                                                         {"depth", depth},
                                                         {"address", tools::utils::FormatAddress(e->ea)},
-                                                        {"type", "assign"},
-                                                        {"from", used_var_rhs},
-                                                        {"to", to_var},
+                                                        {"type", "alias_create"},
+                                                        {"pointer", (*lvs)[p_idx].name.c_str()},
+                                                        {"aliased_var", (*lvs)[target_idx].name.c_str()},
                                                         {"expr", hexrays_ast::CleanItemText(e, cf)}
-                                                    });
-                                                    active_vars.insert(to_var);
+                                                    };
+                                                    std::string cond = GetCondition();
+                                                    if (!cond.empty()) item["path_condition"] = cond;
+                                                    flow.push_back(std::move(item));
                                                 }
-                                            } else if (e->x && (e->x->op == cot_ptr || e->x->op == cot_memptr || e->x->op == cot_memref || e->x->op == cot_obj)) {
-                                                flow.push_back({
-                                                    {"depth", depth},
-                                                    {"address", tools::utils::FormatAddress(e->ea)},
-                                                    {"type", "store"},
-                                                    {"from", used_var_rhs},
-                                                    {"target", hexrays_ast::CleanItemText(e->x, cf)},
-                                                    {"expr", hexrays_ast::CleanItemText(e, cf)}
-                                                });
                                             }
                                         }
 
-                                        // Case B: Active var on LHS -> member store, pointer store, or variable re-assignment
-                                        std::string used_var_lhs;
-                                        if (UsesActiveVar(e->x, used_var_lhs)) {
-                                            if (e->x->op == cot_ptr || e->x->op == cot_memptr || e->x->op == cot_memref) {
-                                                flow.push_back({
+                                        // Pointer store through alias (*p = val)
+                                        if (e->x && e->x->op == cot_ptr && e->x->x && e->x->x->op == cot_var) {
+                                            int p_idx = e->x->x->v.idx;
+                                            auto it = pointer_aliases.find(p_idx);
+                                            if (it != pointer_aliases.end() && active_lvars.count(it->second)) {
+                                                const lvars_t* lvs = const_cast<cfunc_t*>(cf)->get_lvars();
+                                                nlohmann::ordered_json item = {
+                                                    {"depth", depth},
+                                                    {"address", tools::utils::FormatAddress(e->ea)},
+                                                    {"type", "alias_store"},
+                                                    {"pointer", (*lvs)[p_idx].name.c_str()},
+                                                    {"target_var", (*lvs)[it->second].name.c_str()},
+                                                    {"value", hexrays_ast::CleanItemText(e->y, cf)},
+                                                    {"expr", hexrays_ast::CleanItemText(e, cf)}
+                                                };
+                                                std::string cond = GetCondition();
+                                                if (!cond.empty()) item["path_condition"] = cond;
+                                                flow.push_back(std::move(item));
+                                            }
+                                        }
+
+                                        // Abstract memory store (obj->field = val)
+                                        std::string mem_loc = get_mem_loc_fn(e->x, cf);
+                                        VarRef rhs_used;
+                                        if (UsesActiveVar(e->y, rhs_used)) {
+                                            if (!mem_loc.empty()) {
+                                                active_mem_locs.insert(mem_loc);
+                                                nlohmann::ordered_json item = {
                                                     {"depth", depth},
                                                     {"address", tools::utils::FormatAddress(e->ea)},
                                                     {"type", "member_store"},
-                                                    {"base_var", used_var_lhs},
+                                                    {"abstract_loc", mem_loc},
+                                                    {"from", rhs_used.name},
                                                     {"target", hexrays_ast::CleanItemText(e->x, cf)},
-                                                    {"value", hexrays_ast::CleanItemText(e->y, cf)},
                                                     {"expr", hexrays_ast::CleanItemText(e, cf)}
-                                                });
-                                            } else if (e->x->op == cot_var) {
-                                                flow.push_back({
+                                                };
+                                                std::string cond = GetCondition();
+                                                if (!cond.empty()) item["path_condition"] = cond;
+                                                flow.push_back(std::move(item));
+                                            } else if (e->x && (e->x->op == cot_ptr || e->x->op == cot_memptr || e->x->op == cot_memref || e->x->op == cot_obj)) {
+                                                nlohmann::ordered_json item = {
                                                     {"depth", depth},
                                                     {"address", tools::utils::FormatAddress(e->ea)},
-                                                    {"type", "reassign"},
-                                                    {"var", used_var_lhs},
-                                                    {"value", hexrays_ast::CleanItemText(e->y, cf)},
+                                                    {"type", "store"},
+                                                    {"from", rhs_used.name},
+                                                    {"target", hexrays_ast::CleanItemText(e->x, cf)},
                                                     {"expr", hexrays_ast::CleanItemText(e, cf)}
-                                                });
+                                                };
+                                                std::string cond = GetCondition();
+                                                if (!cond.empty()) item["path_condition"] = cond;
+                                                flow.push_back(std::move(item));
+                                            }
+                                        }
+
+                                        // Abstract memory load propagation (y = obj->field)
+                                        if (e->x && e->x->op == cot_var) {
+                                            std::string rhs_mem = get_mem_loc_fn(e->y, cf);
+                                            if (!rhs_mem.empty() && active_mem_locs.count(rhs_mem)) {
+                                                const lvars_t* lvs = const_cast<cfunc_t*>(cf)->get_lvars();
+                                                if (lvs && e->x->v.idx >= 0 && e->x->v.idx < static_cast<int>(lvs->size())) {
+                                                    active_lvars.insert(e->x->v.idx);
+                                                    nlohmann::ordered_json item = {
+                                                        {"depth", depth},
+                                                        {"address", tools::utils::FormatAddress(e->ea)},
+                                                        {"type", "memory_propagate"},
+                                                        {"from_loc", rhs_mem},
+                                                        {"to", (*lvs)[e->x->v.idx].name.c_str()},
+                                                        {"expr", hexrays_ast::CleanItemText(e, cf)}
+                                                    };
+                                                    std::string cond = GetCondition();
+                                                    if (!cond.empty()) item["path_condition"] = cond;
+                                                    flow.push_back(std::move(item));
+                                                }
+                                            }
+                                        }
+
+                                        // Standard variable assignment (y = x)
+                                        if (UsesActiveVar(e->y, rhs_used)) {
+                                            if (e->x && e->x->op == cot_var) {
+                                                const lvars_t* lvs = const_cast<cfunc_t*>(cf)->get_lvars();
+                                                if (lvs && e->x->v.idx >= 0 && e->x->v.idx < static_cast<int>(lvs->size())) {
+                                                    std::string to_var = (*lvs)[e->x->v.idx].name.c_str();
+                                                    active_lvars.insert(e->x->v.idx);
+                                                    nlohmann::ordered_json item = {
+                                                        {"depth", depth},
+                                                        {"address", tools::utils::FormatAddress(e->ea)},
+                                                        {"type", "assign"},
+                                                        {"from", rhs_used.name},
+                                                        {"to", to_var},
+                                                        {"expr", hexrays_ast::CleanItemText(e, cf)}
+                                                    };
+                                                    std::string cond = GetCondition();
+                                                    if (!cond.empty()) item["path_condition"] = cond;
+                                                    flow.push_back(std::move(item));
+                                                }
                                             }
                                         }
                                     }
 
-                                    // 2. Call argument: callee(..., arg, ...)
+                                    // Call arguments
                                     if (e->op == cot_call && e->a) {
                                         std::string callee_name = hexrays_ast::CleanItemText(e->x, cf);
-                                        ea_t callee_ea = (e->x && e->x->op == cot_obj) ? e->x->obj_ea : BADADDR;
+                                        ea_t callee_ea = resolve_call_fn(e, cf);
 
                                         for (size_t i = 0; i < e->a->size(); ++i) {
                                             const cexpr_t* arg_expr = &(*e->a)[i];
-                                            std::string used_var;
-                                            if (UsesActiveVar(arg_expr, used_var)) {
-                                                flow.push_back({
+                                            VarRef used_var;
+                                            bool is_out_param = false;
+
+                                            const cexpr_t* unwrap_arg = arg_expr;
+                                            if (unwrap_arg->op == cot_cast && unwrap_arg->x) unwrap_arg = unwrap_arg->x;
+                                            if (unwrap_arg->op == cot_ref && unwrap_arg->x && unwrap_arg->x->op == cot_var) {
+                                                int v_idx = unwrap_arg->x->v.idx;
+                                                if (active_lvars.count(v_idx)) {
+                                                    const lvars_t* lvs = const_cast<cfunc_t*>(cf)->get_lvars();
+                                                    if (lvs) {
+                                                        used_var = VarRef{ cf->entry_ea, v_idx, (*lvs)[v_idx].name.c_str() };
+                                                        is_out_param = true;
+                                                    }
+                                                }
+                                            }
+
+                                            if (is_out_param || UsesActiveVar(arg_expr, used_var)) {
+                                                nlohmann::ordered_json item = {
                                                     {"depth", depth},
                                                     {"address", tools::utils::FormatAddress(e->ea)},
-                                                    {"type", "call_arg"},
-                                                    {"from", used_var},
+                                                    {"type", is_out_param ? "out_param_pass" : "call_arg"},
+                                                    {"from", used_var.name},
                                                     {"callee", callee_name},
                                                     {"arg_index", i},
                                                     {"expr", hexrays_ast::CleanItemText(e, cf)}
-                                                });
+                                                };
+                                                std::string cond = GetCondition();
+                                                if (!cond.empty()) item["path_condition"] = cond;
+                                                flow.push_back(std::move(item));
 
                                                 if (inc_calls && depth < max_d && callee_ea != BADADDR) {
                                                     func_t* callee_fn = get_func(callee_ea);
@@ -545,29 +774,19 @@ namespace tools::composite {
                                                         hexrays_failure_t cf_hf;
                                                         cfuncptr_t callee_cf = decompile(callee_fn, &cf_hf, DECOMP_WARNINGS | DECOMP_NO_WAIT);
                                                         if (callee_cf) {
+                                                            int param_lvar_idx = get_arg_fn(callee_cf, i);
                                                             const lvars_t* callee_lvars = callee_cf->get_lvars();
-                                                            std::string param_name;
-                                                            size_t arg_cnt = 0;
-                                                            if (callee_lvars) {
-                                                                for (size_t k = 0; k < callee_lvars->size(); ++k) {
-                                                                    if ((*callee_lvars)[k].is_arg_var()) {
-                                                                        if (arg_cnt == i) {
-                                                                            param_name = (*callee_lvars)[k].name.c_str();
-                                                                            break;
-                                                                        }
-                                                                        arg_cnt++;
-                                                                    }
-                                                                }
-                                                            }
-                                                            if (!param_name.empty()) {
+                                                            if (callee_lvars && param_lvar_idx >= 0 && param_lvar_idx < static_cast<int>(callee_lvars->size())) {
+                                                                VarRef callee_ref{ callee_fn->start_ea, param_lvar_idx, (*callee_lvars)[param_lvar_idx].name.c_str() };
                                                                 flow.push_back({
                                                                     {"depth", depth + 1},
                                                                     {"address", tools::utils::FormatAddress(callee_fn->start_ea)},
                                                                     {"type", "param_use"},
                                                                     {"function", callee_name},
-                                                                    {"param", param_name}
+                                                                    {"param", callee_ref.name},
+                                                                    {"arg_index", i}
                                                                 });
-                                                                recurse_fn(callee_fn, param_name, depth + 1);
+                                                                recurse_fn(callee_fn, callee_ref, depth + 1);
                                                             }
                                                         }
                                                     }
@@ -576,42 +795,51 @@ namespace tools::composite {
                                         }
                                     }
 
-                                    // 3. Array indexing: arr[var] or var[i]
+                                    // Array indexing
                                     if (e->op == cot_idx) {
-                                        std::string used_var;
+                                        VarRef used_var;
                                         if (UsesActiveVar(e->y, used_var)) {
-                                            flow.push_back({
+                                            nlohmann::ordered_json item = {
                                                 {"depth", depth},
                                                 {"address", tools::utils::FormatAddress(e->ea)},
                                                 {"type", "index_use"},
-                                                {"from", used_var},
+                                                {"from", used_var.name},
                                                 {"array", hexrays_ast::CleanItemText(e->x, cf)},
                                                 {"expr", hexrays_ast::CleanItemText(e, cf)}
-                                            });
+                                            };
+                                            std::string cond = GetCondition();
+                                            if (!cond.empty()) item["path_condition"] = cond;
+                                            flow.push_back(std::move(item));
                                         }
                                         if (UsesActiveVar(e->x, used_var)) {
-                                            flow.push_back({
+                                            nlohmann::ordered_json item = {
                                                 {"depth", depth},
                                                 {"address", tools::utils::FormatAddress(e->ea)},
                                                 {"type", "array_access"},
-                                                {"from", used_var},
+                                                {"from", used_var.name},
                                                 {"index", hexrays_ast::CleanItemText(e->y, cf)},
                                                 {"expr", hexrays_ast::CleanItemText(e, cf)}
-                                            });
+                                            };
+                                            std::string cond = GetCondition();
+                                            if (!cond.empty()) item["path_condition"] = cond;
+                                            flow.push_back(std::move(item));
                                         }
                                     }
 
-                                    // 4. Increment / Decrement: var++, var--, ++var, --var
+                                    // Increment / Decrement
                                     if (e->op == cot_postinc || e->op == cot_postdec || e->op == cot_preinc || e->op == cot_predec) {
-                                        std::string used_var;
+                                        VarRef used_var;
                                         if (UsesActiveVar(e->x, used_var)) {
-                                            flow.push_back({
+                                            nlohmann::ordered_json item = {
                                                 {"depth", depth},
                                                 {"address", tools::utils::FormatAddress(e->ea)},
                                                 {"type", (e->op == cot_postinc || e->op == cot_preinc) ? "increment" : "decrement"},
-                                                {"var", used_var},
+                                                {"var", used_var.name},
                                                 {"expr", hexrays_ast::CleanItemText(e, cf)}
-                                            });
+                                            };
+                                            std::string cond = GetCondition();
+                                            if (!cond.empty()) item["path_condition"] = cond;
+                                            flow.push_back(std::move(item));
                                         }
                                     }
 
@@ -619,51 +847,53 @@ namespace tools::composite {
                                 }
 
                                 int idaapi visit_insn(cinsn_t* insn) override {
-                                    if (flow.size() >= 150) return 1;
+                                    if (flow.size() >= 200) return 1;
                                     if (insn->op == cit_if && insn->cif) {
-                                        std::string used_var;
+                                        VarRef used_var;
                                         if (UsesActiveVar(&insn->cif->expr, used_var)) {
                                             flow.push_back({
                                                 {"depth", depth},
                                                 {"address", tools::utils::FormatAddress(insn->ea)},
                                                 {"type", "condition"},
-                                                {"from", used_var},
+                                                {"from", used_var.name},
                                                 {"condition", hexrays_ast::CleanItemText(&insn->cif->expr, cf)}
                                             });
                                         }
                                     }
                                     if (insn->op == cit_return && insn->creturn && insn->creturn->expr.op != cot_empty) {
-                                        std::string used_var;
+                                        VarRef used_var;
                                         if (UsesActiveVar(&insn->creturn->expr, used_var)) {
-                                            flow.push_back({
+                                            nlohmann::ordered_json item = {
                                                 {"depth", depth},
                                                 {"address", tools::utils::FormatAddress(insn->ea)},
                                                 {"type", "return"},
-                                                {"from", used_var},
+                                                {"from", used_var.name},
                                                 {"expr", hexrays_ast::CleanItemText(&insn->creturn->expr, cf)}
-                                            });
+                                            };
+                                            std::string cond = GetCondition();
+                                            if (!cond.empty()) item["path_condition"] = cond;
+                                            flow.push_back(std::move(item));
                                         }
                                     }
                                     return 0;
                                 }
                             };
 
-                            ForwardVisitor visitor(local_cf, active_vars, flow_arr, current_depth, include_calls, max_depth, trace_fn);
+                            ForwardVisitor visitor(local_cf, active_lvars, pointer_aliases, active_mem_locs, flow_arr, current_depth, include_calls, max_depth, trace_fn, ResolveCallTarget, GetArgLvarIdx, GetAbstractMemLoc);
                             visitor.apply_to(&local_cf->body, nullptr);
                         } else {
                             // Backward direction: use -> def with deep reverse-AST evaluation
                             std::set<std::string> active_globals;
                             std::set<ea_t> active_objs;
 
-                            auto UsesActiveVar = [&](const cexpr_t* e, std::string& out_name) -> bool {
+                            auto UsesActiveVar = [&](const cexpr_t* e, VarRef& out_v) -> bool {
                                 std::function<bool(const cexpr_t*)> check = [&](const cexpr_t* sub) -> bool {
                                     if (!sub) return false;
                                     if (sub->op == cot_var) {
-                                        const lvars_t* lvars = local_cf->get_lvars();
-                                        if (lvars && sub->v.idx >= 0 && sub->v.idx < static_cast<int>(lvars->size())) {
-                                            std::string vname = (*lvars)[sub->v.idx].name.c_str();
-                                            if (active_vars.count(vname)) {
-                                                out_name = vname;
+                                        const lvars_t* lvs = local_cf->get_lvars();
+                                        if (lvs && sub->v.idx >= 0 && sub->v.idx < static_cast<int>(lvs->size())) {
+                                            if (active_lvars.count(sub->v.idx)) {
+                                                out_v = VarRef{ local_cf->entry_ea, sub->v.idx, (*lvs)[sub->v.idx].name.c_str() };
                                                 return true;
                                             }
                                         }
@@ -682,15 +912,15 @@ namespace tools::composite {
                                 return check(e);
                             };
 
-                            auto ExtractSources = [&](const cexpr_t* e, std::vector<std::string>& out_vars, std::vector<std::string>& out_globals) {
+                            auto ExtractSources = [&](const cexpr_t* e, std::vector<VarRef>& out_vars, std::vector<std::string>& out_globals) {
                                 std::function<void(const cexpr_t*)> walk = [&](const cexpr_t* sub) {
                                     if (!sub) return;
                                     if (sub->op == cot_var) {
-                                        const lvars_t* lvars = local_cf->get_lvars();
-                                        if (lvars && sub->v.idx >= 0 && sub->v.idx < static_cast<int>(lvars->size())) {
-                                            std::string vn = (*lvars)[sub->v.idx].name.c_str();
-                                            if (std::find(out_vars.begin(), out_vars.end(), vn) == out_vars.end()) {
-                                                out_vars.push_back(vn);
+                                        const lvars_t* lvs = local_cf->get_lvars();
+                                        if (lvs && sub->v.idx >= 0 && sub->v.idx < static_cast<int>(lvs->size())) {
+                                            VarRef vr{ local_cf->entry_ea, sub->v.idx, (*lvs)[sub->v.idx].name.c_str() };
+                                            if (std::find(out_vars.begin(), out_vars.end(), vr) == out_vars.end()) {
+                                                out_vars.push_back(vr);
                                             }
                                         }
                                     } else if (sub->op == cot_obj && is_mapped(sub->obj_ea)) {
@@ -726,9 +956,9 @@ namespace tools::composite {
                             } collector;
                             collector.apply_to(&local_cf->body, nullptr);
 
-                            // Traverse collected items in reverse execution order (from bottom to top)
+                            // Traverse collected items in reverse execution order
                             for (auto it = collector.items.rbegin(); it != collector.items.rend(); ++it) {
-                                if (flow_arr.size() >= 150) break;
+                                if (flow_arr.size() >= 200) break;
                                 citem_t* item = *it;
 
                                 if (item->is_expr()) {
@@ -740,19 +970,15 @@ namespace tools::composite {
                                         bool matched = false;
                                         std::string def_target;
 
-                                        // Case A: local variable assignment
                                         if (e->x && e->x->op == cot_var) {
-                                            const lvars_t* lvars = local_cf->get_lvars();
-                                            if (lvars && e->x->v.idx >= 0 && e->x->v.idx < static_cast<int>(lvars->size())) {
-                                                std::string lhs_name = (*lvars)[e->x->v.idx].name.c_str();
-                                                if (active_vars.count(lhs_name)) {
+                                            if (active_lvars.count(e->x->v.idx)) {
+                                                const lvars_t* lvs = local_cf->get_lvars();
+                                                if (lvs && e->x->v.idx >= 0 && e->x->v.idx < static_cast<int>(lvs->size())) {
                                                     matched = true;
-                                                    def_target = lhs_name;
+                                                    def_target = (*lvs)[e->x->v.idx].name.c_str();
                                                 }
                                             }
-                                        }
-                                        // Case B: global data object assignment
-                                        else if (e->x && e->x->op == cot_obj) {
+                                        } else if (e->x && e->x->op == cot_obj) {
                                             qstring oname;
                                             get_name(&oname, e->x->obj_ea);
                                             std::string obj_name = oname.c_str();
@@ -760,10 +986,8 @@ namespace tools::composite {
                                                 matched = true;
                                                 def_target = obj_name.empty() ? tools::utils::FormatAddress(e->x->obj_ea) : obj_name;
                                             }
-                                        }
-                                        // Case C: struct member / pointer dereference assignment
-                                        else if (e->x && (e->x->op == cot_ptr || e->x->op == cot_memptr || e->x->op == cot_memref)) {
-                                            std::string base_var;
+                                        } else if (e->x && (e->x->op == cot_ptr || e->x->op == cot_memptr || e->x->op == cot_memref)) {
+                                            VarRef base_var;
                                             if (UsesActiveVar(e->x, base_var)) {
                                                 flow_arr.push_back({
                                                     {"depth", current_depth},
@@ -771,16 +995,25 @@ namespace tools::composite {
                                                     {"type", "member_def"},
                                                     {"target", hexrays_ast::CleanItemText(e->x, local_cf)},
                                                     {"from", hexrays_ast::CleanItemText(e->y, local_cf)},
-                                                    {"base_var", base_var},
+                                                    {"base_var", base_var.name},
                                                     {"expr", hexrays_ast::CleanItemText(e, local_cf)}
                                                 });
                                             }
                                         }
 
                                         if (matched) {
-                                            std::vector<std::string> src_vars;
+                                            std::vector<VarRef> src_vars;
                                             std::vector<std::string> src_globals;
                                             ExtractSources(e->y, src_vars, src_globals);
+
+                                            std::vector<std::string> src_var_names;
+                                            for (const auto& sv : src_vars) {
+                                                src_var_names.push_back(sv.name);
+                                                active_lvars.insert(sv.lvar_idx);
+                                            }
+                                            for (const auto& sg : src_globals) {
+                                                active_globals.insert(sg);
+                                            }
 
                                             nlohmann::ordered_json flow_item = {
                                                 {"depth", current_depth},
@@ -790,20 +1023,14 @@ namespace tools::composite {
                                                 {"from", hexrays_ast::CleanItemText(e->y, local_cf)},
                                                 {"expr", hexrays_ast::CleanItemText(e, local_cf)}
                                             };
-                                            if (!src_vars.empty()) {
-                                                flow_item["sources"] = src_vars;
-                                                for (const auto& sv : src_vars) active_vars.insert(sv);
-                                            }
-                                            if (!src_globals.empty()) {
-                                                flow_item["global_sources"] = src_globals;
-                                                for (const auto& sg : src_globals) active_globals.insert(sg);
-                                            }
+                                            if (!src_var_names.empty()) flow_item["sources"] = src_var_names;
+                                            if (!src_globals.empty()) flow_item["global_sources"] = src_globals;
                                             flow_arr.push_back(std::move(flow_item));
 
                                             // If defined by a call, inspect callee return and recurse
                                             if (e->y && e->y->op == cot_call) {
                                                 std::string callee_name = hexrays_ast::CleanItemText(e->y->x, local_cf);
-                                                ea_t callee_ea = (e->y->x && e->y->x->op == cot_obj) ? e->y->x->obj_ea : BADADDR;
+                                                ea_t callee_ea = ResolveCallTarget(e->y, local_cf);
 
                                                 flow_arr.push_back({
                                                     {"depth", current_depth},
@@ -821,28 +1048,20 @@ namespace tools::composite {
                                                         if (callee_cf) {
                                                             struct ret_finder_t : public ctree_visitor_t {
                                                                 const cfunc_t* c_cf;
-                                                                std::vector<std::pair<ea_t, std::string>> rets;
+                                                                std::vector<std::pair<ea_t, const cexpr_t*>> rets;
                                                                 ret_finder_t(const cfunc_t* f) : ctree_visitor_t(CV_FAST), c_cf(f) {}
                                                                 int idaapi visit_insn(cinsn_t* in) override {
                                                                     if (in->op == cit_return && in->creturn && in->creturn->expr.op != cot_empty) {
-                                                                        std::string ret_var;
-                                                                        if (in->creturn->expr.op == cot_var) {
-                                                                            const lvars_t* clvs = const_cast<cfunc_t*>(c_cf)->get_lvars();
-                                                                            if (clvs && in->creturn->expr.v.idx >= 0 && in->creturn->expr.v.idx < static_cast<int>(clvs->size())) {
-                                                                                ret_var = (*clvs)[in->creturn->expr.v.idx].name.c_str();
-                                                                            }
-                                                                        }
-                                                                        if (ret_var.empty()) {
-                                                                            ret_var = hexrays_ast::CleanItemText(&in->creturn->expr, c_cf);
-                                                                        }
-                                                                        rets.push_back({in->ea, ret_var});
+                                                                        rets.push_back({in->ea, &in->creturn->expr});
                                                                     }
                                                                     return 0;
                                                                 }
                                                             } rf(callee_cf);
                                                             rf.apply_to(&callee_cf->body, nullptr);
 
-                                                            for (const auto& [ret_ea, ret_str] : rf.rets) {
+                                                            // Handle ALL returns (no break), decomposing expressions into source vars
+                                                            for (const auto& [ret_ea, ret_expr] : rf.rets) {
+                                                                std::string ret_str = hexrays_ast::CleanItemText(ret_expr, callee_cf);
                                                                 flow_arr.push_back({
                                                                     {"depth", current_depth + 1},
                                                                     {"address", tools::utils::FormatAddress(ret_ea)},
@@ -850,15 +1069,37 @@ namespace tools::composite {
                                                                     {"function", callee_name},
                                                                     {"returned", ret_str}
                                                                 });
-                                                                trace_fn(callee_fn, ret_str, current_depth + 1);
-                                                                break;
+
+                                                                std::vector<VarRef> ret_src_vars;
+                                                                std::vector<std::string> ret_src_globals;
+                                                                std::function<void(const cexpr_t*)> walk_ret = [&](const cexpr_t* sub) {
+                                                                    if (!sub) return;
+                                                                    if (sub->op == cot_var) {
+                                                                        const lvars_t* clvs = callee_cf->get_lvars();
+                                                                        if (clvs && sub->v.idx >= 0 && sub->v.idx < static_cast<int>(clvs->size())) {
+                                                                            VarRef vr{ callee_cf->entry_ea, sub->v.idx, (*clvs)[sub->v.idx].name.c_str() };
+                                                                            if (std::find(ret_src_vars.begin(), ret_src_vars.end(), vr) == ret_src_vars.end()) {
+                                                                                ret_src_vars.push_back(vr);
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    if (op_uses_x(sub->op) && sub->x) walk_ret(sub->x);
+                                                                    if (op_uses_y(sub->op) && sub->y) walk_ret(sub->y);
+                                                                    if (op_uses_z(sub->op) && sub->z) walk_ret(sub->z);
+                                                                    if (sub->op == cot_call && sub->a) {
+                                                                        for (const auto& arg : *sub->a) walk_ret(&arg);
+                                                                    }
+                                                                };
+                                                                walk_ret(ret_expr);
+
+                                                                for (const auto& rv : ret_src_vars) {
+                                                                    trace_fn(callee_fn, rv, current_depth + 1);
+                                                                }
                                                             }
                                                         }
                                                     }
                                                 }
-                                            }
-                                            // Memory load definition
-                                            else if (e->y && (e->y->op == cot_ptr || e->y->op == cot_memptr || e->y->op == cot_memref)) {
+                                            } else if (e->y && (e->y->op == cot_ptr || e->y->op == cot_memptr || e->y->op == cot_memref)) {
                                                 flow_arr.push_back({
                                                     {"depth", current_depth},
                                                     {"address", tools::utils::FormatAddress(e->ea)},
@@ -867,9 +1108,7 @@ namespace tools::composite {
                                                     {"source", hexrays_ast::CleanItemText(e->y, local_cf)},
                                                     {"expr", hexrays_ast::CleanItemText(e, local_cf)}
                                                 });
-                                            }
-                                            // Array load definition
-                                            else if (e->y && e->y->op == cot_idx) {
+                                            } else if (e->y && e->y->op == cot_idx) {
                                                 flow_arr.push_back({
                                                     {"depth", current_depth},
                                                     {"address", tools::utils::FormatAddress(e->ea)},
@@ -883,67 +1122,44 @@ namespace tools::composite {
                                         }
                                     }
 
-                                    // 2. Out-parameter call detection: callee(..., &var, ...)
+                                    // Out-parameter call detection: callee(..., &var, ...)
                                     if (e->op == cot_call && e->a) {
                                         std::string callee_name = hexrays_ast::CleanItemText(e->x, local_cf);
-                                        ea_t callee_ea = (e->x && e->x->op == cot_obj) ? e->x->obj_ea : BADADDR;
+                                        ea_t callee_ea = ResolveCallTarget(e, local_cf);
+
                                         for (size_t ai = 0; ai < e->a->size(); ++ai) {
                                             const carg_t& arg = (*e->a)[ai];
-                                            std::string used_var;
-                                            bool is_ref = false;
-                                            if (arg.op == cot_ref && arg.x && arg.x->op == cot_var) {
-                                                const lvars_t* lvs = local_cf->get_lvars();
-                                                if (lvs && arg.x->v.idx >= 0 && arg.x->v.idx < static_cast<int>(lvs->size())) {
-                                                    std::string vn = (*lvs)[arg.x->v.idx].name.c_str();
-                                                    if (active_vars.count(vn)) {
-                                                        used_var = vn;
-                                                        is_ref = true;
-                                                    }
-                                                }
-                                            } else if (arg.op == cot_cast && arg.x && arg.x->op == cot_ref && arg.x->x && arg.x->x->op == cot_var) {
-                                                const lvars_t* lvs = local_cf->get_lvars();
-                                                if (lvs && arg.x->x->v.idx >= 0 && arg.x->x->v.idx < static_cast<int>(lvs->size())) {
-                                                    std::string vn = (*lvs)[arg.x->x->v.idx].name.c_str();
-                                                    if (active_vars.count(vn)) {
-                                                        used_var = vn;
-                                                        is_ref = true;
-                                                    }
-                                                }
-                                            }
+                                            const cexpr_t* unwrap_arg = &arg;
+                                            if (unwrap_arg->op == cot_cast && unwrap_arg->x) unwrap_arg = unwrap_arg->x;
 
-                                            if (is_ref && !used_var.empty()) {
-                                                flow_arr.push_back({
-                                                    {"depth", current_depth},
-                                                    {"address", tools::utils::FormatAddress(e->ea)},
-                                                    {"type", "call_out_arg"},
-                                                    {"var", used_var},
-                                                    {"callee", callee_name},
-                                                    {"arg_index", ai},
-                                                    {"expr", hexrays_ast::CleanItemText(e, local_cf)}
-                                                });
+                                            if (unwrap_arg->op == cot_ref && unwrap_arg->x && unwrap_arg->x->op == cot_var) {
+                                                int v_idx = unwrap_arg->x->v.idx;
+                                                if (active_lvars.count(v_idx)) {
+                                                    const lvars_t* lvs = local_cf->get_lvars();
+                                                    std::string used_var = (lvs && v_idx >= 0 && v_idx < static_cast<int>(lvs->size())) ? (*lvs)[v_idx].name.c_str() : "";
 
-                                                if (include_calls && current_depth < max_depth && callee_ea != BADADDR) {
-                                                    func_t* callee_fn = get_func(callee_ea);
-                                                    if (callee_fn) {
-                                                        hexrays_failure_t c_hf;
-                                                        cfuncptr_t callee_cf = decompile(callee_fn, &c_hf, DECOMP_WARNINGS | DECOMP_NO_WAIT);
-                                                        if (callee_cf) {
-                                                            const lvars_t* callee_lvars = callee_cf->get_lvars();
-                                                            std::string param_name;
-                                                            size_t p_cnt = 0;
-                                                            if (callee_lvars) {
-                                                                for (size_t k = 0; k < callee_lvars->size(); ++k) {
-                                                                    if ((*callee_lvars)[k].is_arg_var()) {
-                                                                        if (p_cnt == ai) {
-                                                                            param_name = (*callee_lvars)[k].name.c_str();
-                                                                            break;
-                                                                        }
-                                                                        p_cnt++;
-                                                                    }
+                                                    flow_arr.push_back({
+                                                        {"depth", current_depth},
+                                                        {"address", tools::utils::FormatAddress(e->ea)},
+                                                        {"type", "call_out_arg"},
+                                                        {"var", used_var},
+                                                        {"callee", callee_name},
+                                                        {"arg_index", ai},
+                                                        {"expr", hexrays_ast::CleanItemText(e, local_cf)}
+                                                    });
+
+                                                    if (include_calls && current_depth < max_depth && callee_ea != BADADDR) {
+                                                        func_t* callee_fn = get_func(callee_ea);
+                                                        if (callee_fn) {
+                                                            hexrays_failure_t c_hf;
+                                                            cfuncptr_t callee_cf = decompile(callee_fn, &c_hf, DECOMP_WARNINGS | DECOMP_NO_WAIT);
+                                                            if (callee_cf) {
+                                                                int param_lvar_idx = GetArgLvarIdx(callee_cf, ai);
+                                                                const lvars_t* callee_lvars = callee_cf->get_lvars();
+                                                                if (callee_lvars && param_lvar_idx >= 0 && param_lvar_idx < static_cast<int>(callee_lvars->size())) {
+                                                                    VarRef callee_ref{ callee_fn->start_ea, param_lvar_idx, (*callee_lvars)[param_lvar_idx].name.c_str() };
+                                                                    trace_fn(callee_fn, callee_ref, current_depth + 1);
                                                                 }
-                                                            }
-                                                            if (!param_name.empty()) {
-                                                                trace_fn(callee_fn, param_name, current_depth + 1);
                                                             }
                                                         }
                                                     }
@@ -952,30 +1168,30 @@ namespace tools::composite {
                                         }
                                     }
 
-                                    // 3. Increment / Decrement
+                                    // Increment / Decrement
                                     if (e->op == cot_postinc || e->op == cot_postdec || e->op == cot_preinc || e->op == cot_predec) {
-                                        std::string used_var;
+                                        VarRef used_var;
                                         if (UsesActiveVar(e->x, used_var)) {
                                             flow_arr.push_back({
                                                 {"depth", current_depth},
                                                 {"address", tools::utils::FormatAddress(e->ea)},
                                                 {"type", (e->op == cot_postinc || e->op == cot_preinc) ? "increment" : "decrement"},
-                                                {"var", used_var},
+                                                {"var", used_var.name},
                                                 {"expr", hexrays_ast::CleanItemText(e, local_cf)}
                                             });
                                         }
                                     }
                                 } else {
-                                    // 4. Instructions: Guard conditions (if-statements)
+                                    // Instructions: Guard conditions (if-statements)
                                     const cinsn_t* insn = static_cast<const cinsn_t*>(item);
                                     if (insn->op == cit_if && insn->cif) {
-                                        std::string used_var;
+                                        VarRef used_var;
                                         if (UsesActiveVar(&insn->cif->expr, used_var)) {
                                             flow_arr.push_back({
                                                 {"depth", current_depth},
                                                 {"address", tools::utils::FormatAddress(insn->ea)},
                                                 {"type", "guard_condition"},
-                                                {"from", used_var},
+                                                {"from", used_var.name},
                                                 {"condition", hexrays_ast::CleanItemText(&insn->cif->expr, local_cf)}
                                             });
                                         }
@@ -983,74 +1199,88 @@ namespace tools::composite {
                                 }
                             }
 
-                            // 5. Caller Argument Resolution: If any active variable is an incoming argument, find callers
+                            // Caller Argument Resolution in Backward direction
                             if (include_calls && current_depth < max_depth) {
                                 const lvars_t* fn_lvars = local_cf->get_lvars();
                                 if (fn_lvars) {
-                                    for (size_t li = 0; li < fn_lvars->size(); ++li) {
-                                        const lvar_t& lv = (*fn_lvars)[li];
-                                        if (lv.is_arg_var() && active_vars.count(lv.name.c_str())) {
-                                            size_t param_idx = 0;
-                                            for (size_t k = 0; k < li; ++k) {
-                                                if ((*fn_lvars)[k].is_arg_var()) param_idx++;
-                                            }
+                                    for (int active_idx : active_lvars) {
+                                        if (active_idx >= 0 && active_idx < static_cast<int>(fn_lvars->size())) {
+                                            const lvar_t& lv = (*fn_lvars)[active_idx];
+                                            if (lv.is_arg_var()) {
+                                                int param_idx = -1;
+                                                for (size_t ai = 0; ai < local_cf->argidx.size(); ++ai) {
+                                                    if (local_cf->argidx[ai] == active_idx) {
+                                                        param_idx = static_cast<int>(ai);
+                                                        break;
+                                                    }
+                                                }
+                                                if (param_idx < 0) {
+                                                    int cur_arg = 0;
+                                                    for (size_t k = 0; k < static_cast<size_t>(active_idx); ++k) {
+                                                        if ((*fn_lvars)[k].is_arg_var()) cur_arg++;
+                                                    }
+                                                    param_idx = cur_arg;
+                                                }
 
-                                            std::set<ea_t> caller_funcs_seen;
-                                            xrefblk_t xb;
-                                            for (bool ok = xb.first_to(fn->start_ea, XREF_ALL); ok && caller_funcs_seen.size() < 3; ok = xb.next_to()) {
-                                                if (!xb.iscode) continue;
-                                                func_t* caller_pfn = get_func(xb.from);
-                                                if (!caller_pfn || caller_pfn->start_ea == fn->start_ea) continue;
-                                                if (caller_funcs_seen.count(caller_pfn->start_ea)) continue;
-                                                caller_funcs_seen.insert(caller_pfn->start_ea);
+                                                std::set<ea_t> caller_funcs_seen;
+                                                xrefblk_t xb;
+                                                for (bool ok = xb.first_to(fn->start_ea, XREF_ALL); ok && caller_funcs_seen.size() < 3; ok = xb.next_to()) {
+                                                    if (!xb.iscode) continue;
+                                                    func_t* caller_pfn = get_func(xb.from);
+                                                    if (!caller_pfn || caller_pfn->start_ea == fn->start_ea) continue;
+                                                    if (caller_funcs_seen.count(caller_pfn->start_ea)) continue;
+                                                    caller_funcs_seen.insert(caller_pfn->start_ea);
 
-                                                hexrays_failure_t c_hf;
-                                                cfuncptr_t caller_cf = decompile(caller_pfn, &c_hf, DECOMP_WARNINGS | DECOMP_NO_WAIT);
-                                                if (!caller_cf) continue;
+                                                    hexrays_failure_t c_hf;
+                                                    cfuncptr_t caller_cf = decompile(caller_pfn, &c_hf, DECOMP_WARNINGS | DECOMP_NO_WAIT);
+                                                    if (!caller_cf) continue;
 
-                                                qstring caller_name_buf;
-                                                get_func_name(&caller_name_buf, caller_pfn->start_ea);
-                                                std::string caller_name = caller_name_buf.c_str();
+                                                    qstring caller_name_buf;
+                                                    get_func_name(&caller_name_buf, caller_pfn->start_ea);
+                                                    std::string caller_name = caller_name_buf.c_str();
 
-                                                struct caller_call_finder_t : public ctree_visitor_t {
-                                                    const cfunc_t* c_cf;
-                                                    ea_t target_fn_ea;
-                                                    size_t p_idx;
-                                                    std::string p_name;
-                                                    std::string c_name;
-                                                    int d;
-                                                    nlohmann::json& fl;
-                                                    std::function<void(func_t*, const std::string&, int)> r_fn;
-                                                    caller_call_finder_t(const cfunc_t* f, ea_t tea, size_t pi, const std::string& pn, const std::string& cn, int cd, nlohmann::json& flow_arr, std::function<void(func_t*, const std::string&, int)> rf)
-                                                        : ctree_visitor_t(CV_FAST), c_cf(f), target_fn_ea(tea), p_idx(pi), p_name(pn), c_name(cn), d(cd), fl(flow_arr), r_fn(rf) {}
+                                                    struct caller_call_finder_t : public ctree_visitor_t {
+                                                        const cfunc_t* c_cf;
+                                                        ea_t target_fn_ea;
+                                                        int p_idx;
+                                                        std::string p_name;
+                                                        std::string c_name;
+                                                        int d;
+                                                        nlohmann::json& fl;
+                                                        std::function<void(func_t*, const VarRef&, int)> r_fn;
+                                                        caller_call_finder_t(const cfunc_t* f, ea_t tea, int pi, const std::string& pn, const std::string& cn, int cd, nlohmann::json& flow_arr, std::function<void(func_t*, const VarRef&, int)> rf)
+                                                            : ctree_visitor_t(CV_FAST), c_cf(f), target_fn_ea(tea), p_idx(pi), p_name(pn), c_name(cn), d(cd), fl(flow_arr), r_fn(rf) {}
 
-                                                    int idaapi visit_expr(cexpr_t* ce) override {
-                                                        if (ce->op == cot_call && ce->x && ce->x->op == cot_obj && ce->x->obj_ea == target_fn_ea && ce->a) {
-                                                            if (p_idx < ce->a->size()) {
-                                                                const carg_t& passed_arg = (*ce->a)[p_idx];
-                                                                std::string passed_str = hexrays_ast::CleanItemText(&passed_arg, c_cf);
-                                                                fl.push_back({
-                                                                    {"depth", d + 1},
-                                                                    {"address", tools::utils::FormatAddress(ce->ea)},
-                                                                    {"type", "caller_arg_passed"},
-                                                                    {"caller", c_name},
-                                                                    {"param", p_name},
-                                                                    {"arg_index", p_idx},
-                                                                    {"passed_expr", passed_str}
-                                                                });
-                                                                if (passed_arg.op == cot_var) {
-                                                                    const lvars_t* clvs = const_cast<cfunc_t*>(c_cf)->get_lvars();
-                                                                    if (clvs && passed_arg.v.idx >= 0 && passed_arg.v.idx < static_cast<int>(clvs->size())) {
-                                                                        std::string caller_var = (*clvs)[passed_arg.v.idx].name.c_str();
-                                                                        r_fn(get_func(c_cf->entry_ea), caller_var, d + 1);
+                                                        int idaapi visit_expr(cexpr_t* ce) override {
+                                                            if (ce->op == cot_call && ce->a) {
+                                                                ea_t resolved_target = BADADDR;
+                                                                if (ce->x && ce->x->op == cot_obj) resolved_target = ce->x->obj_ea;
+                                                                if (resolved_target == target_fn_ea && p_idx >= 0 && static_cast<size_t>(p_idx) < ce->a->size()) {
+                                                                    const carg_t& passed_arg = (*ce->a)[p_idx];
+                                                                    std::string passed_str = hexrays_ast::CleanItemText(&passed_arg, c_cf);
+                                                                    fl.push_back({
+                                                                        {"depth", d + 1},
+                                                                        {"address", tools::utils::FormatAddress(ce->ea)},
+                                                                        {"type", "caller_arg_passed"},
+                                                                        {"caller", c_name},
+                                                                        {"param", p_name},
+                                                                        {"arg_index", p_idx},
+                                                                        {"passed_expr", passed_str}
+                                                                    });
+                                                                    if (passed_arg.op == cot_var) {
+                                                                        const lvars_t* clvs = const_cast<cfunc_t*>(c_cf)->get_lvars();
+                                                                        if (clvs && passed_arg.v.idx >= 0 && passed_arg.v.idx < static_cast<int>(clvs->size())) {
+                                                                            VarRef caller_ref{ c_cf->entry_ea, passed_arg.v.idx, (*clvs)[passed_arg.v.idx].name.c_str() };
+                                                                            r_fn(get_func(c_cf->entry_ea), caller_ref, d + 1);
+                                                                        }
                                                                     }
                                                                 }
                                                             }
+                                                            return 0;
                                                         }
-                                                        return 0;
-                                                    }
-                                                } ccf(caller_cf, fn->start_ea, param_idx, lv.name.c_str(), caller_name, current_depth, flow_arr, trace_fn);
-                                                ccf.apply_to(&caller_cf->body, nullptr);
+                                                    } ccf(caller_cf, fn->start_ea, param_idx, lv.name.c_str(), caller_name, current_depth, flow_arr, trace_fn);
+                                                    ccf.apply_to(&caller_cf->body, nullptr);
+                                                }
                                             }
                                         }
                                     }
@@ -1059,7 +1289,7 @@ namespace tools::composite {
                         }
                     };
 
-                    trace_fn(pfn, target_var, 0);
+                    trace_fn(pfn, root_var, 0);
                 }
             }
 

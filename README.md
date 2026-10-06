@@ -190,7 +190,7 @@ Store `router.exe` in a persistent directory (e.g. `C:\Tools\ida-mcp\router.exe`
 | `reconstruct_struct` | Types & Structures | Reconstructs C struct definitions by analyzing memory accesses, allocations, member offsets, and padding. |
 | `rtti` | RTTI & Polymorphism | Unified MSVC RTTI inspector: lists polymorphic classes, inspects class hierarchies/vtables, and generates TIL structs. |
 | `resolve_vcall` | RTTI & Polymorphism | Resolves virtual method invocations to concrete function implementations via vtable indexing. |
-| `refactor` | Modification & Refactor | Unified atomic refactoring: rename functions/globals/lvars, apply C types/prototypes, manage comments, and auto-recompile. |
+| `refactor` | Modification & Refactor | Unified batched refactoring: rename functions/globals/lvars, apply C types/prototypes, manage comments, and auto-recompile in synchronized transactions. |
 | `make_signature` | Utilities | Generates unique byte pattern signatures (shortest resilient or function entry) with wildcard operands. |
-| `trace_data_flow` | Utilities | Inter-procedural data flow tracking across assignments, pointers, array indexing, and call arguments. |
+| `trace_data_flow` | Utilities | Deep inter-procedural data flow tracking: variable identity via `lvar_idx`, pointer alias analysis, abstract memory locations (`Memory[obj+off]`), and path-sensitive conditions. |
 | `py` | Utilities | Executes arbitrary IDAPython snippets or expressions inside IDA's main thread and captures stdout/stderr. |

@@ -299,7 +299,7 @@ namespace mcp {
             },
             {
                 "name": "refactor",
-                "description": "Unified and atomic refactoring tool for IDA Pro. Modifies function names, global symbols in .data/.bss, types/prototypes, instruction comments, function comments, and decompilation local variables (lvars). Supports batching across multiple items in a single IDB transaction and automatically recompiles affected functions, returning fresh C pseudocode without secondary calls.",
+                "description": "Unified batched refactoring tool for IDA Pro. Modifies function names, global symbols in .data/.bss, types/prototypes, instruction comments, function comments, and decompilation local variables (lvars). Executes changes as a synchronized batched mutation and automatically recompiles affected functions, returning fresh C pseudocode without secondary calls.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

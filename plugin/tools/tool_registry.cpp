@@ -142,28 +142,25 @@ namespace tools {
                     rpc_resp["result"]["content"][0]["text"].is_string()) {
 
                     std::string& text = rpc_resp["result"]["content"][0]["text"].get_ref<std::string&>();
+                    size_t last_brace = text.rfind('}');
                     size_t first_brace = text.find('{');
+
+                    // Fast path: direct text injection before final closing brace, zero JSON re-parsing and re-dumping!
+                    if (last_brace != std::string::npos && first_brace != std::string::npos && first_brace < last_brace) {
+                        double rounded = std::round(elapsed_sec * 1000.0) / 1000.0;
+                        char buf[64];
+                        qsnprintf(buf, sizeof(buf), ",\n  \"elapsed_sec\": %.3f\n}", rounded);
+                        text.replace(last_brace, text.size() - last_brace, buf);
+                        return;
+                    }
+
                     if (first_brace == std::string::npos) return;
 
                     nlohmann::ordered_json parsed = nlohmann::ordered_json::parse(text.substr(first_brace));
                     if (parsed.is_object()) {
-                        nlohmann::ordered_json canonical;
-                        if (parsed.contains("status")) {
-                            canonical["status"] = parsed["status"];
-                        } else {
-                            canonical["status"] = "success";
-                        }
-
-                        for (auto it = parsed.begin(); it != parsed.end(); ++it) {
-                            if (it.key() != "status" && it.key() != "elapsed_sec") {
-                                canonical[it.key()] = std::move(it.value());
-                            }
-                        }
-
                         double rounded = std::round(elapsed_sec * 1000.0) / 1000.0;
-                        canonical["elapsed_sec"] = rounded;
-
-                        text = canonical.dump(2);
+                        parsed["elapsed_sec"] = rounded;
+                        text = parsed.dump(2);
                     }
                 }
             } catch (...) {
@@ -204,7 +201,7 @@ namespace tools {
                     {"protocolVersion", "2024-11-05"},
                     {"serverInfo", {
                         {"name", "ida-pro-mcp"},
-                        {"version", "1.2.0"}
+                        {"version", "1.2.1"}
                     }},
                     {"capabilities", {
                         {"tools", nlohmann::json::object()}

@@ -7,7 +7,16 @@
 #include <filesystem>
 
 namespace router {
-    void IdaRouter::RefreshInstances() {
+    void IdaRouter::RefreshInstances(bool force) {
+        auto now = std::chrono::steady_clock::now();
+        if (!force && !instances_.empty() && !active_file_.empty()) {
+            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_discovery_time_).count();
+            if (elapsed_ms < 1500) {
+                return;
+            }
+        }
+        last_discovery_time_ = now;
+
         std::string cur = active_file_;
         std::wstring active_pipe = active_client_.IsConnected() ? active_client_.GetCurrentPipe() : L"";
 
@@ -195,7 +204,7 @@ namespace router {
             }
         }
 
-        RefreshInstances();
+        RefreshInstances(true);
 
         // Smart matching:
         // 1. Exact key match

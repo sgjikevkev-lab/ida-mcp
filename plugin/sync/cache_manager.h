@@ -53,8 +53,12 @@ namespace cache {
         // Call when raw binary bytes or code instructions are patched in IDB
         void InvalidateBytes() {
             NextGeneration();
-            std::lock_guard<std::mutex> lock(mtx_);
-            for (auto& fn : byte_invalidators_) {
+            std::vector<Invalidator> callbacks;
+            {
+                std::lock_guard<std::mutex> lock(mtx_);
+                callbacks = byte_invalidators_;
+            }
+            for (auto& fn : callbacks) {
                 try { fn(); } catch (...) {}
             }
         }
@@ -62,8 +66,12 @@ namespace cache {
         // Call when types, symbols, comments, or structure definitions change
         void InvalidateAnalysis() {
             NextGeneration();
-            std::lock_guard<std::mutex> lock(mtx_);
-            for (auto& fn : analysis_invalidators_) {
+            std::vector<Invalidator> callbacks;
+            {
+                std::lock_guard<std::mutex> lock(mtx_);
+                callbacks = analysis_invalidators_;
+            }
+            for (auto& fn : callbacks) {
                 try { fn(); } catch (...) {}
             }
         }
@@ -71,11 +79,17 @@ namespace cache {
         // Invalidate all caches across the entire plugin (e.g. after python execution or batch patches)
         void InvalidateAll() {
             NextGeneration();
-            std::lock_guard<std::mutex> lock(mtx_);
-            for (auto& fn : byte_invalidators_) {
+            std::vector<Invalidator> b_callbacks;
+            std::vector<Invalidator> a_callbacks;
+            {
+                std::lock_guard<std::mutex> lock(mtx_);
+                b_callbacks = byte_invalidators_;
+                a_callbacks = analysis_invalidators_;
+            }
+            for (auto& fn : b_callbacks) {
                 try { fn(); } catch (...) {}
             }
-            for (auto& fn : analysis_invalidators_) {
+            for (auto& fn : a_callbacks) {
                 try { fn(); } catch (...) {}
             }
         }

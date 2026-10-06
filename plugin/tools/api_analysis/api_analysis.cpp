@@ -14,6 +14,7 @@
 #include "api_analysis.h"
 #include "tools/utils/utils.h"
 #include "sync/sync.h"
+#include "sync/cache_manager.h"
 
 #include <ida.hpp>
 #include <funcs.hpp>
@@ -31,6 +32,90 @@
 
 namespace tools::analysis {
     namespace {
+        struct PathEdge {
+            ea_t caller_start_ea = BADADDR;
+            ea_t call_site_ea = BADADDR;
+            ea_t callee_start_ea = BADADDR;
+            bool is_thunk = false;
+            bool is_tail_call = false;
+            bool is_indirect = false;
+            std::string edge_type = "call"; // "call", "tail_call", "vtable_verified", "vtable_heuristic", "callback", "indirect_ptr", "indirect_vcall"
+            ea_t vtable_ea = BADADDR;
+            std::string vtable_name;
+            std::string caller_name;
+            std::string caller_demangled;
+            std::string callee_name;
+            std::string callee_demangled;
+            std::string disasm;
+        };
+
+        class FunctionEdgeCache {
+        public:
+            struct CacheEntry {
+                uint64_t generation = 0;
+                std::vector<PathEdge> out_edges;
+                std::vector<PathEdge> in_edges;
+            };
+
+            static FunctionEdgeCache& Instance() {
+                static FunctionEdgeCache inst;
+                return inst;
+            }
+
+            bool GetOut(ea_t ea, uint64_t gen, std::vector<PathEdge>& out) {
+                std::lock_guard<std::mutex> lock(mtx_);
+                auto it = entries_.find(ea);
+                if (it != entries_.end() && it->second.generation == gen && !it->second.out_edges.empty()) {
+                    out = it->second.out_edges;
+                    return true;
+                }
+                return false;
+            }
+
+            void PutOut(ea_t ea, uint64_t gen, std::vector<PathEdge> edges) {
+                std::lock_guard<std::mutex> lock(mtx_);
+                auto& e = entries_[ea];
+                e.generation = gen;
+                e.out_edges = std::move(edges);
+            }
+
+            bool GetIn(ea_t ea, uint64_t gen, std::vector<PathEdge>& in) {
+                std::lock_guard<std::mutex> lock(mtx_);
+                auto it = entries_.find(ea);
+                if (it != entries_.end() && it->second.generation == gen && !it->second.in_edges.empty()) {
+                    in = it->second.in_edges;
+                    return true;
+                }
+                return false;
+            }
+
+            void PutIn(ea_t ea, uint64_t gen, std::vector<PathEdge> edges) {
+                std::lock_guard<std::mutex> lock(mtx_);
+                auto& e = entries_[ea];
+                e.generation = gen;
+                e.in_edges = std::move(edges);
+            }
+
+            void Clear() {
+                std::lock_guard<std::mutex> lock(mtx_);
+                entries_.clear();
+            }
+
+        private:
+            std::mutex mtx_;
+            std::unordered_map<ea_t, CacheEntry> entries_;
+        };
+
+        struct EdgeCacheAutoReg {
+            EdgeCacheAutoReg() {
+                cache::CacheManager::Instance().RegisterAnalysisInvalidator([]() {
+                    FunctionEdgeCache::Instance().Clear();
+                });
+                cache::CacheManager::Instance().RegisterByteInvalidator([]() {
+                    FunctionEdgeCache::Instance().Clear();
+                });
+            }
+        } s_edge_cache_auto_reg;
         std::string CleanDisasmLine(ea_t ea) {
             qstring buf;
             generate_disasm_line(&buf, ea, GENDSM_REMOVE_TAGS);
@@ -1741,54 +1826,32 @@ namespace tools::analysis {
         size_t max_vtable_methods = static_cast<size_t>(tools::utils::GetIntArg(args, "max_vtable_methods", 64));
         if (max_vtable_methods == 0 || max_vtable_methods > 256) max_vtable_methods = 64;
 
-        struct PathEdge {
-            ea_t caller_start_ea = BADADDR;
-            ea_t call_site_ea = BADADDR;
-            ea_t callee_start_ea = BADADDR;
-            bool is_thunk = false;
-            bool is_tail_call = false;
-            bool is_indirect = false;
-            std::string edge_type = "call"; // "call", "tail_call", "vtable", "callback", "indirect_ptr", "indirect_vcall"
-            ea_t vtable_ea = BADADDR;
-            std::string vtable_name;
-            std::string caller_name;
-            std::string caller_demangled;
-            std::string callee_name;
-            std::string callee_demangled;
-            std::string disasm;
-        };
-
         ea_t start_func_ea = BADADDR;
         ea_t target_func_ea = BADADDR;
         std::string start_func_name;
         std::string target_func_name;
         std::vector<std::vector<PathEdge>> all_found_paths;
-        std::set<std::pair<ea_t, ea_t>> banned_edges;
+        std::set<std::tuple<ea_t, ea_t, ea_t>> banned_edges; // (caller, callee, call_site)
+
+        bool valid_start = false;
+        bool valid_target = false;
 
         sync::SyncRead([&]() {
             func_t* f_from = get_func(from_ea);
             if (!f_from && is_code(get_flags(from_ea))) {
-                add_func(from_ea);
-                f_from = get_func(from_ea);
+                f_from = get_func(get_item_head(from_ea));
             }
-            if (f_from) {
-                start_func_ea = f_from->start_ea;
-            } else {
-                start_func_ea = from_ea;
-            }
+            start_func_ea = f_from ? f_from->start_ea : from_ea;
 
             func_t* f_to = get_func(to_ea);
             if (!f_to && is_code(get_flags(to_ea))) {
-                add_func(to_ea);
-                f_to = get_func(to_ea);
+                f_to = get_func(get_item_head(to_ea));
             }
-            if (f_to) {
-                target_func_ea = f_to->start_ea;
-            } else {
-                target_func_ea = to_ea;
-            }
+            target_func_ea = f_to ? f_to->start_ea : to_ea;
 
-            if (!is_mapped(start_func_ea) || !is_mapped(target_func_ea)) return;
+            valid_start = (start_func_ea != BADADDR && is_mapped(start_func_ea));
+            valid_target = (target_func_ea != BADADDR && is_mapped(target_func_ea));
+            if (!valid_start || !valid_target) return;
 
             start_func_name = GetSymbolName(start_func_ea);
             target_func_name = GetSymbolName(target_func_ea);
@@ -1799,6 +1862,12 @@ namespace tools::analysis {
             }
 
             auto get_out_edges = [&](ea_t caller_ea) -> std::vector<PathEdge> {
+                uint64_t cur_gen = cache::CurrentGeneration();
+                std::vector<PathEdge> cached;
+                if (FunctionEdgeCache::Instance().GetOut(caller_ea, cur_gen, cached)) {
+                    return cached;
+                }
+
                 std::vector<PathEdge> edges;
                 func_t* fn = get_func(caller_ea);
                 if (!fn) return edges;
@@ -1875,9 +1944,13 @@ namespace tools::analysis {
                                             e.callee_start_ea = m_fn->start_ea;
                                             e.is_thunk = (m_fn->flags & FUNC_THUNK) != 0;
                                             e.is_indirect = true;
-                                            e.edge_type = (found_in_tbl > 1 || mi > 0) ? "vtable" : "indirect_ptr";
+                                            std::string vtbl_sym = GetSymbolName(ref_ea);
+                                            bool is_verified_vftable = (vtbl_sym.find("vftable") != std::string::npos ||
+                                                                        vtbl_sym.find("vtable") != std::string::npos ||
+                                                                        vtbl_sym.rfind("??_7", 0) == 0);
+                                            e.edge_type = (found_in_tbl > 1 || mi > 0) ? (is_verified_vftable ? "vtable_verified" : "vtable_heuristic") : "indirect_ptr";
                                             e.vtable_ea = ref_ea;
-                                            e.vtable_name = GetSymbolName(ref_ea);
+                                            e.vtable_name = vtbl_sym;
                                             add_edge(std::move(e));
                                         }
                                     }
@@ -1945,10 +2018,17 @@ namespace tools::analysis {
                 for (auto& pair : unique_edges) {
                     edges.push_back(std::move(pair.second));
                 }
+                FunctionEdgeCache::Instance().PutOut(caller_ea, cur_gen, edges);
                 return edges;
             };
 
             auto get_in_edges = [&](ea_t target_ea) -> std::vector<PathEdge> {
+                uint64_t cur_gen = cache::CurrentGeneration();
+                std::vector<PathEdge> cached;
+                if (FunctionEdgeCache::Instance().GetIn(target_ea, cur_gen, cached)) {
+                    return cached;
+                }
+
                 std::vector<PathEdge> edges;
                 if (target_ea == BADADDR) return edges;
 
@@ -2021,9 +2101,13 @@ namespace tools::analysis {
                                         e.call_site_ea = xb_tbl.from;
                                         e.callee_start_ea = target_ea;
                                         e.is_indirect = true;
-                                        e.edge_type = "vtable";
+                                        std::string vtbl_sym = GetSymbolName(curr);
+                                        bool is_verified_vftable = (vtbl_sym.find("vftable") != std::string::npos ||
+                                                                    vtbl_sym.find("vtable") != std::string::npos ||
+                                                                    vtbl_sym.rfind("??_7", 0) == 0);
+                                        e.edge_type = is_verified_vftable ? "vtable_verified" : "vtable_heuristic";
                                         e.vtable_ea = curr;
-                                        e.vtable_name = GetSymbolName(curr);
+                                        e.vtable_name = vtbl_sym;
                                         add_edge(std::move(e));
                                     }
                                 }
@@ -2044,6 +2128,7 @@ namespace tools::analysis {
                 for (auto& pair : unique_edges) {
                     edges.push_back(std::move(pair.second));
                 }
+                FunctionEdgeCache::Instance().PutIn(target_ea, cur_gen, edges);
                 return edges;
             };
 
@@ -2074,7 +2159,7 @@ namespace tools::analysis {
 
                         auto edges = get_out_edges(cur_ea);
                         for (const auto& e : edges) {
-                            if (banned_edges.count({e.caller_start_ea, e.callee_start_ea})) continue;
+                            if (banned_edges.count({e.caller_start_ea, e.callee_start_ea, e.call_site_ea})) continue;
 
                             if (parent_bwd.count(e.callee_start_ea) || e.callee_start_ea == target_func_ea) {
                                 parent_fwd[e.callee_start_ea] = e;
@@ -2097,7 +2182,7 @@ namespace tools::analysis {
 
                         auto edges = get_in_edges(cur_ea);
                         for (const auto& e : edges) {
-                            if (banned_edges.count({e.caller_start_ea, e.callee_start_ea})) continue;
+                            if (banned_edges.count({e.caller_start_ea, e.callee_start_ea, e.call_site_ea})) continue;
 
                             if (parent_fwd.count(e.caller_start_ea) || e.caller_start_ea == start_func_ea) {
                                 parent_bwd[e.caller_start_ea] = e;
@@ -2152,12 +2237,12 @@ namespace tools::analysis {
 
                 if (!full_path.empty()) {
                     size_t mid_idx = full_path.size() / 2;
-                    banned_edges.insert({full_path[mid_idx].caller_start_ea, full_path[mid_idx].callee_start_ea});
+                    banned_edges.insert({full_path[mid_idx].caller_start_ea, full_path[mid_idx].callee_start_ea, full_path[mid_idx].call_site_ea});
                 }
             }
         });
 
-        if (start_func_ea == BADADDR || target_func_ea == BADADDR || !is_mapped(start_func_ea) || !is_mapped(target_func_ea)) {
+        if (!valid_start || !valid_target || start_func_ea == BADADDR || target_func_ea == BADADDR) {
             return tools::utils::MakeToolErrorJson(id, "Could not locate valid symbols or code for given addresses", "function_not_found");
         }
 

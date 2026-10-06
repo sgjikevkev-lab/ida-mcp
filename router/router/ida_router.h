@@ -14,7 +14,7 @@ namespace router {
         IdaRouter() = default;
         ~IdaRouter();
 
-        void RefreshInstances();
+        void RefreshInstances(bool force = false);
         void ProcessMessage(const std::string& raw_message);
         void Run();
 
@@ -44,6 +44,7 @@ namespace router {
         std::string active_tool_;
         std::string active_tool_args_;
         std::chrono::steady_clock::time_point active_tool_start_;
+        std::chrono::steady_clock::time_point last_discovery_time_{};
         std::thread worker_thread_;
     };
 }
