@@ -5,6 +5,10 @@
 #include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <random>
+#include "shared/json_parse.h"
+#include "shared/argument_validation.h"
+#include "shared/runtime_limits.h"
 
 namespace router {
     void IdaRouter::RefreshInstances(bool force) {
@@ -24,9 +28,10 @@ namespace router {
 
         if (!cur.empty() && instances_.find(cur) != instances_.end()) {
             active_file_ = cur;
-        } else if (!instances_.empty()) {
+        } else if (cur.empty() && !selection_required_ && instances_.size() == 1) {
             active_file_ = instances_.begin()->first;
         } else {
+            if (!cur.empty()) selection_required_ = true;
             active_file_.clear();
             active_client_.Disconnect();
         }
@@ -69,6 +74,8 @@ namespace router {
 
     void IdaRouter::HandleInitialize(const mcp::json& req, const mcp::json& id) {
         std::string proto = req.value("params", mcp::json::object()).value("protocolVersion", mcp::constants::DEFAULT_PROTOCOL_VERSION);
+        if (proto != "2024-11-05" && proto != "2025-03-26" && proto != "2025-06-18")
+            proto = mcp::constants::DEFAULT_PROTOCOL_VERSION;
         mcp::json resp = mcp::MakeSuccessResponse(id, {
             {"protocolVersion", proto},
             {"serverInfo", {
@@ -83,54 +90,14 @@ namespace router {
     }
 
     IdaRouter::~IdaRouter() {
+        active_client_.Cancel();
+        if (worker_thread_.joinable()) worker_thread_.join();
         active_client_.Disconnect();
-        if (worker_thread_.joinable()) {
-            worker_thread_.join();
-        }
     }
 
     void IdaRouter::HandleToolsList(const mcp::json& req, const mcp::json& id) {
         mcp::json all_tools = GetCustomTools();
-
-        // If an instance is active and not currently busy, try querying tools directly from plugin
-        bool queried_from_instance = false;
-        bool busy_now = false;
-        {
-            std::lock_guard<std::mutex> lock(status_mtx_);
-            busy_now = is_busy_;
-        }
-
-        if (!busy_now && (active_file_.empty() || instances_.find(active_file_) == instances_.end())) {
-            RefreshInstances();
-        }
-
-        if (!busy_now && !active_file_.empty() && instances_.find(active_file_) != instances_.end()) {
-            const auto& inst = instances_[active_file_];
-            if (active_client_.Connect(inst.pipe_name, 2000)) {
-                std::string resp;
-                if (active_client_.Transact(req.dump(), resp, 5000)) {
-                    try {
-                        mcp::json parsed = mcp::json::parse(resp);
-                        if (parsed.contains("result") && parsed["result"].contains("tools") && parsed["result"]["tools"].is_array()) {
-                            for (const auto& t : parsed["result"]["tools"]) {
-                                all_tools.push_back(t);
-                            }
-                            queried_from_instance = true;
-                        }
-                    } catch (...) {
-                    }
-                }
-            }
-        }
-
-        // Fallback to default schema if not queried from instance
-        if (!queried_from_instance) {
-            const auto& default_tools = mcp::GetDefaultIdaToolsSchema();
-            for (const auto& t : default_tools) {
-                all_tools.push_back(t);
-            }
-        }
-
+        for (const auto& tool : mcp::GetDefaultIdaToolsSchema()) all_tools.push_back(tool);
         mcp::StdioTransport::Send(mcp::MakeSuccessResponse(id, {{"tools", all_tools}}));
     }
 
@@ -206,43 +173,25 @@ namespace router {
 
         RefreshInstances(true);
 
-        // Smart matching:
-        // 1. Exact key match
         std::string matched_key;
-        if (instances_.find(target) != instances_.end()) {
-            matched_key = target;
-        } else {
-            // 2. Case-insensitive key match
-            for (const auto& kv : instances_) {
-                if (_stricmp(kv.first.c_str(), target.c_str()) == 0) {
-                    matched_key = kv.first;
-                    break;
-                }
-            }
-            // 3. Match stem without extension (e.g. "server" -> "server.dll")
-            if (matched_key.empty()) {
-                for (const auto& kv : instances_) {
-                    auto dot = kv.first.rfind('.');
-                    std::string stem = (dot != std::string::npos) ? kv.first.substr(0, dot) : kv.first;
-                    if (_stricmp(stem.c_str(), target.c_str()) == 0) {
-                        matched_key = kv.first;
-                        break;
-                    }
-                }
-            }
-            // 4. Match by IDB filename
-            if (matched_key.empty()) {
-                for (const auto& kv : instances_) {
-                    if (!kv.second.idb_path.empty()) {
-                        std::string idb_file = std::filesystem::path(kv.second.idb_path).filename().string();
-                        if (_stricmp(idb_file.c_str(), target.c_str()) == 0) {
-                            matched_key = kv.first;
-                            break;
-                        }
-                    }
-                }
+        std::vector<std::string> matches;
+        if (instances_.contains(target)) matches.push_back(target);
+        else {
+            for (const auto& [key, instance] : instances_)
+                if (_stricmp(key.c_str(), target.c_str()) == 0) matches.push_back(key);
+            if (matches.empty()) for (const auto& [key, instance] : instances_) {
+                const auto stem = std::filesystem::path(key).stem().string();
+                const auto idb = std::filesystem::path(instance.idb_path).filename().string();
+                if (_stricmp(stem.c_str(), target.c_str()) == 0 || _stricmp(idb.c_str(), target.c_str()) == 0)
+                    matches.push_back(key);
             }
         }
+        if (matches.size() > 1) {
+            mcp::StdioTransport::Send(mcp::MakeSuccessResponse(id, mcp::MakeToolCallResult(
+                mcp::json({{"error_code", "ambiguous_file"}, {"matches", matches}}).dump(), true)));
+            return;
+        }
+        if (!matches.empty()) matched_key = matches.front();
 
         auto t1 = std::chrono::steady_clock::now();
         double elapsed_sec = std::round(std::chrono::duration<double>(t1 - t0).count() * 1000.0) / 1000.0;
@@ -250,8 +199,13 @@ namespace router {
         if (!matched_key.empty()) {
             if (active_file_ != matched_key || !active_client_.IsConnected()) {
                 active_client_.Disconnect();
+                if (!active_client_.Connect(instances_[matched_key].pipe_name, 3000)) {
+                    mcp::StdioTransport::Send(mcp::MakeSuccessResponse(id, mcp::MakeToolCallResult(
+                        mcp::json({{"error_code", "connection_failed"}, {"message", "Cannot connect to selected IDA database"}}).dump(), true)));
+                    return;
+                }
                 active_file_ = matched_key;
-                active_client_.Connect(instances_[matched_key].pipe_name, 3000);
+                selection_required_ = false;
             }
 
             mcp::ordered_json res = {
@@ -285,10 +239,6 @@ namespace router {
         std::string previous_active = active_file_;
 
         if (active_file_.empty() || instances_.find(active_file_) == instances_.end()) {
-            RefreshInstances();
-        }
-
-        if (active_file_.empty() || instances_.find(active_file_) == instances_.end()) {
             mcp::json files_arr = mcp::json::array();
             for (const auto& kv : instances_) {
                 files_arr.push_back(kv.first);
@@ -317,7 +267,6 @@ namespace router {
         // Guard against dead IDA process: if process died, disconnect immediately to release pipe
         if (!ida::InstanceDiscovery::IsPidAlive(inst.pid)) {
             active_client_.Disconnect();
-            RefreshInstances();
             mcp::json files_arr = mcp::json::array();
             for (const auto& kv : instances_) {
                 files_arr.push_back(kv.first);
@@ -339,8 +288,7 @@ namespace router {
         // Connect persistent pipe if not already connected
         if (!active_client_.IsConnected()) {
             if (!active_client_.Connect(inst.pipe_name, 3000)) {
-                RefreshInstances();
-                mcp::json err_res = {
+                    mcp::json err_res = {
                     {"status", "error"},
                     {"error_code", "connection_failed"},
                     {"file", active_file_},
@@ -355,13 +303,14 @@ namespace router {
         }
 
         std::string pipe_resp;
-        const std::string& payload_to_send = raw_tool_call.empty() ? req.dump() : raw_tool_call;
+        mcp::json forwarded = req;
+        { std::lock_guard<std::mutex> lock(status_mtx_); forwarded["_cancel_token"] = active_cancel_token_; }
+        const std::string payload_to_send = forwarded.dump();
 
-        // Perform persistent transaction (8-minute timeout)
-        if (!active_client_.Transact(payload_to_send, pipe_resp, 480000)) {
-            // Disconnect and refresh
+        // Perform persistent transaction (30-minute limit)
+        if (!active_client_.Transact(payload_to_send, pipe_resp, mcp::limits::operation_ms)) {
+            const DWORD transport_error = active_client_.LastError();
             active_client_.Disconnect();
-            RefreshInstances();
 
             mcp::json files_arr = mcp::json::array();
             for (const auto& kv : instances_) {
@@ -370,9 +319,8 @@ namespace router {
 
             mcp::json err_res = {
                 {"status", "error"},
-                {"error_code", "instance_offline_or_crashed"},
-                {"file", active_file_},
-                {"message", "IDA Pro instance disconnected, crashed or exceeded 8-minute timeout"},
+                {"error_code", transport_error == ERROR_TIMEOUT ? "execution_timeout" : "connection_lost"},
+                {"message", transport_error == ERROR_TIMEOUT ? "30-minute limit exceeded; cancellation requested on disconnect. Check get_status before retrying." : "IDA connection lost; execution outcome is unknown. Do not blindly retry mutations."},
                 {"available_files", files_arr}
             };
 
@@ -386,58 +334,44 @@ namespace router {
         // Forward response directly
         try {
             mcp::json parsed = mcp::json::parse(pipe_resp);
-            parsed["id"] = id;
+            if (!parsed.is_object() || parsed.value("jsonrpc", mcp::json(nullptr)) != "2.0" ||
+                parsed.value("id", mcp::json(nullptr)) != id || (!parsed.contains("result") && !parsed.contains("error")))
+                throw std::runtime_error("Mismatched backend response");
             mcp::StdioTransport::Send(parsed);
         } catch (...) {
             mcp::StdioTransport::Send(mcp::MakeSuccessResponse(
                 id,
-                mcp::MakeToolCallResult(pipe_resp)
+                mcp::MakeToolCallResult(mcp::json({{"error_code", "invalid_backend_response"},
+                    {"message", "Invalid or mismatched response from IDA; execution outcome is unknown"}}).dump(), true)
             ));
         }
     }
 
     void IdaRouter::HandleGetStatus(const mcp::json& id) {
-        auto t0 = std::chrono::steady_clock::now();
-        std::lock_guard<std::mutex> lock(status_mtx_);
-        mcp::ordered_json res;
-        res["status"] = "success";
-        res["busy"] = is_busy_;
-
-        if (is_busy_) {
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - active_tool_start_).count();
-            double elapsed_sec = std::round(elapsed_ms / 10.0) / 100.0;
-            res["active_file"] = active_file_.empty() ? nullptr : mcp::json(active_file_);
-            res["message"] = "executing " + active_tool_;
-            res["elapsed_sec"] = elapsed_sec;
-        } else {
-            if (active_file_.empty() || instances_.find(active_file_) == instances_.end()) {
-                RefreshInstances();
+        mcp::json result;
+        {
+            std::lock_guard<std::mutex> lock(status_mtx_);
+            result = {{"busy", is_busy_}, {"active_file", active_file_.empty() ? mcp::json(nullptr) : mcp::json(active_file_)}};
+            if (is_busy_) {
+                result["tool"] = active_tool_;
+                result["elapsed_seconds"] = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - active_tool_start_).count();
             }
-            if (!active_file_.empty() && instances_.find(active_file_) != instances_.end()) {
-                const auto& inst = instances_[active_file_];
-                if (ida::InstanceDiscovery::IsPidAlive(inst.pid)) {
-                    res["active_file"] = active_file_;
-                    res["message"] = "idle";
-                } else {
-                    active_client_.Disconnect();
-                    RefreshInstances();
-                    res["active_file"] = active_file_.empty() ? nullptr : mcp::json(active_file_);
-                    res["message"] = active_file_.empty() ? "idle (no active IDA instance)" : "idle";
-                }
-            } else {
-                res["active_file"] = nullptr;
-                res["message"] = "idle (no active IDA instance, use get_available_files / switch_file)";
-            }
-            auto t1 = std::chrono::steady_clock::now();
-            double elapsed_sec = std::round(std::chrono::duration<double>(t1 - t0).count() * 1000.0) / 1000.0;
-            res["elapsed_sec"] = elapsed_sec;
         }
-
-        mcp::StdioTransport::Send(mcp::MakeSuccessResponse(
-            id,
-            mcp::MakeToolCallResult(res.dump(2))
-        ));
+        if (!result["busy"].get<bool>() && !active_file_.empty() && instances_.contains(active_file_)) {
+            std::string response;
+            const mcp::json request = {{"jsonrpc", "2.0"}, {"id", id}, {"method", "tools/call"},
+                                      {"params", {{"name", "get_status"}, {"arguments", mcp::json::object()}}}};
+            if (ipc::PipeClient::CallOnce(instances_.at(active_file_).pipe_name, request.dump(), response, 500)) {
+                auto parsed = mcp::json::parse(response, nullptr, false);
+                if (!parsed.is_discarded() && parsed.is_object() && parsed.contains("result")) {
+                    parsed["id"] = id;
+                    mcp::StdioTransport::Send(parsed);
+                    return;
+                }
+            } else result["reachable"] = false;
+        }
+        mcp::StdioTransport::Send(mcp::MakeSuccessResponse(id, mcp::MakeToolCallResult(result.dump())));
     }
 
     void IdaRouter::DispatchToolCallAsync(
@@ -447,6 +381,12 @@ namespace router {
         const std::string& name,
         const mcp::json& args
     ) {
+        bool busy_snapshot;
+        { std::lock_guard<std::mutex> lock(status_mtx_); busy_snapshot = is_busy_; }
+        if (!busy_snapshot) {
+            if (worker_thread_.joinable()) worker_thread_.join();
+            RefreshInstances();
+        }
         {
             std::lock_guard<std::mutex> lock(status_mtx_);
             if (is_busy_) {
@@ -471,12 +411,11 @@ namespace router {
                 return;
             }
 
-            if (worker_thread_.joinable()) {
-                worker_thread_.join();
-            }
-
             is_busy_ = true;
             active_tool_ = name;
+            active_request_id_ = id;
+            std::random_device entropy;
+            active_cancel_token_ = std::to_string(entropy()) + "-" + std::to_string(entropy()) + "-" + std::to_string(entropy());
             active_tool_args_ = (args.is_null() || args.empty()) ? "" : args.dump();
             if (active_tool_args_.size() > 200) {
                 active_tool_args_ = active_tool_args_.substr(0, 197) + "...";
@@ -523,6 +462,25 @@ namespace router {
         std::string name = params.value("name", "");
         mcp::json args = params.value("arguments", mcp::json::object());
 
+        auto schemas = GetCustomTools();
+        for (const auto& tool : mcp::GetDefaultIdaToolsSchema()) schemas.push_back(tool);
+        bool found = false;
+        for (const auto& tool : schemas) {
+            if (tool["name"] != name) continue;
+            found = true;
+            auto error = mcp::ValidateArguments(tool["inputSchema"], args);
+            if (!error.empty()) {
+                mcp::StdioTransport::Send(mcp::MakeSuccessResponse(id,
+                    mcp::MakeToolCallResult(mcp::json({{"error_code", "invalid_params"}, {"message", error}}).dump(), true)));
+                return;
+            }
+            break;
+        }
+        if (!found) {
+            mcp::StdioTransport::Send(mcp::MakeSuccessResponse(id,
+                mcp::MakeToolCallResult(mcp::json({{"error_code", "tool_not_found"}, {"message", name}}).dump(), true)));
+            return;
+        }
         if (name == "get_status") {
             HandleGetStatus(id);
         } else if (name == "get_available_files") {
@@ -539,11 +497,33 @@ namespace router {
 
         mcp::json id = nullptr;
         try {
-            mcp::json req = mcp::json::parse(raw_message);
+            mcp::json req = mcp::ParseBoundedJson(raw_message);
+            if (!req.is_object() || req.value("jsonrpc", mcp::json(nullptr)) != "2.0" ||
+                !req.contains("method") || !req["method"].is_string()) {
+                mcp::StdioTransport::Send(mcp::MakeErrorResponse(nullptr, -32600, "Invalid JSON-RPC request"));
+                return;
+            }
             if (req.contains("id")) {
                 id = req["id"];
             }
             std::string method = req.value("method", "");
+            if (method == "notifications/cancelled") {
+                const auto params = req.value("params", mcp::json::object());
+                if (!params.is_object()) return;
+                mcp::json cancellation;
+                std::wstring pipe;
+                {
+                    std::lock_guard<std::mutex> lock(status_mtx_);
+                    if (!is_busy_ || params.value("requestId", mcp::json(nullptr)) != active_request_id_ ||
+                        !instances_.contains(active_file_)) return;
+                    pipe = instances_.at(active_file_).pipe_name;
+                    cancellation = {{"jsonrpc", "2.0"}, {"method", "ida/cancel"},
+                        {"params", {{"requestId", active_request_id_}, {"token", active_cancel_token_}}}};
+                }
+                ipc::PipeClient::NotifyOnce(pipe, cancellation.dump());
+                return;
+            }
+            if (!req.contains("id") && method != "notifications/initialized") return;
 
             if (method == "initialize") {
                 HandleInitialize(req, id);
@@ -569,7 +549,6 @@ namespace router {
     }
 
     void IdaRouter::Run() {
-        RefreshInstances();
         mcp::StdioTransport::RunLoop([this](const std::string& line) {
             ProcessMessage(line);
         });

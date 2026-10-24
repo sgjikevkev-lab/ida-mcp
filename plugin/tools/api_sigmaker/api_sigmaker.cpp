@@ -63,6 +63,7 @@ namespace tools::sigmaker {
                 bytes.reserve(bytes.size() + count);
                 mask.reserve(mask.size() + count);
                 for (size_t i = 0; i < count; ++i) {
+                    sync::Checkpoint();
                     bool is_wildcard = GET_BIT(wildcard_bits, i);
                     uint8_t b = get_byte(addr + i);
                     add_byte(b, is_wildcard);
@@ -73,6 +74,7 @@ namespace tools::sigmaker {
                 bytes.reserve(bytes.size() + count);
                 mask.reserve(mask.size() + count);
                 for (size_t i = 0; i < count; ++i) {
+                    sync::Checkpoint();
                     bool is_wildcard = GET_BIT(wildcard_bits, i);
                     add_byte(raw_bytes ? raw_bytes[i] : 0, is_wildcard);
                 }
@@ -80,11 +82,13 @@ namespace tools::sigmaker {
 
             void trim() {
                 while (!mask.empty() && mask.back() == 0x00) {
+                    sync::Checkpoint();
                     bytes.pop_back();
                     mask.pop_back();
                 }
                 last_fixed = 0;
                 for (size_t i = mask.size(); i > 0; --i) {
+                    sync::Checkpoint();
                     if (mask[i - 1] == 0xFF) {
                         last_fixed = i - 1;
                         break;
@@ -101,6 +105,7 @@ namespace tools::sigmaker {
             result.reserve(pat.size() * 3);
             char buf[8];
             for (size_t i = 0; i < pat.size(); ++i) {
+                sync::Checkpoint();
                 if (pat.mask[i] == 0x00) {
                     result += (doubleQM ? "?? " : "? ");
                 } else {
@@ -117,12 +122,14 @@ namespace tools::sigmaker {
             if (!wildcardBits) return false;
             *wildcardBits = 0;
             for (int i = 0; i < UA_MAXOP; ++i) {
+                sync::Checkpoint();
                 const auto& op = instruction.ops[i];
                 if (op.type == o_void) break;
                 // Only wildcard relocatable addresses / branches / memory operands, NOT immediate constants (o_imm)
                 if (op.type == o_imm) continue;
                 if (op.offb != 0) {
                     for (int b = 0; b < 4; ++b) {
+                        sync::Checkpoint();
                         if (op.offb + b < instruction.size) {
                             *wildcardBits = SET_BIT(*wildcardBits, op.offb + b);
                         }
@@ -183,6 +190,7 @@ namespace tools::sigmaker {
 
         inline const uint8_t* GetSegmentPtr(const std::vector<ScanSegment>& segments, ea_t addr) {
             for (const auto& seg : segments) {
+                sync::Checkpoint();
                 if (addr >= seg.start_ea && addr < seg.end_ea) {
                     size_t off = static_cast<size_t>(addr - seg.start_ea);
                     if (off < seg.size) return seg.data.data() + off;
@@ -214,6 +222,7 @@ namespace tools::sigmaker {
             const uint8_t last_byte = pat.bytes[last_off];
 
             for (const auto& seg : segments) {
+                sync::Checkpoint();
                 if (seg.size < pat_len) continue;
 
                 const uint8_t* const base = seg.data.data();
@@ -221,6 +230,7 @@ namespace tools::sigmaker {
                 const uint8_t* const max_start = base + seg.size - pat_len;
 
                 while (ptr <= max_start) {
+                    sync::Checkpoint();
                     // Vectorized hardware search for the first non-wildcard byte
                     const uint8_t* cand = static_cast<const uint8_t*>(
                         std::memchr(ptr + first_off, first_byte, (max_start - ptr) + 1)
@@ -233,6 +243,7 @@ namespace tools::sigmaker {
                     if (match_start[last_off] == last_byte) {
                         bool match = true;
                         for (size_t i = 0; i < pat_len; ++i) {
+                            sync::Checkpoint();
                             if (pat.mask[i] != 0 && match_start[i] != pat.bytes[i]) {
                                 match = false;
                                 break;
@@ -309,6 +320,7 @@ namespace tools::sigmaker {
             bool tracked_collisions = false;
 
             for (const auto& di : cand.insns) {
+                sync::Checkpoint();
                 if (res.pat.size() >= max_len || res.pat.size() >= prune_len) break;
 
                 size_t prev_size = res.pat.size();
@@ -323,6 +335,7 @@ namespace tools::sigmaker {
                     size_t added_len = res.pat.size() - prev_size;
                     auto it = std::remove_if(active_collisions.begin(), active_collisions.end(), [&](ea_t coll_ea) {
                         for (size_t i = 0; i < added_len; ++i) {
+                            sync::Checkpoint();
                             size_t pat_idx = prev_size + i;
                             if (res.pat.mask[pat_idx] == 0) continue;
                             const uint8_t* b = GetSegmentPtr(segments, coll_ea + pat_idx);
@@ -355,6 +368,7 @@ namespace tools::sigmaker {
                         } else if (sr.count > 1 && sr.matches.size() <= 64) {
                             active_collisions.clear();
                             for (ea_t m : sr.matches) {
+                                sync::Checkpoint();
                                 if (m != cand.cand_ea) active_collisions.push_back(m);
                             }
                             tracked_collisions = true;
@@ -382,14 +396,6 @@ namespace tools::sigmaker {
                 cache::CacheManager::Instance().RegisterByteInvalidator(&InvalidateSegmentCache);
             }
         } s_sigmaker_cache_reg;
-    }
-
-    bool ApiSigmaker::CanHandle(const std::string& name) const {
-        return name == "make_signature";
-    }
-
-    nlohmann::json ApiSigmaker::GetSchema() const {
-        return nlohmann::json::array();
     }
 
     nlohmann::json ApiSigmaker::Dispatch(const nlohmann::json& id, const std::string& name, const nlohmann::json& args) {
@@ -440,6 +446,7 @@ namespace tools::sigmaker {
                 auto segs = std::make_shared<std::vector<ScanSegment>>();
                 segs->reserve(get_segm_qty());
                 for (int i = 0; i < get_segm_qty(); ++i) {
+                    sync::Checkpoint();
                     segment_t* seg = getnseg(i);
                     if (!seg) continue;
                     if (seg->type == SEG_XTRN || seg->type == SEG_NULL || seg->type == SEG_BSS) continue;
@@ -468,6 +475,7 @@ namespace tools::sigmaker {
                 is_range_mode = true;
                 ea_t cur = eaStart;
                 while (cur < eaEnd && range_insns.size() < max_len) {
+                    sync::Checkpoint();
                     insn_t instruction;
                     int len = decode_insn(&instruction, cur);
                     if (len <= 0) {
@@ -497,6 +505,7 @@ namespace tools::sigmaker {
                 ea_t cur = start_addr;
                 size_t acc_len = 0;
                 while (acc_len < max_len) {
+                    sync::Checkpoint();
                     insn_t insn;
                     int len = decode_insn(&insn, cur);
                     if (len <= 0) break;
@@ -515,6 +524,7 @@ namespace tools::sigmaker {
                 insn_t insn;
                 if (decode_insn(&insn, xref_site) > 0) {
                     for (int i = 0; i < UA_MAXOP; ++i) {
+                        sync::Checkpoint();
                         if (insn.ops[i].offb != 0) {
                             return static_cast<int>(base_offset + insn.ops[i].offb);
                         }
@@ -539,11 +549,13 @@ namespace tools::sigmaker {
                 func_item_iterator_t fii;
                 std::vector<ea_t> func_cands;
                 for (bool ok = fii.set(currentFunction, currentFunction->start_ea); ok; ok = fii.next_code()) {
+                    sync::Checkpoint();
                     func_cands.push_back(fii.current());
                     if (func_cands.size() >= candidate_limit) break;
                 }
 
                 for (ea_t cand : func_cands) {
+                    sync::Checkpoint();
                     CandidateMetadata cm;
                     cm.cand_ea = cand;
                     cm.offset = static_cast<int64_t>(cand - currentFunction->start_ea);
@@ -557,6 +569,7 @@ namespace tools::sigmaker {
                 xrefblk_t xb;
                 size_t callers_checked = 0;
                 for (bool ok = xb.first_to(currentFunction->start_ea, XREF_ALL); ok && callers_checked < 16; ok = xb.next_to()) {
+                    sync::Checkpoint();
                     if (!xb.iscode && !is_code(get_flags(xb.from))) continue;
                     callers_checked++;
                     ea_t call_site = xb.from;
@@ -575,6 +588,7 @@ namespace tools::sigmaker {
                     ea_t min_seg = seg ? seg->start_ea : inf_get_min_ea();
                     ea_t walk = call_site;
                     for (int step = 1; step <= 5; ++step) {
+                        sync::Checkpoint();
                         ea_t prev = prev_head(walk, min_seg);
                         if (prev == BADADDR || !is_code(get_flags(prev))) break;
                         if (caller_fn && get_func(prev) != caller_fn) break;
@@ -594,6 +608,7 @@ namespace tools::sigmaker {
                 xrefblk_t xb;
                 size_t xrefs_checked = 0;
                 for (bool ok = xb.first_to(ea, XREF_ALL); ok && xrefs_checked < 32; ok = xb.next_to()) {
+                    sync::Checkpoint();
                     if (!is_code(get_flags(xb.from))) continue;
                     xrefs_checked++;
                     ea_t call_site = xb.from;
@@ -612,6 +627,7 @@ namespace tools::sigmaker {
                     ea_t min_seg = seg ? seg->start_ea : inf_get_min_ea();
                     ea_t walk = call_site;
                     for (int step = 1; step <= 5; ++step) {
+                        sync::Checkpoint();
                         ea_t prev = prev_head(walk, min_seg);
                         if (prev == BADADDR || !is_code(get_flags(prev))) break;
                         if (caller_fn && get_func(prev) != caller_fn) break;
@@ -655,6 +671,7 @@ namespace tools::sigmaker {
         // 1. Explicit range mode
         if (is_range_mode) {
             for (const auto& di : range_insns) {
+                sync::Checkpoint();
                 if (final_pat.size() >= max_len) break;
                 const uint8_t* raw = GetSegmentPtr(segments, di.ea);
                 final_pat.add_raw_bytes(raw, di.len, di.wildcard_bits);
@@ -692,6 +709,7 @@ namespace tools::sigmaker {
             const CandidateMetadata* fallback_cand = nullptr;
 
             for (const auto& cand : candidates) {
+                sync::Checkpoint();
                 GrowResult r = GrowCandSignature(segments, cand, max_len, best_len);
                 if (r.unique && r.length < best_len) {
                     best_len = r.length;
@@ -758,6 +776,7 @@ namespace tools::sigmaker {
             res["matches_count"] = sr.count;
             nlohmann::json matches_arr = nlohmann::json::array();
             for (ea_t m : sr.matches) {
+                sync::Checkpoint();
                 matches_arr.push_back(tools::utils::FormatAddress(m));
             }
             res["matches"] = std::move(matches_arr);

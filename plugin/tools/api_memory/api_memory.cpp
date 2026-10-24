@@ -19,14 +19,6 @@
 #include <name.hpp>
 
 namespace tools::memory {
-    bool ApiMemory::CanHandle(const std::string& name) const {
-        return name == "get_bytes";
-    }
-
-    nlohmann::json ApiMemory::GetSchema() const {
-        return nlohmann::json::array();
-    }
-
     nlohmann::json ApiMemory::Dispatch(const nlohmann::json& id, const std::string& name, const nlohmann::json& args) {
         if (name == "get_bytes") return GetBytes(id, args);
 
@@ -91,22 +83,18 @@ namespace tools::memory {
         }
 
         std::ostringstream ss;
-        std::string ascii_str;
-        ascii_str.reserve(read_bytes);
 
         for (ssize_t i = 0; i < read_bytes; ++i) {
+            sync::Checkpoint();
             if (i > 0) ss << " ";
             ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(buf[i]);
-            uint8_t b = buf[i];
-            ascii_str += (b >= 32 && b <= 126) ? static_cast<char>(b) : '.';
         }
 
         nlohmann::ordered_json res;
         res["status"] = "success";
         res["address"] = tools::utils::FormatAddress(ea);
-        res["size"] = read_bytes;
+        if (read_bytes != size_val) res["size_read"] = read_bytes;
         res["hex"] = ss.str();
-        res["ascii"] = ascii_str;
 
         return tools::utils::MakeToolSuccessJson(id, res);
     }

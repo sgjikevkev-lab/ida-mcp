@@ -99,8 +99,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="!ibs\json.h" />
-    <ClInclude Include="discovery\registration.h" />
+    <ClInclude Include="..\shared\json.h" />
     <ClInclude Include="server\pipe_server.h" />
     <ClInclude Include="server\status_tracker.h" />
     <ClInclude Include="sync\sync.h" />
@@ -123,7 +122,6 @@
     <ClInclude Include="..\shared\ida_tools_schema.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="discovery\registration.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="server\pipe_server.cpp" />
     <ClCompile Include="tools\api_analysis\api_analysis.cpp" />

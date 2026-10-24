@@ -1,3 +1,4 @@
+#include "sync/operation.h"
 #include "api_hexrays.h"
 #include "ctree_serializer.h"
 #include "mba_rules.h"
@@ -17,16 +18,6 @@
 #include <intel.hpp>
 
 namespace tools::hexrays_ast {
-
-    nlohmann::json ApiHexrays::GetSchema() const {
-        return nlohmann::json::array();
-    }
-
-    bool ApiHexrays::CanHandle(const std::string& name) const {
-        return name == "get_ast" ||
-               name == "mba_simplify" ||
-               name == "simplify_predicate";
-    }
 
     nlohmann::json ApiHexrays::Dispatch(const nlohmann::json& id, const std::string& name, const nlohmann::json& args) {
         if (name == "get_ast") return GetAst(id, args);
@@ -126,43 +117,55 @@ namespace tools::hexrays_ast {
                     : ctree_visitor_t(CV_FAST), cf(f), pattern(pat), matches(m), max_matches(max_m), func_ea(fea), func_name(fname) {}
 
                 int idaapi visit_insn(cinsn_t* insn) override {
-                    if (count >= max_matches) return 1;
-                    std::map<std::string, nlohmann::json> bindings;
-                    if (MatchPattern(insn, cf, pattern, bindings)) {
-                        nlohmann::ordered_json match_item = {
-                            {"function", func_name},
-                            {"address", tools::utils::FormatAddress(insn->ea)},
-                            {"op", CTypeToString(insn->op)},
-                            {"expr", CleanItemText(insn, cf)}
-                        };
-                        if (!bindings.empty()) {
-                            match_item["bindings"] = bindings;
-                        }
-                        matches.push_back(std::move(match_item));
-                        count++;
+                    try {
+                        sync::Checkpoint();
                         if (count >= max_matches) return 1;
+                        std::map<std::string, nlohmann::json> bindings;
+                        if (MatchPattern(insn, cf, pattern, bindings)) {
+                            nlohmann::ordered_json match_item = {
+                                {"function", func_name},
+                                {"address", tools::utils::FormatAddress(insn->ea)},
+                                {"op", CTypeToString(insn->op)},
+                                {"expr", CleanItemText(insn, cf)}
+                            };
+                            if (!bindings.empty()) {
+                                match_item["bindings"] = bindings;
+                            }
+                            matches.push_back(std::move(match_item));
+                            count++;
+                            if (count >= max_matches) return 1;
+                        }
+                        return 0;
+                    } catch (...) {
+                        sync::SaveCallbackException();
+                        return 1;
                     }
-                    return 0;
                 }
 
                 int idaapi visit_expr(cexpr_t* expr) override {
-                    if (count >= max_matches) return 1;
-                    std::map<std::string, nlohmann::json> bindings;
-                    if (MatchPattern(expr, cf, pattern, bindings)) {
-                        nlohmann::ordered_json match_item = {
-                            {"function", func_name},
-                            {"address", tools::utils::FormatAddress(expr->ea)},
-                            {"op", CTypeToString(expr->op)},
-                            {"expr", CleanItemText(expr, cf)}
-                        };
-                        if (!bindings.empty()) {
-                            match_item["bindings"] = bindings;
-                        }
-                        matches.push_back(std::move(match_item));
-                        count++;
+                    try {
+                        sync::Checkpoint();
                         if (count >= max_matches) return 1;
+                        std::map<std::string, nlohmann::json> bindings;
+                        if (MatchPattern(expr, cf, pattern, bindings)) {
+                            nlohmann::ordered_json match_item = {
+                                {"function", func_name},
+                                {"address", tools::utils::FormatAddress(expr->ea)},
+                                {"op", CTypeToString(expr->op)},
+                                {"expr", CleanItemText(expr, cf)}
+                            };
+                            if (!bindings.empty()) {
+                                match_item["bindings"] = bindings;
+                            }
+                            matches.push_back(std::move(match_item));
+                            count++;
+                            if (count >= max_matches) return 1;
+                        }
+                        return 0;
+                    } catch (...) {
+                        sync::SaveCallbackException();
+                        return 1;
                     }
-                    return 0;
                 }
             };
 
@@ -182,11 +185,13 @@ namespace tools::hexrays_ast {
                     get_func_name(&fn_name, pfn->start_ea);
                     match_visitor_t visitor(cf, pattern, matches, max_matches, pfn->start_ea, fn_name.c_str());
                     visitor.apply_to(&cf->body, nullptr);
+                    sync::Checkpoint();
                 }
             } else {
                 size_t total_funcs = get_func_qty();
                 size_t scanned = 0;
                 for (size_t i = 0; i < total_funcs && static_cast<int>(scanned) < limit; ++i) {
+                    sync::Checkpoint();
                     func_t* pfn = getn_func(i);
                     if (!pfn) continue;
 
@@ -202,6 +207,7 @@ namespace tools::hexrays_ast {
                     if (cf) {
                         match_visitor_t visitor(cf, pattern, matches, max_matches, pfn->start_ea, fname_str);
                         visitor.apply_to(&cf->body, nullptr);
+                        sync::Checkpoint();
                         if (visitor.count >= max_matches) break;
                     }
                 }
@@ -258,6 +264,7 @@ namespace tools::hexrays_ast {
             if (args.contains("custom_rules") && args["custom_rules"].is_array()) {
                 const auto& cr_arr = args["custom_rules"];
                 for (size_t i = 0; i < cr_arr.size(); ++i) {
+                    sync::Checkpoint();
                     const auto& cr = cr_arr[i];
                     if (!cr.is_object() || !cr.contains("pattern")) continue;
                     std::string rname = cr.value("name", "custom_rule_" + std::to_string(i + 1));
@@ -276,6 +283,7 @@ namespace tools::hexrays_ast {
                 }
             }
             for (const auto& r : GetMbaRules()) {
+                sync::Checkpoint();
                 combined_rules.push_back(r);
             }
 
@@ -289,77 +297,85 @@ namespace tools::hexrays_ast {
                     : ctree_visitor_t(CV_FAST), cf(f), rules(r), matches(m), target_expr_ea(tea) {}
 
                 int idaapi visit_expr(cexpr_t* expr) override {
-                    if (target_expr_ea != BADADDR) {
-                        if (expr->ea != target_expr_ea &&
-                            (expr->ea == BADADDR || get_item_head(expr->ea) != get_item_head(target_expr_ea))) {
-                            return 0;
+                    try {
+                        sync::Checkpoint();
+                        if (target_expr_ea != BADADDR) {
+                            if (expr->ea != target_expr_ea &&
+                                (expr->ea == BADADDR || get_item_head(expr->ea) != get_item_head(target_expr_ea))) {
+                                return 0;
+                            }
                         }
-                    }
 
-                    bool is_candidate = (expr->op == cot_add || expr->op == cot_sub ||
-                                         expr->op == cot_bor || expr->op == cot_xor ||
-                                         expr->op == cot_band || expr->op == cot_bnot ||
-                                         expr->op == cot_shl || expr->op == cot_sshr ||
-                                         expr->op == cot_ushr || expr->op == cot_neg ||
-                                         expr->op == cot_mul);
-                    if (!is_candidate) return 0;
+                        bool is_candidate = (expr->op == cot_add || expr->op == cot_sub ||
+                                             expr->op == cot_bor || expr->op == cot_xor ||
+                                             expr->op == cot_band || expr->op == cot_bnot ||
+                                             expr->op == cot_shl || expr->op == cot_sshr ||
+                                             expr->op == cot_ushr || expr->op == cot_neg ||
+                                             expr->op == cot_mul);
+                        if (!is_candidate) return 0;
 
-                    // Level 1: Static pattern matching
-                    for (const auto& rule : rules) {
-                        std::map<std::string, nlohmann::json> bindings;
-                        if (MatchPattern(expr, cf, rule.pattern, bindings)) {
-                            std::string simplified_text = rule.format_simplified ? rule.format_simplified(bindings) : "";
+                        // Level 1: Static pattern matching
+                        for (const auto& rule : rules) {
+                            sync::Checkpoint();
+                            std::map<std::string, nlohmann::json> bindings;
+                            if (MatchPattern(expr, cf, rule.pattern, bindings)) {
+                                std::string simplified_text = rule.format_simplified ? rule.format_simplified(bindings) : "";
+                                matches.push_back({
+                                    {"address", tools::utils::FormatAddress(expr->ea)},
+                                    {"expression", CleanItemText(expr, cf)},
+                                    {"simplified", simplified_text},
+                                    {"rule", rule.name},
+                                    {"confidence", "rule_verified"},
+                                    {"method", "rule_match"}
+                                });
+                                return 0;
+                            }
+                        }
+
+                        // Level 2: Constant folding
+                        if (expr->x || expr->y) {
+                            auto cf_val = TryConstFold(expr);
+                            if (cf_val) {
+                                std::ostringstream oss;
+                                if (*cf_val == 0) oss << "0";
+                                else oss << "0x" << std::hex << *cf_val;
+                                matches.push_back({
+                                    {"address", tools::utils::FormatAddress(expr->ea)},
+                                    {"expression", CleanItemText(expr, cf)},
+                                    {"simplified", oss.str()},
+                                    {"rule", "Constant Folding"},
+                                    {"confidence", "exact_constant"},
+                                    {"method", "const_fold"}
+                                });
+                                return 0;
+                            }
+                        }
+
+                        // Level 3: Brute-force symbolic verification
+                        auto bf_res = BruteForceSimplify(expr, cf);
+                        if (bf_res) {
                             matches.push_back({
                                 {"address", tools::utils::FormatAddress(expr->ea)},
                                 {"expression", CleanItemText(expr, cf)},
-                                {"simplified", simplified_text},
-                                {"rule", rule.name},
-                                {"confidence", "rule_verified"},
-                                {"method", "rule_match"}
+                                {"simplified", bf_res->simplified},
+                                {"rule", "Algebraic Identity"},
+                                {"confidence", bf_res->confidence},
+                                {"method", "algebraic_eval"}
                             });
                             return 0;
                         }
-                    }
 
-                    // Level 2: Constant folding
-                    if (expr->x || expr->y) {
-                        auto cf_val = TryConstFold(expr);
-                        if (cf_val) {
-                            std::ostringstream oss;
-                            if (*cf_val == 0) oss << "0";
-                            else oss << "0x" << std::hex << *cf_val;
-                            matches.push_back({
-                                {"address", tools::utils::FormatAddress(expr->ea)},
-                                {"expression", CleanItemText(expr, cf)},
-                                {"simplified", oss.str()},
-                                {"rule", "Constant Folding"},
-                                {"confidence", "exact_constant"},
-                                {"method", "const_fold"}
-                            });
-                            return 0;
-                        }
-                    }
-
-                    // Level 3: Brute-force symbolic verification
-                    auto bf_res = BruteForceSimplify(expr, cf);
-                    if (bf_res) {
-                        matches.push_back({
-                            {"address", tools::utils::FormatAddress(expr->ea)},
-                            {"expression", CleanItemText(expr, cf)},
-                            {"simplified", bf_res->simplified},
-                            {"rule", "Algebraic Identity"},
-                            {"confidence", bf_res->confidence},
-                            {"method", "algebraic_eval"}
-                        });
                         return 0;
+                    } catch (...) {
+                        sync::SaveCallbackException();
+                        return 1;
                     }
-
-                    return 0;
                 }
             };
 
             mba_visitor_t visitor(cf, combined_rules, matches, target_expr_ea);
             visitor.apply_to(&cf->body, nullptr);
+            sync::Checkpoint();
         });
 
         if (!error_code.empty()) {
@@ -387,6 +403,7 @@ namespace tools::hexrays_ast {
 
         if (args.contains("predicates") && args["predicates"].is_array()) {
             for (const auto& item : args["predicates"]) {
+                sync::Checkpoint();
                 if (!item.is_object()) continue;
                 ea_t pea = tools::utils::GetAddressArg(item, "predicate_addr");
                 std::string fb = tools::utils::GetStringArg(item, "force_branch");
@@ -452,52 +469,60 @@ namespace tools::hexrays_ast {
                         : ctree_visitor_t(CV_FAST), cf(f), detected(d) {}
 
                     int idaapi visit_insn(cinsn_t* insn) override {
-                        if (insn->op == cit_if && insn->cif) {
-                            cexpr_t* cond = &insn->cif->expr;
-                            std::string cond_text = CleanItemText(cond, cf);
+                        try {
+                            sync::Checkpoint();
+                            if (insn->op == cit_if && insn->cif) {
+                                cexpr_t* cond = &insn->cif->expr;
+                                std::string cond_text = CleanItemText(cond, cf);
 
-                            // 1. Const fold
-                            auto cf_val = TryConstFold(cond);
-                            if (cf_val) {
-                                detected.push_back({
-                                    {"predicate_addr", tools::utils::FormatAddress(insn->ea)},
-                                    {"condition", cond_text},
-                                    {"evaluation", (*cf_val != 0) ? "always_true" : "always_false"},
-                                    {"confidence", "certain"}
-                                });
-                                return 0;
-                            }
-
-                            // 2. Brute force simplify
-                            auto bf_res = BruteForceSimplify(cond, cf);
-                            if (bf_res) {
-                                if (bf_res->simplified == "0") {
+                                // 1. Const fold
+                                auto cf_val = TryConstFold(cond);
+                                if (cf_val) {
                                     detected.push_back({
                                         {"predicate_addr", tools::utils::FormatAddress(insn->ea)},
                                         {"condition", cond_text},
-                                        {"evaluation", "always_false"},
+                                        {"evaluation", (*cf_val != 0) ? "always_true" : "always_false"},
                                         {"confidence", "certain"}
                                     });
-                                } else if (bf_res->simplified == "1" || bf_res->simplified == "~0") {
-                                    detected.push_back({
-                                        {"predicate_addr", tools::utils::FormatAddress(insn->ea)},
-                                        {"condition", cond_text},
-                                        {"evaluation", "always_true"},
-                                        {"confidence", "certain"}
-                                    });
+                                    return 0;
+                                }
+
+                                // 2. Brute force simplify
+                                auto bf_res = BruteForceSimplify(cond, cf);
+                                if (bf_res) {
+                                    if (bf_res->simplified == "0") {
+                                        detected.push_back({
+                                            {"predicate_addr", tools::utils::FormatAddress(insn->ea)},
+                                            {"condition", cond_text},
+                                            {"evaluation", "always_false"},
+                                            {"confidence", "certain"}
+                                        });
+                                    } else if (bf_res->simplified == "1" || bf_res->simplified == "~0") {
+                                        detected.push_back({
+                                            {"predicate_addr", tools::utils::FormatAddress(insn->ea)},
+                                            {"condition", cond_text},
+                                            {"evaluation", "always_true"},
+                                            {"confidence", "certain"}
+                                        });
+                                    }
                                 }
                             }
+                            return 0;
+                        } catch (...) {
+                            sync::SaveCallbackException();
+                            return 1;
                         }
-                        return 0;
                     }
                 };
                 opaque_detector_t detector(cf, detected_opaques);
                 detector.apply_to(&cf->body, nullptr);
+                sync::Checkpoint();
             }
 
             // Auto-populate requests from detected opaques if no manual requests were specified
             if (requests.empty() && auto_detect) {
                 for (const auto& det : detected_opaques) {
+                    sync::Checkpoint();
                     ea_t pea = tools::utils::ParseAddress(det["predicate_addr"].get<std::string>());
                     std::string fb = det["evaluation"].get<std::string>();
                     if (pea != BADADDR && (fb == "always_true" || fb == "always_false")) {
@@ -510,21 +535,29 @@ namespace tools::hexrays_ast {
 
             // Apply modifications
             for (const auto& req : requests) {
+                sync::Checkpoint();
                 struct if_finder_t : public ctree_visitor_t {
                     ea_t target;
                     cinsn_t* found = nullptr;
                     if_finder_t(ea_t t) : ctree_visitor_t(CV_FAST), target(t) {}
                     int idaapi visit_insn(cinsn_t* insn) override {
-                        if (insn->op == cit_if && (insn->ea == target || target == BADADDR)) {
-                            found = insn;
+                        try {
+                            sync::Checkpoint();
+                            if (insn->op == cit_if && (insn->ea == target || target == BADADDR)) {
+                                found = insn;
+                                return 1;
+                            }
+                            return 0;
+                        } catch (...) {
+                            sync::SaveCallbackException();
                             return 1;
                         }
-                        return 0;
                     }
                 };
 
                 if_finder_t finder(req.pred_ea);
                 finder.apply_to(&cf->body, nullptr);
+                sync::Checkpoint();
                 if (!finder.found) continue;
 
                 cinsn_t* if_insn = finder.found;
@@ -556,6 +589,7 @@ namespace tools::hexrays_ast {
                     ea_t jcc_ea = BADADDR;
                     insn_t insn;
                     for (ea_t cur = req.pred_ea; cur <= req.pred_ea + 16 && cur < pfn->end_ea; ) {
+                        sync::Checkpoint();
                         int len = decode_insn(&insn, cur);
                         if (len <= 0) break;
                         if (insn_jcc(insn)) {
@@ -649,6 +683,7 @@ namespace tools::hexrays_ast {
 
             const strvec_t& new_sv = cf->get_pseudocode();
             for (size_t i = 0; i < new_sv.size(); ++i) {
+                sync::Checkpoint();
                 qstring clean;
                 tag_remove(&clean, new_sv[i].line);
                 out_code += clean.c_str();

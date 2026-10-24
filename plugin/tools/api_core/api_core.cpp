@@ -28,16 +28,6 @@
 
 namespace tools::core {
 
-    bool ApiCore::CanHandle(const std::string& name) const {
-        return name == "strings" ||
-               name == "idb_save" ||
-               name == "list_funcs" ||
-               name == "list_globals" ||
-               name == "imports_query" ||
-               name == "get_exports" ||
-               name == "get_segments";
-    }
-
     nlohmann::json ApiCore::Dispatch(const nlohmann::json& id, const std::string& name, const nlohmann::json& args) {
         if (name == "strings") return Strings(id, args);
         if (name == "idb_save") return IdbSave(id, args);
@@ -75,7 +65,7 @@ namespace tools::core {
                     file_name = root_buf;
                 }
             }
-        }, 600000);
+        });
 
         if (!sync_ok || !ok) {
             return tools::utils::MakeToolErrorJson(id, "Failed to save IDB database to disk", "idb_save_failed");
@@ -92,7 +82,7 @@ namespace tools::core {
         if (!file_name.empty()) res["file_name"] = file_name;
         if (db_size > 0) {
             res["size"] = db_size;
-            res["size_formatted"] = tools::utils::FormatSize(db_size);
+
         }
         res["compacted"] = compact;
         res["backup_created"] = backup;
@@ -147,6 +137,7 @@ namespace tools::core {
 
             int fetched = 0;
             for (size_t i = start_idx; i < total && fetched < count; ++i) {
+                sync::Checkpoint();
                 func_t* fn = getn_func(i);
                 if (!fn) continue;
 
@@ -184,10 +175,7 @@ namespace tools::core {
 
                 nlohmann::ordered_json item;
                 item["address"] = tools::utils::FormatAddress(fn->start_ea);
-                item["name"] = fn_name;
-                if (!demangled_str.empty()) {
-                    item["demangled"] = demangled_str;
-                }
+                item["name"] = demangled_str.empty() ? fn_name : demangled_str;
                 item["size"] = sz;
                 if (is_thunk) {
                     item["is_thunk"] = true;
@@ -215,11 +203,11 @@ namespace tools::core {
         nlohmann::ordered_json res;
         res["status"] = "success";
         res["total"] = total;
-        res["returned"] = funcs_arr.size();
+
         res["functions"] = funcs_arr;
 
         if (next_offset != -1) {
-            res["next_offset"] = next_offset;
+
             if (next_cursor_ea != BADADDR) {
                 res["next_cursor"] = tools::utils::FormatAddress(next_cursor_ea);
             }
@@ -256,6 +244,7 @@ namespace tools::core {
                 size_t low = 0;
                 size_t high = total;
                 while (low < high) {
+                    sync::Checkpoint();
                     size_t mid = low + (high - low) / 2;
                     ea_t mid_ea = get_nlist_ea(mid);
                     if (mid_ea < cursor_ea) {
@@ -269,6 +258,7 @@ namespace tools::core {
 
             int fetched = 0;
             for (size_t i = start_idx; i < total && fetched < count; ++i) {
+                sync::Checkpoint();
                 ea_t ea = get_nlist_ea(i);
                 if (ea == BADADDR || get_func(ea) != nullptr) continue;
 
@@ -319,10 +309,7 @@ namespace tools::core {
 
                 nlohmann::ordered_json item;
                 item["address"] = tools::utils::FormatAddress(ea);
-                item["name"] = sym_name;
-                if (!demangled_str.empty()) {
-                    item["demangled"] = demangled_str;
-                }
+                item["name"] = demangled_str.empty() ? sym_name : demangled_str;
 
                 tinfo_t tif;
                 if (get_tinfo(&tif, ea)) {
@@ -356,11 +343,11 @@ namespace tools::core {
         nlohmann::ordered_json res;
         res["status"] = "success";
         res["total"] = total;
-        res["returned"] = globals_arr.size();
+
         res["globals"] = globals_arr;
 
         if (next_offset != -1) {
-            res["next_offset"] = next_offset;
+
             if (next_cursor_ea != BADADDR) {
                 res["next_cursor"] = tools::utils::FormatAddress(next_cursor_ea);
             }
@@ -375,6 +362,7 @@ namespace tools::core {
             sync::SyncRead([&]() {
                 int mod_qty = get_import_module_qty();
                 for (int i = 0; i < mod_qty; ++i) {
+                    sync::Checkpoint();
                     qstring mod_name;
                     get_import_module_name(&mod_name, i);
                     mods_arr.push_back(mod_name.c_str());
@@ -390,7 +378,7 @@ namespace tools::core {
         int offset = static_cast<int>(tools::utils::GetIntArg(args, "offset", 0));
         std::string cursor_str = tools::utils::GetStringArg(args, "cursor");
         if (!cursor_str.empty()) {
-            try { offset = std::stoi(cursor_str); } catch (...) {}
+            try { offset = std::stoi(cursor_str); } catch (const sync::OperationStopped&) { throw; } catch (...) {}
         }
         if (offset < 0) offset = 0;
 
@@ -411,6 +399,7 @@ namespace tools::core {
             size_t match_idx = 0;
 
             for (int i = 0; i < mod_qty; ++i) {
+                sync::Checkpoint();
                 qstring mod_name;
                 get_import_module_name(&mod_name, i);
                 std::string mod_str = mod_name.c_str();
@@ -428,27 +417,34 @@ namespace tools::core {
                 } ctx{mod_str, pat_filter, target_ea, static_cast<size_t>(offset), static_cast<size_t>(count), match_idx, imports_arr};
 
                 enum_import_names(i, [](ea_t ea, const char* name, uval_t ord, void* param) -> int {
-                    auto& c = *static_cast<Ctx*>(param);
+                    try {
+                        sync::Checkpoint();
+                        auto& c = *static_cast<Ctx*>(param);
 
-                    if (c.target_ea != BADADDR && ea != c.target_ea) {
+                        if (c.target_ea != BADADDR && ea != c.target_ea) {
+                            return 1;
+                        }
+
+                        std::string sym = name ? name : ("ord_" + std::to_string(ord));
+                        if (!c.pat.empty() && !tools::utils::PatternMatch(sym, c.pat)) {
+                            return 1;
+                        }
+
+                        if (c.match_idx >= c.offset && c.arr.size() < c.count) {
+                            nlohmann::ordered_json item;
+                            item["module"] = c.mod;
+                            item["name"] = sym;
+                            item["address"] = tools::utils::FormatAddress(ea);
+                            c.arr.push_back(std::move(item));
+                        }
+                        c.match_idx++;
                         return 1;
+                    } catch (...) {
+                        sync::SaveCallbackException();
+                        return 0;
                     }
-
-                    std::string sym = name ? name : ("ord_" + std::to_string(ord));
-                    if (!c.pat.empty() && !tools::utils::PatternMatch(sym, c.pat)) {
-                        return 1;
-                    }
-
-                    if (c.match_idx >= c.offset && c.arr.size() < c.count) {
-                        nlohmann::ordered_json item;
-                        item["module"] = c.mod;
-                        item["name"] = sym;
-                        item["address"] = tools::utils::FormatAddress(ea);
-                        c.arr.push_back(std::move(item));
-                    }
-                    c.match_idx++;
-                    return 1;
                 }, &ctx);
+                sync::Checkpoint();
             }
 
             total_matched = match_idx;
@@ -463,7 +459,7 @@ namespace tools::core {
         res["count"] = imports_arr.size();
         res["imports"] = imports_arr;
         if (next_offset != -1) {
-            res["next_offset"] = next_offset;
+
         }
 
         return tools::utils::MakeToolSuccessJson(id, res);
@@ -490,6 +486,7 @@ namespace tools::core {
             size_t match_idx = 0;
 
             for (size_t i = 0; i < qty; ++i) {
+                sync::Checkpoint();
                 uval_t ord = get_entry_ordinal(i);
                 if (target_ord >= 0 && static_cast<int64_t>(ord) != target_ord) {
                     continue;
@@ -546,7 +543,7 @@ namespace tools::core {
         res["count"] = exports_arr.size();
         res["exports"] = exports_arr;
         if (next_offset != -1) {
-            res["next_offset"] = next_offset;
+
         }
 
         return tools::utils::MakeToolSuccessJson(id, res);
@@ -581,6 +578,7 @@ namespace tools::core {
 
             int qty = get_segm_qty();
             for (int i = 0; i < qty; ++i) {
+                sync::Checkpoint();
                 segment_t* s = getnseg(i);
                 if (!s) continue;
                 qstring name_buf;
@@ -647,6 +645,7 @@ namespace tools::core {
                 size_t low = 0;
                 size_t high = total_strings;
                 while (low < high) {
+                    sync::Checkpoint();
                     size_t mid = low + (high - low) / 2;
                     string_info_t si;
                     if (get_strlist_item(&si, mid) && si.ea < cursor_ea) {
@@ -660,6 +659,7 @@ namespace tools::core {
 
             int fetched = 0;
             for (size_t i = start_idx; i < total_strings && fetched < count; ++i) {
+                sync::Checkpoint();
                 if (i % 1000 == 0) {
                     server::PluginStatusTracker::Instance().UpdateProgress(
                         i, total_strings, "Searching strings..."
@@ -720,7 +720,7 @@ namespace tools::core {
         res["results"] = matches;
 
         if (next_offset != -1) {
-            res["next_offset"] = next_offset;
+
             if (next_cursor_ea != BADADDR) {
                 res["next_cursor"] = tools::utils::FormatAddress(next_cursor_ea);
             }
@@ -828,6 +828,7 @@ namespace tools::core {
             std::string req_type = tools::utils::GetStringArg(args, "type", tools::utils::GetStringArg(args, "encoding", "auto"));
             nlohmann::json strings_arr = nlohmann::json::array();
             for (const auto& a : args["addrs"]) {
+                sync::Checkpoint();
                 ea_t ea = BADADDR;
                 if (a.is_string()) ea = tools::utils::ParseAddress(a.get<std::string>());
                 else if (a.is_number_integer()) ea = static_cast<ea_t>(a.get<uint64_t>());

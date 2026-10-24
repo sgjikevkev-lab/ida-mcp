@@ -53,6 +53,8 @@ public:
         return is_busy_.load(std::memory_order_acquire);
     }
 
+    void Quarantine() { quarantined_.store(true, std::memory_order_release); }
+
     std::string GetCurrentTool() const {
         std::lock_guard<std::mutex> lock(mtx_);
         return current_tool_;
@@ -62,9 +64,9 @@ public:
         std::lock_guard<std::mutex> lock(mtx_);
         bool busy = is_busy_.load(std::memory_order_acquire);
         nlohmann::json res = {
-            {"status", "success"},
             {"busy", busy}
         };
+        if (quarantined_.load(std::memory_order_acquire)) res["quarantined"] = true;
 
         if (busy) {
             auto now = std::chrono::steady_clock::now();
@@ -73,8 +75,7 @@ public:
             if (!args_summary_.empty()) {
                 res["tool_args"] = args_summary_;
             }
-            res["elapsed_ms"] = elapsed_ms;
-            res["elapsed_sec"] = elapsed_ms / 1000.0;
+            res["elapsed_seconds"] = elapsed_ms / 1000;
             if (total_steps_ > 0) {
                 res["progress"] = {
                     {"current", current_step_},
@@ -87,8 +88,6 @@ public:
             } else {
                 res["message"] = "executing " + current_tool_;
             }
-        } else {
-            res["message"] = "idle";
         }
 
         return tools::utils::MakeToolSuccessJson(id, res);
@@ -102,6 +101,7 @@ private:
 
     mutable std::mutex mtx_;
     std::atomic<bool> is_busy_{false};
+    std::atomic<bool> quarantined_{false};
     std::string current_tool_;
     std::string args_summary_;
     std::chrono::steady_clock::time_point start_time_;

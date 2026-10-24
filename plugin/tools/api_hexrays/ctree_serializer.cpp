@@ -1,3 +1,4 @@
+#include "sync/operation.h"
 #include "ctree_serializer.h"
 #include "../utils/utils.h"
 #include <kernwin.hpp>
@@ -211,6 +212,7 @@ namespace tools::hexrays_ast {
         if (!lvars) return lvar_array;
 
         for (size_t i = 0; i < lvars->size(); ++i) {
+            sync::Checkpoint();
             const lvar_t& lv = (*lvars)[i];
             qstring type_str;
             lv.type().print(&type_str);
@@ -230,6 +232,8 @@ namespace tools::hexrays_ast {
     }
 
     nlohmann::json SerializeCItem(const citem_t* item, const cfunc_t* cf, int max_depth, int current_depth) {
+        sync::Checkpoint();
+        sync::RecursionGuard recursion;
         if (!item) return nullptr;
 
         nlohmann::json res = nlohmann::json::object();
@@ -336,6 +340,7 @@ namespace tools::hexrays_ast {
                     if (e->a) {
                         nlohmann::json args_arr = nlohmann::json::array();
                         for (size_t i = 0; i < e->a->size(); ++i) {
+                            sync::Checkpoint();
                             const carg_t& arg = (*e->a)[i];
                             args_arr.push_back(SerializeCItem(&arg, cf, max_depth, current_depth + 1));
                         }
@@ -367,6 +372,7 @@ namespace tools::hexrays_ast {
                     if (insn->cblock) {
                         nlohmann::json body_arr = nlohmann::json::array();
                         for (const auto& child : *insn->cblock) {
+                            sync::Checkpoint();
                             body_arr.push_back(SerializeCItem(&child, cf, max_depth, current_depth + 1));
                         }
                         res["body"] = body_arr;
@@ -429,9 +435,11 @@ namespace tools::hexrays_ast {
                         res["expr"] = SerializeCItem(&insn->cswitch->expr, cf, max_depth, current_depth + 1);
                         nlohmann::json cases_arr = nlohmann::json::array();
                         for (const auto& cs : insn->cswitch->cases) {
+                            sync::Checkpoint();
                             nlohmann::json case_json = nlohmann::json::object();
                             nlohmann::json vals = nlohmann::json::array();
                             for (size_t vi = 0; vi < cs.size(); ++vi) {
+                                sync::Checkpoint();
                                 vals.push_back(cs.value(static_cast<int>(vi)));
                             }
                             case_json["values"] = vals;
@@ -456,6 +464,8 @@ namespace tools::hexrays_ast {
         const nlohmann::json& pattern,
         std::map<std::string, nlohmann::json>& bindings
     ) {
+        sync::Checkpoint();
+        sync::RecursionGuard recursion;
         if (!node) return false;
 
         // String pattern
@@ -638,6 +648,7 @@ namespace tools::hexrays_ast {
                     size_t actual_count = e->a ? e->a->size() : 0;
 
                     for (size_t ai = 0; ai < pat_args.size(); ++ai) {
+                        sync::Checkpoint();
                         if (pat_args[ai].is_string() && pat_args[ai].get<std::string>() == "$_") {
                             // Wildcard at the end of args allows remaining arguments
                             if (ai == pat_args.size() - 1) return true;

@@ -51,11 +51,8 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="!ibs\json.h">
+    <ClInclude Include="..\shared\json.h">
       <Filter>!ibs</Filter>
-    </ClInclude>
-    <ClInclude Include="discovery\registration.h">
-      <Filter>discovery</Filter>
     </ClInclude>
     <ClInclude Include="server\pipe_server.h">
       <Filter>server</Filter>
@@ -116,9 +113,6 @@
     <ClInclude Include="server\status_tracker.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="discovery\registration.cpp">
-      <Filter>discovery</Filter>
-    </ClCompile>
     <ClCompile Include="main.cpp" />
     <ClCompile Include="server\pipe_server.cpp">
       <Filter>server</Filter>

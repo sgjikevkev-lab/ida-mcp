@@ -1,5 +1,8 @@
+#include "sync/operation.h"
 #include <chrono>
-#include <cmath>
+#include "sync/operation.h"
+#include "shared/argument_validation.h"
+#include "shared/json_parse.h"
 
 #pragma warning(push, 0)
 #include "json.h"
@@ -132,45 +135,10 @@ namespace tools {
     }
 
     namespace {
-        void InjectElapsedSec(nlohmann::json& rpc_resp, double elapsed_sec) {
-            try {
-                if (rpc_resp.contains("result") &&
-                    rpc_resp["result"].contains("content") &&
-                    rpc_resp["result"]["content"].is_array() &&
-                    !rpc_resp["result"]["content"].empty() &&
-                    rpc_resp["result"]["content"][0].contains("text") &&
-                    rpc_resp["result"]["content"][0]["text"].is_string()) {
-
-                    std::string& text = rpc_resp["result"]["content"][0]["text"].get_ref<std::string&>();
-                    size_t last_brace = text.rfind('}');
-                    size_t first_brace = text.find('{');
-
-                    // Fast path: direct text injection before final closing brace, zero JSON re-parsing and re-dumping!
-                    if (last_brace != std::string::npos && first_brace != std::string::npos && first_brace < last_brace) {
-                        double rounded = std::round(elapsed_sec * 1000.0) / 1000.0;
-                        char buf[64];
-                        qsnprintf(buf, sizeof(buf), ",\n  \"elapsed_sec\": %.3f\n}", rounded);
-                        text.replace(last_brace, text.size() - last_brace, buf);
-                        return;
-                    }
-
-                    if (first_brace == std::string::npos) return;
-
-                    nlohmann::ordered_json parsed = nlohmann::ordered_json::parse(text.substr(first_brace));
-                    if (parsed.is_object()) {
-                        double rounded = std::round(elapsed_sec * 1000.0) / 1000.0;
-                        parsed["elapsed_sec"] = rounded;
-                        text = parsed.dump(2);
-                    }
-                }
-            } catch (...) {
-            }
-        }
-
         std::string SafeDumpJson(const nlohmann::json& j) {
             try {
-                return j.dump();
-            } catch (const std::exception& e) {
+                return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+            } catch (const sync::OperationStopped&) { throw; } catch (const std::exception& e) {
                 return tools::utils::MakeToolErrorJson(nullptr, std::string("JSON serialization error: ") + e.what(), "serialization_error").dump();
             } catch (...) {
                 return tools::utils::MakeToolErrorJson(nullptr, "JSON serialization error", "serialization_error").dump();
@@ -181,8 +149,8 @@ namespace tools {
     std::string ToolRegistry::HandleRequest(const std::string& raw_body) {
         nlohmann::json req;
         try {
-            req = nlohmann::json::parse(raw_body);
-        } catch (...) {
+            req = mcp::ParseBoundedJson(raw_body);
+        } catch (const sync::OperationStopped&) { throw; } catch (...) {
             return nlohmann::json({
                 {"jsonrpc", "2.0"},
                 {"id", nullptr},
@@ -190,6 +158,10 @@ namespace tools {
             }).dump();
         }
 
+        if (!req.is_object() || req.value("jsonrpc", nlohmann::json(nullptr)) != "2.0" ||
+            !req.contains("method") || !req["method"].is_string())
+            return nlohmann::json({{"jsonrpc", "2.0"}, {"id", nullptr},
+                {"error", {{"code", -32600}, {"message", "Invalid JSON-RPC request"}}}}).dump();
         auto id = req.contains("id") ? req["id"] : nullptr;
         std::string method = req.value("method", "");
 
@@ -201,7 +173,7 @@ namespace tools {
                     {"protocolVersion", "2024-11-05"},
                     {"serverInfo", {
                         {"name", "ida-pro-mcp"},
-                        {"version", "1.2.1"}
+                        {"version", "2.0.0-dev"}
                     }},
                     {"capabilities", {
                         {"tools", nlohmann::json::object()}
@@ -232,24 +204,17 @@ namespace tools {
             nlohmann::json params = req.value("params", nlohmann::json::object());
             std::string name = params.value("name", "");
             nlohmann::json args = params.value("arguments", nlohmann::json::object());
-            auto start_time = std::chrono::steady_clock::now();
             try {
                 nlohmann::json res = DispatchToolCall(id, name, args);
-                auto end_time = std::chrono::steady_clock::now();
-                double elapsed_sec = std::chrono::duration<double>(end_time - start_time).count();
-                InjectElapsedSec(res, elapsed_sec);
+
                 return SafeDumpJson(res);
-            } catch (const std::exception& e) {
-                auto end_time = std::chrono::steady_clock::now();
-                double elapsed_sec = std::chrono::duration<double>(end_time - start_time).count();
+            } catch (const sync::OperationStopped&) { throw; } catch (const std::exception& e) {
                 nlohmann::json err = tools::utils::MakeToolErrorJson(id, std::string("Internal error: ") + e.what(), "internal_error");
-                InjectElapsedSec(err, elapsed_sec);
+
                 return SafeDumpJson(err);
             } catch (...) {
-                auto end_time = std::chrono::steady_clock::now();
-                double elapsed_sec = std::chrono::duration<double>(end_time - start_time).count();
                 nlohmann::json err = tools::utils::MakeToolErrorJson(id, "Unknown internal error", "internal_error");
-                InjectElapsedSec(err, elapsed_sec);
+
                 return SafeDumpJson(err);
             }
         }
@@ -262,6 +227,14 @@ namespace tools {
     }
 
     nlohmann::json ToolRegistry::DispatchToolCall(const nlohmann::json& id, const std::string& name, const nlohmann::json& args) {
+        sync::Checkpoint();
+        for (const auto& tool : GetToolsSchema()) {
+            sync::Checkpoint();
+            if (tool["name"] != name) continue;
+            auto error = mcp::ValidateArguments(tool["inputSchema"], args);
+            if (!error.empty()) return tools::utils::MakeToolErrorJson(id, error, "invalid_params");
+            break;
+        }
         auto it = handlers_.find(name);
         if (it != handlers_.end()) {
             return it->second(id, args);

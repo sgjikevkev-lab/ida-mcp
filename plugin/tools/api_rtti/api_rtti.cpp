@@ -1,3 +1,4 @@
+#include "sync/operation.h"
 #pragma warning(push, 0)
 #include "json.h"
 #pragma warning(pop)
@@ -59,6 +60,7 @@ namespace tools::rtti {
             if (name.empty()) return "AnonymousClass";
             std::string out;
             for (char c : name) {
+                sync::Checkpoint();
                 if (isalnum(static_cast<unsigned char>(c)) || c == '_') {
                     out.push_back(c);
                 } else if (c == ':' || c == '<' || c == '>' || c == ' ' || c == '*' || c == '&' || c == '-' || c == '.') {
@@ -95,7 +97,7 @@ namespace tools::rtti {
                         }
                         return res;
                     }
-                } catch (...) {
+                } catch (const sync::OperationStopped&) { throw; } catch (...) {
                 }
             }
 
@@ -104,12 +106,14 @@ namespace tools::rtti {
                 s = s.substr(4);
             }
             while (!s.empty() && s.back() == '@') {
+                sync::Checkpoint();
                 s.pop_back();
             }
 
             std::vector<std::string> parts;
             size_t start = 0;
             for (size_t i = 0; i <= s.size(); ++i) {
+                sync::Checkpoint();
                 if (i == s.size() || s[i] == '@') {
                     if (i > start) {
                         parts.push_back(s.substr(start, i - start));
@@ -122,6 +126,7 @@ namespace tools::rtti {
                 std::reverse(parts.begin(), parts.end());
                 std::string result;
                 for (size_t i = 0; i < parts.size(); ++i) {
+                    sync::Checkpoint();
                     if (i > 0) result += "::";
                     result += parts[i];
                 }
@@ -136,6 +141,7 @@ namespace tools::rtti {
             if (ea == BADADDR || !is_mapped(ea)) return s;
 
             for (size_t i = 0; i < max_len; ++i) {
+                sync::Checkpoint();
                 ea_t cur = ea + i;
                 if (!is_mapped(cur) || !is_loaded(cur)) break;
                 char c = static_cast<char>(get_byte(cur));
@@ -190,6 +196,7 @@ namespace tools::rtti {
 
                 std::string clean;
                 for (char c : mname) {
+                    sync::Checkpoint();
                     if (isalnum(static_cast<unsigned char>(c)) || c == '_') {
                         clean += c;
                     }
@@ -205,6 +212,7 @@ namespace tools::rtti {
                 if (raw_name == "_purecall" || raw_name == "__cxa_pure_virtual") return "purecall";
                 std::string clean;
                 for (char c : raw_name) {
+                    sync::Checkpoint();
                     if (isalnum(static_cast<unsigned char>(c)) || c == '_') {
                         clean += c;
                     }
@@ -223,6 +231,7 @@ namespace tools::rtti {
             size_t count = 0;
 
             for (size_t i = 0; i < max_methods; ++i) {
+                sync::Checkpoint();
                 ea_t entry_ea = vtable_ea + i * ptr_size;
                 if (!is_mapped(entry_ea) || !is_loaded(entry_ea)) break;
 
@@ -307,6 +316,7 @@ namespace tools::rtti {
 
                     if (is_mapped(bca_ea) && is_loaded(bca_ea)) {
                         for (uint32_t bi = 0; bi < std::min(num_bases, 128u); ++bi) {
+                            sync::Checkpoint();
                             ea_t bcd_ptr = bca_ea + bi * 4;
                             if (!is_mapped(bcd_ptr) || !is_loaded(bcd_ptr)) break;
 
@@ -347,6 +357,7 @@ namespace tools::rtti {
                     std::unordered_set<ea_t> ctor_set;
                     xrefblk_t vtxb;
                     for (bool vok = vtxb.first_to(vtable_ea, XREF_ALL); vok; vok = vtxb.next_to()) {
+                        sync::Checkpoint();
                         if (vtxb.from == BADADDR) continue;
                         func_t* pfn = get_func(vtxb.from);
                         if (pfn && ctor_set.insert(pfn->start_ea).second) {
@@ -356,7 +367,7 @@ namespace tools::rtti {
                 }
 
                 return true;
-            } catch (...) {
+            } catch (const sync::OperationStopped&) { throw; } catch (...) {
                 return false;
             }
         }
@@ -382,6 +393,7 @@ namespace tools::rtti {
                 // Strategy 1: Scan IDA's Name List (instantaneous & accurate for symbols defined/analyzed by IDA)
                 size_t name_count = get_nlist_size();
                 for (size_t i = 0; i < name_count; ++i) {
+                    sync::Checkpoint();
                     const char* sym_name = get_nlist_name(i);
                     if (!sym_name) continue;
 
@@ -406,6 +418,7 @@ namespace tools::rtti {
                             ea_t vt_ea = BADADDR;
                             xrefblk_t cxb;
                             for (bool cok = cxb.first_to(col_ea, XREF_DATA); cok; cok = cxb.next_to()) {
+                                sync::Checkpoint();
                                 ea_t cand = is64 ? (cxb.from + 8) : (cxb.from + 4);
                                 if (is_mapped(cand) && is_loaded(cand)) {
                                     ea_t m0 = is64 ? get_qword(cand) : get_dword(cand);
@@ -429,6 +442,7 @@ namespace tools::rtti {
                 if (classes.size() < 5) {
                     size_t str_qty = get_strlist_qty();
                     for (size_t si_idx = 0; si_idx < str_qty; ++si_idx) {
+                        sync::Checkpoint();
                         string_info_t si;
                         if (!get_strlist_item(&si, si_idx)) continue;
                         if (si.ea == BADADDR || !is_mapped(si.ea)) continue;
@@ -441,12 +455,14 @@ namespace tools::rtti {
                             // Find COL referencing this TD
                             xrefblk_t tdxb;
                             for (bool tok = tdxb.first_to(td_ea, XREF_DATA); tok; tok = tdxb.next_to()) {
+                                sync::Checkpoint();
                                 if (tdxb.from == BADADDR) continue;
                                 ea_t col_cand = tdxb.from - 12;
                                 if (is_mapped(col_cand) && seen_cols.insert(col_cand).second) {
                                     ea_t vt_ea = BADADDR;
                                     xrefblk_t cxb;
                                     for (bool cok = cxb.first_to(col_cand, XREF_DATA); cok; cok = cxb.next_to()) {
+                                        sync::Checkpoint();
                                         ea_t cand = is64 ? (cxb.from + 8) : (cxb.from + 4);
                                         if (is_mapped(cand) && is_loaded(cand)) {
                                             ea_t m0 = is64 ? get_qword(cand) : get_dword(cand);
@@ -496,6 +512,7 @@ namespace tools::rtti {
                     by_col_.clear();
                     by_type_desc_.clear();
                     for (size_t i = 0; i < classes_.size(); ++i) {
+                        sync::Checkpoint();
                         const auto& e = classes_[i];
                         if (!e.clean_name.empty()) {
                             auto it = by_clean_name_.find(e.clean_name);
@@ -534,6 +551,7 @@ namespace tools::rtti {
                     bool is64 = inf_is_64bit();
                     size_t ptr_sz = is64 ? 8 : 4;
                     for (const auto& c : clist) {
+                        sync::Checkpoint();
                         if (c.vtable_ea != BADADDR && query_ea >= c.vtable_ea && query_ea < c.vtable_ea + c.methods_count * ptr_sz) {
                             return &c;
                         }
@@ -542,8 +560,10 @@ namespace tools::rtti {
                     // Check if query_ea is a virtual method function (referenced by data XREF from a vtable slot)
                     xrefblk_t xb;
                     for (bool ok = xb.first_to(query_ea, XREF_DATA); ok; ok = xb.next_to()) {
+                        sync::Checkpoint();
                         if (xb.from == BADADDR) continue;
                         for (const auto& c : clist) {
+                            sync::Checkpoint();
                             if (c.vtable_ea != BADADDR && xb.from >= c.vtable_ea && xb.from < c.vtable_ea + c.methods_count * ptr_sz) {
                                 return &c;
                             }
@@ -552,7 +572,9 @@ namespace tools::rtti {
 
                     // Check if query_ea is a constructor
                     for (const auto& c : clist) {
+                        sync::Checkpoint();
                         for (ea_t ctor_ea : c.constructors) {
+                            sync::Checkpoint();
                             if (ctor_ea == query_ea) return &c;
                         }
                     }
@@ -563,15 +585,18 @@ namespace tools::rtti {
                     auto it_r = by_raw_name_.find(query);
                     if (it_r != by_raw_name_.end()) return &clist[it_r->second];
                     for (const auto& c : clist) {
+                        sync::Checkpoint();
                         if (c.clean_name == query || c.raw_name == query) return &c;
                     }
                     for (const auto& c : clist) {
+                        sync::Checkpoint();
                         if (tools::utils::PatternMatch(c.clean_name, query) ||
                             tools::utils::PatternMatch(c.raw_name, query)) {
                             return &c;
                         }
                     }
                     for (const auto& c : clist) {
+                        sync::Checkpoint();
                         if (c.clean_name.find(query) != std::string::npos ||
                             c.raw_name.find(query) != std::string::npos) {
                             return &c;
@@ -596,15 +621,6 @@ namespace tools::rtti {
     }
 
     ApiRtti::ApiRtti() = default;
-
-    bool ApiRtti::CanHandle(const std::string& name) const {
-        return name == "rtti" ||
-               name == "resolve_vcall";
-    }
-
-    nlohmann::json ApiRtti::GetSchema() const {
-        return nlohmann::json::array();
-    }
 
     nlohmann::json ApiRtti::Dispatch(const nlohmann::json& id, const std::string& name, const nlohmann::json& args) {
         if (name == "rtti") return UnifiedRtti(id, args);
@@ -656,7 +672,7 @@ namespace tools::rtti {
         size_t offset = static_cast<size_t>(tools::utils::GetIntArg(args, "offset", 0));
         std::string cursor_str = tools::utils::GetStringArg(args, "cursor");
         if (!cursor_str.empty()) {
-            try { offset = static_cast<size_t>(std::stoul(cursor_str)); } catch (...) {}
+            try { offset = static_cast<size_t>(std::stoul(cursor_str)); } catch (const sync::OperationStopped&) { throw; } catch (...) {}
         }
         size_t count = static_cast<size_t>(tools::utils::GetIntArg(args, "count", 50));
         if (count <= 0) count = 50;
@@ -670,7 +686,7 @@ namespace tools::rtti {
                     RttiIndex::Instance().Invalidate();
                 }
                 all_classes = CollectRttiClasses();
-            } catch (...) {
+            } catch (const sync::OperationStopped&) { throw; } catch (...) {
             }
         });
 
@@ -678,6 +694,7 @@ namespace tools::rtti {
         filtered.reserve(all_classes.size());
 
         for (const auto& c : all_classes) {
+            sync::Checkpoint();
             if (!pattern.empty()) {
                 if (!tools::utils::PatternMatch(c.clean_name, pattern) &&
                     !tools::utils::PatternMatch(c.raw_name, pattern)) {
@@ -688,6 +705,7 @@ namespace tools::rtti {
             if (!base_class.empty()) {
                 bool base_matched = false;
                 for (const auto& b : c.hierarchy) {
+                    sync::Checkpoint();
                     if (tools::utils::PatternMatch(b, base_class)) {
                         base_matched = true;
                         break;
@@ -733,6 +751,7 @@ namespace tools::rtti {
         size_t end_idx = std::min(offset + count, total_matched);
 
         for (size_t i = offset; i < end_idx; ++i) {
+            sync::Checkpoint();
             const auto* c = filtered[i];
             nlohmann::ordered_json item;
             item["class"] = c->clean_name;
@@ -757,11 +776,11 @@ namespace tools::rtti {
         nlohmann::ordered_json res;
         res["status"] = "success";
         res["total"] = total_matched;
-        res["returned"] = classes_arr.size();
+
         res["offset"] = offset;
         res["classes"] = classes_arr;
         if (next_offset != -1) {
-            res["next_offset"] = next_offset;
+
             res["next_cursor"] = std::to_string(next_offset);
         }
         return tools::utils::MakeToolSuccessJson(id, res);
@@ -774,6 +793,7 @@ namespace tools::rtti {
             size_t ptr_size = is64 ? 8 : 4;
 
             for (size_t i = 0; i < methods_count; ++i) {
+                sync::Checkpoint();
                 ea_t entry_ea = vtable_ea + i * ptr_size;
                 if (!is_mapped(entry_ea) || !is_loaded(entry_ea)) break;
 
@@ -866,6 +886,7 @@ namespace tools::rtti {
 
                     const auto& clist = RttiIndex::Instance().GetClasses();
                     for (const auto& c : clist) {
+                        sync::Checkpoint();
                         if (c.type_desc_ea != BADADDR && c.type_desc_ea == target->type_desc_ea) {
                             all_matching_entries.push_back(c);
                         } else if (!query.empty() && c.clean_name.find(query) != std::string::npos) {
@@ -879,7 +900,7 @@ namespace tools::rtti {
                         return a.offset < b.offset;
                     });
                 }
-            } catch (...) {
+            } catch (const sync::OperationStopped&) { throw; } catch (...) {
             }
         });
 
@@ -910,6 +931,7 @@ namespace tools::rtti {
         if (!target_copy.base_classes.empty()) {
             nlohmann::json base_classes_arr = nlohmann::json::array();
             for (const auto& b : target_copy.base_classes) {
+                sync::Checkpoint();
                 nlohmann::ordered_json b_obj;
                 b_obj["name"] = b.clean_name;
                 b_obj["offset"] = b.offset;
@@ -929,6 +951,7 @@ namespace tools::rtti {
         if (!target_copy.constructors.empty()) {
             nlohmann::json ctors_arr = nlohmann::json::array();
             for (ea_t c_ea : target_copy.constructors) {
+                sync::Checkpoint();
                 nlohmann::ordered_json c_obj;
                 c_obj["address"] = tools::utils::FormatAddress(c_ea);
                 qstring cname;
@@ -959,6 +982,7 @@ namespace tools::rtti {
         if (all_matching_entries.size() > 1) {
             nlohmann::json vtables_arr = nlohmann::json::array();
             for (const auto& e : all_matching_entries) {
+                sync::Checkpoint();
                 nlohmann::ordered_json vt_obj;
                 vt_obj["offset"] = e.offset;
                 vt_obj["vtable"] = tools::utils::FormatAddress(e.vtable_ea);
@@ -988,7 +1012,7 @@ namespace tools::rtti {
                 cache::CacheManager::Instance().InvalidateAnalysis();
                 count = CollectRttiClasses().size();
                 ok = true;
-            } catch (const std::exception& e) {
+            } catch (const sync::OperationStopped&) { throw; } catch (const std::exception& e) {
                 err_msg = e.what();
             } catch (...) {
                 err_msg = "Unknown error during RTTI refresh";
@@ -1028,6 +1052,7 @@ namespace tools::rtti {
 
                     const auto& clist = RttiIndex::Instance().GetClasses();
                     for (const auto& c : clist) {
+                        sync::Checkpoint();
                         if (c.type_desc_ea != BADADDR && c.type_desc_ea == target->type_desc_ea) {
                             all_matching_entries.push_back(c);
                         }
@@ -1037,7 +1062,7 @@ namespace tools::rtti {
                         return a.offset < b.offset;
                     });
                 }
-            } catch (...) {
+            } catch (const sync::OperationStopped&) { throw; } catch (...) {
             }
         });
 
@@ -1054,6 +1079,7 @@ namespace tools::rtti {
         ss << "// Forward declarations\n";
         ss << "struct " << vtable_struct_name << ";\n";
         for (size_t ei = 1; ei < all_matching_entries.size(); ++ei) {
+            sync::Checkpoint();
             ss << "struct " << vtable_struct_name << "_" << all_matching_entries[ei].offset << ";\n";
         }
         ss << "struct " << class_struct_name << ";\n\n";
@@ -1066,6 +1092,7 @@ namespace tools::rtti {
         sync::SyncRead([&]() {
             if (target_copy.vtable_ea != BADADDR && is_mapped(target_copy.vtable_ea)) {
                 for (size_t i = 0; i < target_copy.methods_count; ++i) {
+                    sync::Checkpoint();
                     ea_t entry_ea = target_copy.vtable_ea + i * ptr_size;
                     if (!is_mapped(entry_ea) || !is_loaded(entry_ea)) break;
 
@@ -1096,6 +1123,7 @@ namespace tools::rtti {
                 }
             } else {
                 for (size_t i = 0; i < target_copy.methods_count; ++i) {
+                    sync::Checkpoint();
                     ss << "    void* vfunc_" << i << ";\n";
                 }
             }
@@ -1104,6 +1132,7 @@ namespace tools::rtti {
 
         // Secondary vtable structs if multiple inheritance exists
         for (size_t ei = 1; ei < all_matching_entries.size(); ++ei) {
+            sync::Checkpoint();
             const auto& sec_entry = all_matching_entries[ei];
             std::string sec_vtable_name = vtable_struct_name + "_" + std::to_string(sec_entry.offset);
             std::unordered_set<std::string> sec_seen;
@@ -1112,6 +1141,7 @@ namespace tools::rtti {
             sync::SyncRead([&]() {
                 if (sec_entry.vtable_ea != BADADDR && is_mapped(sec_entry.vtable_ea)) {
                     for (size_t i = 0; i < sec_entry.methods_count; ++i) {
+                        sync::Checkpoint();
                         ea_t entry_ea = sec_entry.vtable_ea + i * ptr_size;
                         if (!is_mapped(entry_ea) || !is_loaded(entry_ea)) break;
 
@@ -1141,6 +1171,7 @@ namespace tools::rtti {
         ss << "struct " << class_struct_name << " {\n";
         ss << "    struct " << vtable_struct_name << "* __vftable;\n";
         for (size_t ei = 1; ei < all_matching_entries.size(); ++ei) {
+            sync::Checkpoint();
             const auto& sec_entry = all_matching_entries[ei];
             std::string sec_vtable_name = vtable_struct_name + "_" + std::to_string(sec_entry.offset);
             ss << "    struct " << sec_vtable_name << "* __vftable_" << sec_entry.offset << ";\n";
@@ -1154,7 +1185,7 @@ namespace tools::rtti {
         sync::SyncWrite([&]() {
             try {
                 parse_errs = parse_decls(get_idati(), c_header.c_str(), RttiDeclPrinter, HTI_DCL | HTI_PAKDEF | HTI_NWR | HTI_SEMICOLON);
-            } catch (...) {
+            } catch (const sync::OperationStopped&) { throw; } catch (...) {
                 parse_errs = -1;
             }
         });
@@ -1284,6 +1315,7 @@ namespace tools::rtti {
                     insn_t insn;
                     if (decode_insn(&insn, query_ea) > 0) {
                         for (int op_i = 0; op_i < 6; ++op_i) {
+                            sync::Checkpoint();
                             if (insn.ops[op_i].type == o_displ) {
                                 call_disp = static_cast<int>(insn.ops[op_i].addr);
                                 base_reg = GetRegisterName(insn.ops[op_i].reg, ptr_size);
@@ -1302,6 +1334,7 @@ namespace tools::rtti {
                                 if (pfn) {
                                     ea_t b_ea = query_ea;
                                     for (int step = 0; step < 5; ++step) {
+                                        sync::Checkpoint();
                                         ea_t prev_b = prev_head(b_ea, pfn->start_ea);
                                         if (prev_b == BADADDR || prev_b == b_ea) break;
                                         b_ea = prev_b;
@@ -1344,6 +1377,7 @@ namespace tools::rtti {
                         ea_t target_fn_ea = pfn ? pfn->start_ea : query_ea;
                         xrefblk_t xb;
                         for (bool ok = xb.first_to(target_fn_ea, XREF_DATA); ok; ok = xb.next_to()) {
+                            sync::Checkpoint();
                             if (xb.from == BADADDR) continue;
                             segment_t* from_seg = getseg(xb.from);
                             if (from_seg && (from_seg->perm & SEGPERM_EXEC) == 0) {
@@ -1364,12 +1398,14 @@ namespace tools::rtti {
                     if (mode == "call_site" && resolved_vtable_ea == BADADDR && pfn) {
                         ea_t cur_ea = query_ea;
                         for (int step = 0; step < 15; ++step) {
+                            sync::Checkpoint();
                             ea_t prev_ea = prev_head(cur_ea, pfn->start_ea);
                             if (prev_ea == BADADDR || prev_ea == cur_ea) break;
                             cur_ea = prev_ea;
                             insn_t prev_insn;
                             if (decode_insn(&prev_insn, cur_ea) > 0) {
                                 for (int op_i = 0; op_i < 6; ++op_i) {
+                                    sync::Checkpoint();
                                     if (prev_insn.ops[op_i].type == o_mem || prev_insn.ops[op_i].type == o_imm) {
                                         ea_t cand_ea = prev_insn.ops[op_i].addr;
                                         const auto* c = RttiIndex::Instance().FindClass("", cand_ea);
@@ -1482,6 +1518,7 @@ namespace tools::rtti {
                 }
 
                 for (size_t i = 0; i < max_methods; ++i) {
+                    sync::Checkpoint();
                     ea_t slot_ea = resolved_vtable_ea + i * ptr_size;
                     if (!is_mapped(slot_ea) || !is_loaded(slot_ea)) break;
 

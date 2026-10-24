@@ -26,3 +26,7 @@ Release/
 # OS files
 Thumbs.db
 Desktop.ini
+
+# Python check caches
+__pycache__/
+*.pyc

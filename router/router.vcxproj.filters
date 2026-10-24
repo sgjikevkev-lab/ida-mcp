@@ -30,7 +30,7 @@
     <ClCompile Include="main.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="!ibs\json.h">
+    <ClInclude Include="..\shared\json.h">
       <Filter>!ibs</Filter>
     </ClInclude>
     <ClInclude Include="ipc\pipe_client.h">

@@ -37,12 +37,15 @@ namespace router {
 
         std::map<std::string, ida::IdaInstance> instances_;
         std::string active_file_;
+        bool selection_required_{false};
         ipc::PipeClient active_client_;
 
         std::mutex status_mtx_;
         bool is_busy_{false};
         std::string active_tool_;
         std::string active_tool_args_;
+        mcp::json active_request_id_;
+        std::string active_cancel_token_;
         std::chrono::steady_clock::time_point active_tool_start_;
         std::chrono::steady_clock::time_point last_discovery_time_{};
         std::thread worker_thread_;

@@ -1,8 +1,9 @@
+#include "shared/utf8.h"
 #include <string>
 #include <vector>
 #include <cstdint>
 #include <algorithm>
-#include <regex>
+#include "shared/pattern_match.h"
 
 #pragma warning(push, 0)
 #include "json.h"
@@ -29,7 +30,7 @@ namespace tools::utils {
         if (s.size() >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
             try {
                 return std::stoull(s.substr(2), nullptr, 16);
-            } catch (...) {
+            } catch (const sync::OperationStopped&) { throw; } catch (...) {
                 return BADADDR;
             }
         }
@@ -51,6 +52,7 @@ namespace tools::utils {
         // 3. Try parsing as a hex number (e.g. "401000")
         bool is_hex = true;
         for (char c : s) {
+            sync::Checkpoint();
             if (!isxdigit(static_cast<unsigned char>(c))) {
                 is_hex = false;
                 break;
@@ -59,7 +61,7 @@ namespace tools::utils {
         if (is_hex && !s.empty()) {
             try {
                 return std::stoull(s, nullptr, 16);
-            } catch (...) {
+            } catch (const sync::OperationStopped&) { throw; } catch (...) {
             }
         }
 
@@ -92,6 +94,7 @@ namespace tools::utils {
         if (it == args.end() || it->is_null()) {
             if (key == "address" || key == "addr" || key == "ea") {
                 for (const char* alias : {"address", "addr", "ea", "target"}) {
+                    sync::Checkpoint();
                     auto a_it = args.find(alias);
                     if (a_it != args.end() && !a_it->is_null()) {
                         it = a_it;
@@ -130,7 +133,7 @@ namespace tools::utils {
                     return std::stoll(s.substr(2), nullptr, 16);
                 }
                 return std::stoll(s);
-            } catch (...) {
+            } catch (const sync::OperationStopped&) { throw; } catch (...) {
                 return default_val;
             }
         }
@@ -172,108 +175,12 @@ namespace tools::utils {
     }
 
     bool PatternMatch(const std::string& text, const std::string& pattern, bool case_sensitive) {
-        if (pattern.empty()) return true;
-
-        bool has_special = false;
-        bool is_glob = false;
-        for (char c : pattern) {
-            if (c == '*' || c == '?') {
-                is_glob = true;
-                has_special = true;
-                break;
-            }
-            if (std::string(".^$|()[]{}+\\").find(c) != std::string::npos) {
-                has_special = true;
-            }
-        }
-
-        // Fast path: simple substring search (avoids heavy std::regex construction)
-        if (!has_special) {
-            if (case_sensitive) {
-                return text.find(pattern) != std::string::npos;
-            } else {
-                auto it = std::search(
-                    text.begin(), text.end(),
-                    pattern.begin(), pattern.end(),
-                    [](char ch1, char ch2) {
-                        return ::tolower(static_cast<unsigned char>(ch1)) == ::tolower(static_cast<unsigned char>(ch2));
-                    }
-                );
-                return it != text.end();
-            }
-        }
-
-        std::string regex_str = "";
-        if (is_glob) {
-            for (char c : pattern) {
-                if (c == '*') {
-                    regex_str += ".*";
-                } else if (c == '?') {
-                    regex_str += ".";
-                } else if (std::string(".^$|()[]{}+\\").find(c) != std::string::npos) {
-                    regex_str += '\\';
-                    regex_str += c;
-                } else {
-                    regex_str += c;
-                }
-            }
-        } else {
-            regex_str = pattern;
-        }
-
-        try {
-            std::regex::flag_type flags = std::regex::ECMAScript;
-            if (!case_sensitive) flags |= std::regex::icase;
-            std::regex re(regex_str, flags);
-            return std::regex_search(text, re);
-        } catch (...) {
-            if (case_sensitive) {
-                return text.find(pattern) != std::string::npos;
-            } else {
-                std::string t = text;
-                std::string p = pattern;
-                std::transform(t.begin(), t.end(), t.begin(), ::tolower);
-                std::transform(p.begin(), p.end(), p.begin(), ::tolower);
-                return t.find(p) != std::string::npos;
-            }
-        }
+        sync::Checkpoint();
+        return mcp::MatchName(text, pattern, case_sensitive, [] { sync::Checkpoint(); });
     }
 
     std::string SanitizeUtf8(const std::string& input) {
-        std::string out;
-        out.reserve(input.size());
-        for (size_t i = 0; i < input.size(); ) {
-            unsigned char c = static_cast<unsigned char>(input[i]);
-            if (c < 0x80) {
-                out.push_back(c);
-                i += 1;
-            } else if ((c & 0xE0) == 0xC0 && i + 1 < input.size() && (static_cast<unsigned char>(input[i + 1]) & 0xC0) == 0x80) {
-                out.push_back(input[i]);
-                out.push_back(input[i + 1]);
-                i += 2;
-            } else if ((c & 0xF0) == 0xE0 && i + 2 < input.size() &&
-                       (static_cast<unsigned char>(input[i + 1]) & 0xC0) == 0x80 &&
-                       (static_cast<unsigned char>(input[i + 2]) & 0xC0) == 0x80) {
-                out.push_back(input[i]);
-                out.push_back(input[i + 1]);
-                out.push_back(input[i + 2]);
-                i += 3;
-            } else if ((c & 0xF8) == 0xF0 && i + 3 < input.size() &&
-                       (static_cast<unsigned char>(input[i + 1]) & 0xC0) == 0x80 &&
-                       (static_cast<unsigned char>(input[i + 2]) & 0xC0) == 0x80 &&
-                       (static_cast<unsigned char>(input[i + 3]) & 0xC0) == 0x80) {
-                out.push_back(input[i]);
-                out.push_back(input[i + 1]);
-                out.push_back(input[i + 2]);
-                out.push_back(input[i + 3]);
-                i += 4;
-            } else {
-                // Replace invalid byte with UTF-8 replacement character U+FFFD
-                out += "\xEF\xBF\xBD";
-                i += 1;
-            }
-        }
-        return out;
+        return mcp::SanitizeUnicode(input);
     }
 
 

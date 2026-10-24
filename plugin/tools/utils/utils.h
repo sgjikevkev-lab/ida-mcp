@@ -8,6 +8,7 @@
 #pragma warning(pop)
 
 #include <ida.hpp>
+#include "shared/model_output.h"
 
 namespace tools::utils {
     ea_t ParseAddress(const std::string& str);
@@ -28,13 +29,10 @@ namespace tools::utils {
     nlohmann::json SafeJsonNullOrString(const char* input);
 
     inline nlohmann::json MakeToolTextResult(const nlohmann::json& id, const std::string& text, bool is_error = false) {
-        constexpr size_t MAX_TEXT_LEN = 2 * 1024 * 1024; // 2 MB safety limit
-        std::string final_text;
-        if (text.size() > MAX_TEXT_LEN) {
-            final_text = text.substr(0, MAX_TEXT_LEN);
-            final_text += "\n[Warning: output truncated at 2MB safety limit. Use pagination parameters like offset/count to retrieve remaining items]";
-        } else {
-            final_text = text;
+        std::string final_text = text;
+        if (text.size() > mcp::limits::result_bytes) {
+            final_text = "{\"error_code\":\"output_too_large\",\"message\":\"Result exceeds 2 MiB; narrow the query or use pagination\"}";
+            is_error = true;
         }
         final_text = SanitizeUtf8(final_text);
 
@@ -54,21 +52,16 @@ namespace tools::utils {
     }
 
     inline nlohmann::json MakeToolResultJson(const nlohmann::json& id, const nlohmann::json& json_data, bool is_error = false) {
-        std::string dumped = json_data.dump(2);
+        std::string dumped = mcp::output::Format(json_data);
         return MakeToolTextResult(id, dumped, is_error);
     }
 
     inline nlohmann::json MakeToolSuccessJson(const nlohmann::json& id, nlohmann::json payload = nlohmann::json::object()) {
-        if (!payload.is_object()) {
-            nlohmann::json wrapper = {
-                {"status", "success"},
-                {"data", std::move(payload)}
-            };
-            return MakeToolResultJson(id, wrapper, false);
-        }
-        if (!payload.contains("status")) {
-            payload["status"] = "success";
-        }
+        if (payload.is_object() && payload.value("status", nlohmann::json(nullptr)) == "error")
+            return MakeToolResultJson(id, payload, true);
+        bool all_failed = payload.is_object() && payload.contains("failed") && payload.contains("succeeded")
+            && payload["succeeded"] == 0 && payload["failed"].is_number() && payload["failed"].get<int64_t>() > 0;
+        if (all_failed) return MakeToolResultJson(id, payload, true);
         return MakeToolResultJson(id, payload, false);
     }
 

@@ -41,16 +41,13 @@ namespace tools::modify {
             std::string code;
             const strvec_t& sv = cfunc->get_pseudocode();
             for (size_t i = 0; i < sv.size(); ++i) {
+                sync::Checkpoint();
                 qstring clean_line;
                 tag_remove(&clean_line, sv[i].line.c_str());
                 code += tools::utils::SanitizeUtf8(clean_line.c_str()) + "\n";
             }
             return code;
         }
-    }
-
-    bool ApiModify::CanHandle(const std::string& name) const {
-        return name == "refactor";
     }
 
     nlohmann::json ApiModify::Dispatch(const nlohmann::json& id, const std::string& name, const nlohmann::json& args) {
@@ -65,6 +62,7 @@ namespace tools::modify {
         if (args.contains("items") && args["items"].is_array()) {
             is_batch = true;
             for (const auto& item : args["items"]) {
+                sync::Checkpoint();
                 if (item.is_object()) items.push_back(item);
             }
         } else {
@@ -77,6 +75,7 @@ namespace tools::modify {
                 if (init_hexrays_plugin()) {
                     size_t total = get_func_qty();
                     for (size_t i = 0; i < total; ++i) {
+                        sync::Checkpoint();
                         func_t* fn = getn_func(i);
                         if (fn && fn->start_ea != BADADDR) {
                             mark_cfunc_dirty(fn->start_ea);
@@ -100,6 +99,7 @@ namespace tools::modify {
 
         sync::SyncWrite([&]() {
             for (const auto& item : items) {
+                sync::Checkpoint();
                 ea_t ea = tools::utils::GetAddressArg(item, "target");
                 if (ea == BADADDR) ea = tools::utils::GetAddressArg(item, "addr");
                 if (ea == BADADDR) ea = tools::utils::GetAddressArg(item, "func");
@@ -227,6 +227,7 @@ namespace tools::modify {
                         if (cfunc) {
                             nlohmann::json lvar_results = nlohmann::json::array();
                             for (const auto& lv_item : item["lvars"]) {
+                                sync::Checkpoint();
                                 if (!lv_item.is_object()) continue;
                                 std::string cur_lv_name = tools::utils::GetStringArg(lv_item, "name", tools::utils::GetStringArg(lv_item, "old_name"));
                                 std::string new_lv_name = tools::utils::GetStringArg(lv_item, "new_name");
@@ -284,6 +285,7 @@ namespace tools::modify {
                 if (item.contains("comments") && item["comments"].is_array()) {
                     nlohmann::json cmt_results = nlohmann::json::array();
                     for (const auto& ci : item["comments"]) {
+                        sync::Checkpoint();
                         if (!ci.is_object()) continue;
                         ea_t c_ea = tools::utils::GetAddressArg(ci, "addr");
                         if (c_ea == BADADDR) c_ea = tools::utils::GetAddressArg(ci, "target");
@@ -326,6 +328,7 @@ namespace tools::modify {
             }
 
             for (ea_t fn_start : affected_funcs) {
+                sync::Checkpoint();
                 if (init_hexrays_plugin()) {
                     mark_cfunc_dirty(fn_start);
                 }
@@ -335,7 +338,7 @@ namespace tools::modify {
         cache::InvalidateIDBAnalysis();
 
         // Auto-recompile affected function and attach refreshed C pseudocode
-        if (affected_funcs.size() == 1 && !is_batch && !results.empty()) {
+        if (tools::utils::GetBoolArg(args, "include_code", false) && affected_funcs.size() == 1 && !is_batch && !results.empty()) {
             ea_t target_fn_ea = *affected_funcs.begin();
             func_t* rfn = get_func(target_fn_ea);
             if (rfn) {

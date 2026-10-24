@@ -17,6 +17,10 @@
 #include <mutex>
 
 namespace cache {
+    inline std::atomic<bool> pending_database_changes{false};
+    inline void MarkDatabaseChanged() {
+        pending_database_changes.store(true, std::memory_order_release);
+    }
 
     inline std::atomic<uint64_t>& GetIdbGeneration() {
         static std::atomic<uint64_t> s_gen{1};
@@ -111,5 +115,10 @@ namespace cache {
 
     inline void InvalidateIDBDependentCaches() {
         CacheManager::Instance().InvalidateAll();
+    }
+
+    inline void ApplyPendingChanges() {
+        if (pending_database_changes.exchange(false, std::memory_order_acq_rel))
+            InvalidateIDBDependentCaches();
     }
 }

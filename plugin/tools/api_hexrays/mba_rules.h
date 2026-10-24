@@ -7,6 +7,7 @@
 #include <set>
 #include <sstream>
 #include "ctree_serializer.h"
+#include "sync/operation.h"
 
 namespace tools::hexrays_ast {
 
@@ -211,7 +212,7 @@ namespace tools::hexrays_ast {
             {
                 26,
                 "Complement Sub: x - x => 0",
-                nlohmann::json::parse(R"({"op": "cot_sub", "x": "$x", "y": "$x"}})") ,
+                nlohmann::json::parse(R"({"op": "cot_sub", "x": "$x", "y": "$x"})") ,
                 [](const auto&) { return "0"; },
                 [](uint8_t x, uint8_t) { return uint8_t(x - x) == 0; }
             },
@@ -305,6 +306,8 @@ namespace tools::hexrays_ast {
     // === Constant Folding Engine ===
     // Try to evaluate a pure-constant expression to a single value.
     inline std::optional<uint64_t> TryConstFold(const cexpr_t* expr) {
+        sync::Checkpoint();
+        sync::RecursionGuard recursion;
         if (!expr) return std::nullopt;
 
         if (expr->op == cot_num) {
@@ -391,6 +394,8 @@ namespace tools::hexrays_ast {
 
     // Count unique lvars used in an expression
     inline void CollectLvars(const cexpr_t* expr, const cfunc_t* cf, std::set<int>& lvar_indices) {
+        sync::Checkpoint();
+        sync::RecursionGuard recursion;
         if (!expr) return;
         if (expr->op == cot_var) {
             lvar_indices.insert(expr->v.idx);
@@ -401,6 +406,7 @@ namespace tools::hexrays_ast {
         if (op_uses_z(expr->op) && expr->z) CollectLvars(expr->z, cf, lvar_indices);
         if (expr->op == cot_call && expr->a) {
             for (const auto& arg : *expr->a) {
+                sync::Checkpoint();
                 CollectLvars(&arg, cf, lvar_indices);
             }
         }
@@ -410,6 +416,8 @@ namespace tools::hexrays_ast {
         const cexpr_t* expr,
         const std::map<int, uint64_t>& var_map,
         uint64_t mask) {
+        sync::Checkpoint();
+        sync::RecursionGuard recursion;
         if (!expr) return std::nullopt;
 
         if (expr->op == cot_num) {
@@ -498,6 +506,8 @@ namespace tools::hexrays_ast {
         int target_var_idx,
         uint64_t var_val,
         uint64_t mask) {
+        sync::Checkpoint();
+        sync::RecursionGuard recursion;
         return EvalExprWithVars(expr, {{target_var_idx, var_val}}, mask);
     }
 
@@ -544,8 +554,10 @@ namespace tools::hexrays_ast {
             bool is_and = true, is_or = true, is_xor = true, is_zero = true;
 
             for (uint64_t vx : kSample2) {
+                sync::Checkpoint();
                 uint64_t x_val = vx & mask;
                 for (uint64_t vy : kSample2) {
+                    sync::Checkpoint();
                     uint64_t y_val = vy & mask;
                     auto eval_res = EvalExprWithVars(expr, {{var1_idx, x_val}, {var2_idx, y_val}}, mask);
                     if (!eval_res) return std::nullopt;
@@ -613,6 +625,7 @@ namespace tools::hexrays_ast {
         std::optional<uint64_t> first_val = std::nullopt;
 
         for (uint64_t raw_val : test_values) {
+            sync::Checkpoint();
             uint64_t val = raw_val & mask;
             auto eval_res = EvalExprWithSingleVar(expr, target_var, val, mask);
             if (!eval_res) {

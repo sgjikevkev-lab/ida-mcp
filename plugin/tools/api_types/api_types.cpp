@@ -60,6 +60,7 @@ namespace tools::types {
             // 3. Try each loaded base TIL explicitly
             if (local_ti) {
                 for (int b = 0; b < local_ti->nbases; ++b) {
+                    sync::Checkpoint();
                     if (local_ti->base[b] && tif.get_named_type(local_ti->base[b], clean.c_str())) {
                         return tif;
                     }
@@ -75,12 +76,6 @@ namespace tools::types {
             }
             return tinfo_t();
         }
-    }
-
-    bool ApiTypes::CanHandle(const std::string& name) const {
-        return name == "types" ||
-               name == "stack_frame" ||
-               name == "reconstruct_struct";
     }
 
     nlohmann::json ApiTypes::Dispatch(const nlohmann::json& id, const std::string& name, const nlohmann::json& args) {
@@ -112,6 +107,7 @@ namespace tools::types {
         if (args.contains("names") && args["names"].is_array()) {
             nlohmann::json results = nlohmann::json::array();
             for (const auto& n : args["names"]) {
+                sync::Checkpoint();
                 if (!n.is_string()) continue;
                 nlohmann::json inspect_args = args;
                 inspect_args["name"] = n.get<std::string>();
@@ -169,6 +165,7 @@ namespace tools::types {
         if (errs != 0) {
             std::string clean_err = tools::utils::SanitizeUtf8(g_parse_errors.c_str());
             while (!clean_err.empty() && (clean_err.back() == '\n' || clean_err.back() == '\r' || clean_err.back() == ' ')) {
+                sync::Checkpoint();
                 clean_err.pop_back();
             }
             std::string msg = "C parser encountered " + std::to_string(errs) + " error(s)";
@@ -192,6 +189,7 @@ namespace tools::types {
             auto words_begin = std::sregex_iterator(decls.begin(), decls.end(), re_tag);
             auto words_end = std::sregex_iterator();
             for (auto it = words_begin; it != words_end; ++it) {
+                sync::Checkpoint();
                 std::smatch m = *it;
                 if (m.size() > 1) {
                     std::string tag_name = m[1].str();
@@ -205,6 +203,7 @@ namespace tools::types {
             std::regex re_td(R"(typedef\s+[^;]+?\s+([A-Za-z_][A-Za-z0-9_]*)\s*;)");
             auto td_begin = std::sregex_iterator(decls.begin(), decls.end(), re_td);
             for (auto it = td_begin; it != words_end; ++it) {
+                sync::Checkpoint();
                 std::smatch m = *it;
                 if (m.size() > 1) {
                     std::string td_name = m[1].str();
@@ -213,11 +212,12 @@ namespace tools::types {
                     }
                 }
             }
-        } catch (...) {}
+        } catch (const sync::OperationStopped&) { throw; } catch (...) {}
 
         nlohmann::json types_arr = nlohmann::json::array();
         sync::SyncRead([&]() {
             for (const auto& c_name : candidate_names) {
+                sync::Checkpoint();
                 tinfo_t tif = GetTypeByName(c_name);
                 if (tif.empty() || !tif.present()) continue;
 
@@ -242,6 +242,7 @@ namespace tools::types {
                     if (detailed) {
                         nlohmann::json f_arr = nlohmann::json::array();
                         for (int i = 0; i < nmembers; ++i) {
+                            sync::Checkpoint();
                             udm_t udm;
                             if (tif.get_udm(&udm, static_cast<size_t>(i)) >= 0) {
                                 nlohmann::ordered_json f;
@@ -263,6 +264,7 @@ namespace tools::types {
                         if (detailed) {
                             nlohmann::json m_arr = nlohmann::json::array();
                             for (size_t i = 0; i < ei.size(); ++i) {
+                                sync::Checkpoint();
                                 m_arr.push_back({
                                     {"name", tools::utils::SanitizeUtf8(ei[i].name.c_str())},
                                     {"value", ei[i].value}
@@ -300,6 +302,7 @@ namespace tools::types {
         if (!g_parse_errors.empty()) {
             std::string clean_w = tools::utils::SanitizeUtf8(g_parse_errors.c_str());
             while (!clean_w.empty() && (clean_w.back() == '\n' || clean_w.back() == '\r' || clean_w.back() == ' ')) {
+                sync::Checkpoint();
                 clean_w.pop_back();
             }
             if (!clean_w.empty()) {
@@ -325,7 +328,7 @@ namespace tools::types {
             if (!cursor_str.empty()) {
                 try {
                     offset = static_cast<size_t>(std::stoull(cursor_str, nullptr, 0));
-                } catch (...) {}
+                } catch (const sync::OperationStopped&) { throw; } catch (...) {}
             }
         }
 
@@ -347,6 +350,7 @@ namespace tools::types {
                 }
                 if (!local_only && til_filter != "local") {
                     for (int b = 0; b < local_ti->nbases; ++b) {
+                        sync::Checkpoint();
                         til_t* base_ti = local_ti->base[b];
                         if (!base_ti) continue;
                         if (!til_filter.empty() && til_filter != "all" && (!base_ti->name || til_filter != base_ti->name)) {
@@ -358,8 +362,10 @@ namespace tools::types {
             }
 
             for (til_t* cur_til : tils_to_search) {
+                sync::Checkpoint();
                 const char* named = first_named_type(cur_til, NTF_TYPE);
                 while (named != nullptr) {
+                    sync::Checkpoint();
                     std::string t_name = named;
                     named = next_named_type(cur_til, named, NTF_TYPE);
 
@@ -442,7 +448,7 @@ namespace tools::types {
         res["count"] = types_arr.size();
         res["types"] = types_arr;
         if (next_offset != -1) {
-            res["next_offset"] = next_offset;
+
         }
         return tools::utils::MakeToolSuccessJson(id, res);
     }
@@ -499,6 +505,7 @@ namespace tools::types {
                     int nmembers = tif.get_udt_nmembers();
                     uint64 cur_bit = 0;
                     for (int i = 0; i < nmembers; ++i) {
+                        sync::Checkpoint();
                         udm_t udm;
                         if (tif.get_udm(&udm, static_cast<size_t>(i)) >= 0) {
                             if (udm.offset > cur_bit && cur_bit != 0) {
@@ -554,6 +561,7 @@ namespace tools::types {
                     enum_type_data_t ei;
                     if (tif.get_enum_details(&ei)) {
                         for (size_t i = 0; i < ei.size(); ++i) {
+                            sync::Checkpoint();
                             nlohmann::ordered_json m;
                             m["name"] = tools::utils::SanitizeUtf8(ei[i].name.c_str());
                             m["value"] = ei[i].value;
@@ -753,6 +761,7 @@ namespace tools::types {
                     if (ftype.get_udt_details(&nested)) {
                         nlohmann::json nested_fields = nlohmann::json::array();
                         for (const auto& nm : nested) {
+                            sync::Checkpoint();
                             size_t nm_size = nm.type.get_size();
                             size_t nested_off = f_offset_bits + nm.offset;
                             nested_fields.push_back(
@@ -781,6 +790,7 @@ namespace tools::types {
                             std::string str_val;
                             size_t max_read = std::min<size_t>(nelems_total, 256);
                             for (size_t c = 0; c < max_read; ++c) {
+                                sync::Checkpoint();
                                 uint8_t b = 0;
                                 size_t root_off = (field_ea != BADADDR && ea != BADADDR && field_ea >= ea) ? static_cast<size_t>(field_ea - ea + c) : 0;
                                 if (has_bulk && root_off < bulk_buf.size()) {
@@ -806,6 +816,7 @@ namespace tools::types {
 
                         nlohmann::json elems = nlohmann::json::array();
                         for (int i = 0; i < show_count; ++i) {
+                            sync::Checkpoint();
                             qstring idx_name;
                             idx_name.sprnt("[%d]", i);
                             size_t elem_offset_bits = f_offset_bits + static_cast<size_t>(i) * elem_size * 8;
@@ -862,6 +873,7 @@ namespace tools::types {
                         enum_type_data_t ei;
                         if (ftype.get_enum_details(&ei)) {
                             for (const auto& em : ei) {
+                                sync::Checkpoint();
                                 if (static_cast<uint64_t>(em.value) == raw_val) {
                                     field_obj["enum_name"] = tools::utils::SanitizeUtf8(em.name.c_str());
                                     break;
@@ -904,6 +916,7 @@ namespace tools::types {
             udt_type_data_t udt;
             if (tif.get_udt_details(&udt)) {
                 for (const auto& m : udt) {
+                    sync::Checkpoint();
                     size_t m_size = m.type.get_size();
                     fields_arr.push_back(
                         ReadFieldRecursive(ea, m.type, m.name, m.offset, m_size, 0, max_depth, array_limit)
@@ -934,6 +947,7 @@ namespace tools::types {
             std::string hex_str;
             size_t preview_len = std::min<size_t>(bulk_buf.size(), 64);
             for (size_t b = 0; b < preview_len; ++b) {
+                sync::Checkpoint();
                 char hb[4];
                 qsnprintf(hb, sizeof(hb), "%02X ", bulk_buf[b]);
                 hex_str += hb;
@@ -956,7 +970,7 @@ namespace tools::types {
             return tools::utils::MakeToolErrorJson(id, "Parameter 'addr' could not be resolved", "invalid_addr");
         }
 
-        bool include_lvars = tools::utils::GetBoolArg(args, "include_lvars", true);
+        bool include_lvars = tools::utils::GetBoolArg(args, "include_lvars", false);
 
         nlohmann::json members_arr = nlohmann::json::array();
         nlohmann::json lvars_arr = nlohmann::json::array();
@@ -1000,6 +1014,7 @@ namespace tools::types {
                     // Find return address offset for category classification
                     uint64 ret_addr_bit_offset = static_cast<uint64>(-1);
                     for (const auto& m : udt) {
+                        sync::Checkpoint();
                         if (m.name == FRAME_UDM_NAME_R) {
                             ret_addr_bit_offset = m.offset;
                             break;
@@ -1007,6 +1022,7 @@ namespace tools::types {
                     }
 
                     for (const auto& m : udt) {
+                        sync::Checkpoint();
                         qstring type_name;
                         m.type.print(&type_name, nullptr, PRTYPE_1LINE);
                         std::string clean_type = tools::utils::SanitizeUtf8(type_name.c_str());
@@ -1070,6 +1086,7 @@ namespace tools::types {
                     const lvars_t* lvars = cfunc->get_lvars();
                     if (lvars) {
                         for (size_t i = 0; i < lvars->size(); ++i) {
+                            sync::Checkpoint();
                             const lvar_t& v = (*lvars)[i];
                             nlohmann::ordered_json v_obj;
                             v_obj["name"] = tools::utils::SanitizeUtf8(v.name.c_str());
@@ -1165,7 +1182,7 @@ namespace tools::types {
         if (max_depth > 5) max_depth = 5;
 
         bool apply = tools::utils::GetBoolArg(args, "apply", false);
-        bool decompile_now = tools::utils::GetBoolArg(args, "decompile_now", false) || apply;
+        bool decompile_now = tools::utils::GetBoolArg(args, "include_code", false);
 
         struct InferredField {
             uint64_t offset = 0;
@@ -1256,6 +1273,7 @@ namespace tools::types {
             if (!lvars || lvars->empty()) return;
 
             for (size_t i = 0; i < lvars->size(); ++i) {
+                sync::Checkpoint();
                 const auto& lv = (*lvars)[i];
                 qstring tstr;
                 lv.type().print(&tstr);
@@ -1273,6 +1291,7 @@ namespace tools::types {
                 for (char& c : target_lower) c = static_cast<char>(std::tolower(c));
 
                 for (size_t i = 0; i < lvars->size(); ++i) {
+                    sync::Checkpoint();
                     if ((*lvars)[i].name == target_var_name.c_str()) {
                         target_idx = static_cast<int>(i);
                         break;
@@ -1280,6 +1299,7 @@ namespace tools::types {
                 }
                 if (target_idx == -1) {
                     for (size_t i = 0; i < lvars->size(); ++i) {
+                        sync::Checkpoint();
                         std::string ln = (*lvars)[i].name.c_str();
                         for (char& c : ln) c = static_cast<char>(std::tolower(c));
                         if (ln == target_lower) {
@@ -1291,6 +1311,7 @@ namespace tools::types {
                 }
                 if (target_idx == -1 && (target_lower == "this" || target_lower == "rcx" || target_lower == "a1")) {
                     for (size_t i = 0; i < lvars->size(); ++i) {
+                        sync::Checkpoint();
                         if ((*lvars)[i].is_arg_var()) {
                             target_idx = static_cast<int>(i);
                             target_var_name = (*lvars)[i].name.c_str();
@@ -1305,25 +1326,32 @@ namespace tools::types {
                         int found_idx = -1;
                         VarAtEaVisitor(ea_t a) : ctree_visitor_t(CV_FAST), target_ea(a) {}
                         int idaapi visit_expr(cexpr_t* e) override {
-                            if (e->ea == target_ea) {
-                                if (e->op == cot_var) {
-                                    found_idx = e->v.idx;
-                                    return 1;
-                                }
-                                if ((e->op == cot_ptr || e->op == cot_memptr || e->op == cot_memref) && e->x) {
-                                    const cexpr_t* base = e->x;
-                                    while (base && (base->op == cot_cast || base->op == cot_ref)) base = base->x;
-                                    if (base && base->op == cot_var) {
-                                        found_idx = base->v.idx;
+                            try {
+                                sync::Checkpoint();
+                                if (e->ea == target_ea) {
+                                    if (e->op == cot_var) {
+                                        found_idx = e->v.idx;
                                         return 1;
                                     }
+                                    if ((e->op == cot_ptr || e->op == cot_memptr || e->op == cot_memref) && e->x) {
+                                        const cexpr_t* base = e->x;
+                                        while (base && (base->op == cot_cast || base->op == cot_ref)) base = base->x;
+                                        if (base && base->op == cot_var) {
+                                            found_idx = base->v.idx;
+                                            return 1;
+                                        }
+                                    }
                                 }
+                                return 0;
+                            } catch (...) {
+                                sync::SaveCallbackException();
+                                return 1;
                             }
-                            return 0;
                         }
                     };
                     VarAtEaVisitor var_finder(ea);
                     var_finder.apply_to(&cf->body, nullptr);
+                    sync::Checkpoint();
                     if (var_finder.found_idx >= 0 && var_finder.found_idx < static_cast<int>(lvars->size())) {
                         target_idx = var_finder.found_idx;
                         target_var_name = (*lvars)[target_idx].name.c_str();
@@ -1332,6 +1360,7 @@ namespace tools::types {
 
                 if (target_idx == -1) {
                     for (size_t i = 0; i < lvars->size(); ++i) {
+                        sync::Checkpoint();
                         if ((*lvars)[i].is_arg_var() && (*lvars)[i].type().is_ptr()) {
                             target_idx = static_cast<int>(i);
                             target_var_name = (*lvars)[i].name.c_str();
@@ -1341,6 +1370,7 @@ namespace tools::types {
                 }
                 if (target_idx == -1) {
                     for (size_t i = 0; i < lvars->size(); ++i) {
+                        sync::Checkpoint();
                         if ((*lvars)[i].is_arg_var()) {
                             target_idx = static_cast<int>(i);
                             target_var_name = (*lvars)[i].name.c_str();
@@ -1350,6 +1380,7 @@ namespace tools::types {
                 }
                 if (target_idx == -1) {
                     for (size_t i = 0; i < lvars->size(); ++i) {
+                        sync::Checkpoint();
                         if ((*lvars)[i].type().is_ptr()) {
                             target_idx = static_cast<int>(i);
                             target_var_name = (*lvars)[i].name.c_str();
@@ -1378,6 +1409,8 @@ namespace tools::types {
             std::function<void(func_t*, int, int, uint64_t)> scan_fn;
 
             scan_fn = [&](func_t* cur_fn, int lvar_idx, int current_depth, uint64_t base_offset) {
+                sync::Checkpoint();
+                sync::RecursionGuard recursion;
                 if (!cur_fn || current_depth > max_depth) return;
                 auto ctx_key = std::make_tuple(cur_fn->start_ea, lvar_idx, base_offset);
                 if (visited_contexts.count(ctx_key)) return;
@@ -1451,6 +1484,7 @@ namespace tools::types {
                 };
 
                 for (int round = 0; round < 3; ++round) {
+                    sync::Checkpoint();
                     bool new_alias = false;
                     struct AliasVisitor : public ctree_visitor_t {
                         std::map<int, int64_t>& al;
@@ -1459,22 +1493,29 @@ namespace tools::types {
                         AliasVisitor(std::map<int, int64_t>& a, decltype(is_alias_base)& b, bool& c)
                             : ctree_visitor_t(CV_FAST), al(a), is_b(b), changed(c) {}
                         int idaapi visit_expr(cexpr_t* e) override {
-                            if (e->op == cot_asg && e->x && e->y) {
-                                if (e->x->op == cot_var) {
-                                    int64_t off = 0;
-                                    if (is_b(is_b, e->y, off)) {
-                                        if (al.find(e->x->v.idx) == al.end()) {
-                                            al[e->x->v.idx] = off;
-                                            changed = true;
+                            try {
+                                sync::Checkpoint();
+                                if (e->op == cot_asg && e->x && e->y) {
+                                    if (e->x->op == cot_var) {
+                                        int64_t off = 0;
+                                        if (is_b(is_b, e->y, off)) {
+                                            if (al.find(e->x->v.idx) == al.end()) {
+                                                al[e->x->v.idx] = off;
+                                                changed = true;
+                                            }
                                         }
                                     }
                                 }
+                                return 0;
+                            } catch (...) {
+                                sync::SaveCallbackException();
+                                return 1;
                             }
-                            return 0;
                         }
                     };
                     AliasVisitor av(aliases, is_alias_base, new_alias);
                     av.apply_to(&local_cf->body, nullptr);
+                    sync::Checkpoint();
                     if (!new_alias) break;
                 }
 
@@ -1558,241 +1599,246 @@ namespace tools::types {
                     }
 
                     int idaapi visit_expr(cexpr_t* e) override {
-                        bool is_write = false;
-                        const citem_t* p = parent_expr();
-                        if (p && p->is_expr() && p->op == cot_asg) {
-                            const cexpr_t* asg = reinterpret_cast<const cexpr_t*>(p);
-                            if (asg->x == e) is_write = true;
-                        }
-
-                        // 1. Pointer dereference: *(type*)(var + offset)
-                        if (e->op == cot_ptr && e->x) {
-                            int64_t off = 0;
-                            if (is_target(is_target, e->x, off)) {
-                                int64_t signed_final = static_cast<int64_t>(base_off) + off;
-                                if (signed_final >= 0) {
-                                    uint64_t final_off = static_cast<uint64_t>(signed_final);
-                                    size_t sz = e->ptrsize > 0 ? static_cast<size_t>(e->ptrsize) : e->type.get_size();
-                                    record_access(final_off, sz, e->type, is_write);
-                                }
+                        try {
+                            sync::Checkpoint();
+                            bool is_write = false;
+                            const citem_t* p = parent_expr();
+                            if (p && p->is_expr() && p->op == cot_asg) {
+                                const cexpr_t* asg = reinterpret_cast<const cexpr_t*>(p);
+                                if (asg->x == e) is_write = true;
                             }
-                        }
 
-                        // 2. Member pointer or reference: var->member or var.member
-                        if ((e->op == cot_memptr || e->op == cot_memref) && e->x) {
-                            int64_t off = 0;
-                            if (is_target(is_target, e->x, off)) {
-                                int64_t signed_final = static_cast<int64_t>(base_off) + off + static_cast<int64_t>(e->m);
-                                if (signed_final >= 0) {
-                                    uint64_t final_off = static_cast<uint64_t>(signed_final);
-                                    size_t sz = e->ptrsize > 0 ? static_cast<size_t>(e->ptrsize) : e->type.get_size();
-                                    record_access(final_off, sz, e->type, is_write);
-                                }
-                            }
-                        }
-
-                        // 3. Array indexing: var[i]
-                        if (e->op == cot_idx && e->x && e->y && e->y->op == cot_num) {
-                            int64_t off = 0;
-                            if (is_target(is_target, e->x, off)) {
-                                size_t elem_sz = e->type.get_size();
-                                if (elem_sz <= 0 || elem_sz == BADSIZE) elem_sz = 1;
-                                int64_t signed_final = static_cast<int64_t>(base_off) + off + static_cast<int64_t>(e->y->numval() * elem_sz);
-                                if (signed_final >= 0) {
-                                    uint64_t final_off = static_cast<uint64_t>(signed_final);
-                                    record_access(final_off, elem_sz, e->type, is_write);
-                                }
-                            }
-                        }
-
-                        // 4. Hex-Rays helper functions (LODWORD, HIDWORD, BYTE4, etc.)
-                        if (e->op == cot_call && e->x && e->x->op == cot_helper && e->a && !e->a->empty()) {
-                            size_t h_off = 0, h_sz = 0;
-                            bool h_signed = false;
-                            if (parse_helper(e->x->helper, h_off, h_sz, h_signed)) {
+                            // 1. Pointer dereference: *(type*)(var + offset)
+                            if (e->op == cot_ptr && e->x) {
                                 int64_t off = 0;
-                                if (is_target(is_target, &(*e->a)[0], off)) {
-                                    int64_t signed_final = static_cast<int64_t>(base_off) + off + static_cast<int64_t>(h_off);
+                                if (is_target(is_target, e->x, off)) {
+                                    int64_t signed_final = static_cast<int64_t>(base_off) + off;
                                     if (signed_final >= 0) {
                                         uint64_t final_off = static_cast<uint64_t>(signed_final);
-                                        std::string t = h_signed ? ("int" + std::to_string(h_sz * 8) + "_t") : ("uint" + std::to_string(h_sz * 8) + "_t");
-                                        record_access(final_off, h_sz, tinfo_t(), is_write, t);
+                                        size_t sz = e->ptrsize > 0 ? static_cast<size_t>(e->ptrsize) : e->type.get_size();
+                                        record_access(final_off, sz, e->type, is_write);
                                     }
                                 }
                             }
-                        }
 
-                        // 5. Assignment inspection: check RHS for vtable, string literals, float constants, allocation
-                        if (e->op == cot_asg && e->x && e->y) {
-                            int64_t off = 0;
-                            size_t sz = 0;
-                            bool is_field_write = false;
-
-                            if (e->x->op == cot_ptr && e->x->x && is_target(is_target, e->x->x, off)) {
-                                sz = e->x->ptrsize > 0 ? static_cast<size_t>(e->x->ptrsize) : e->x->type.get_size();
-                                is_field_write = true;
-                            } else if ((e->x->op == cot_memptr || e->x->op == cot_memref) && e->x->x && is_target(is_target, e->x->x, off)) {
-                                off += e->x->m;
-                                sz = e->x->ptrsize > 0 ? static_cast<size_t>(e->x->ptrsize) : e->x->type.get_size();
-                                is_field_write = true;
-                            } else if (e->x->op == cot_idx && e->x->x && is_target(is_target, e->x->x, off) && e->x->y && e->x->y->op == cot_num) {
-                                size_t elem_sz = e->x->type.get_size();
-                                if (elem_sz <= 0 || elem_sz == BADSIZE) elem_sz = 1;
-                                off += e->x->y->numval() * elem_sz;
-                                sz = elem_sz;
-                                is_field_write = true;
+                            // 2. Member pointer or reference: var->member or var.member
+                            if ((e->op == cot_memptr || e->op == cot_memref) && e->x) {
+                                int64_t off = 0;
+                                if (is_target(is_target, e->x, off)) {
+                                    int64_t signed_final = static_cast<int64_t>(base_off) + off + static_cast<int64_t>(e->m);
+                                    if (signed_final >= 0) {
+                                        uint64_t final_off = static_cast<uint64_t>(signed_final);
+                                        size_t sz = e->ptrsize > 0 ? static_cast<size_t>(e->ptrsize) : e->type.get_size();
+                                        record_access(final_off, sz, e->type, is_write);
+                                    }
+                                }
                             }
 
-                            if (is_field_write) {
-                                int64_t signed_final = static_cast<int64_t>(base_off) + off;
-                                if (signed_final >= 0) {
-                                    uint64_t final_off = static_cast<uint64_t>(signed_final);
-                                    const cexpr_t* r = e->y;
-                                    while (r && r->op == cot_cast) r = r->x;
-
-                                    ea_t vtbl_ea = BADADDR;
-                                    if (r) {
-                                        if (r->op == cot_obj) vtbl_ea = r->obj_ea;
-                                        else if (r->op == cot_ref && r->x && r->x->op == cot_obj) vtbl_ea = r->x->obj_ea;
+                            // 3. Array indexing: var[i]
+                            if (e->op == cot_idx && e->x && e->y && e->y->op == cot_num) {
+                                int64_t off = 0;
+                                if (is_target(is_target, e->x, off)) {
+                                    size_t elem_sz = e->type.get_size();
+                                    if (elem_sz <= 0 || elem_sz == BADSIZE) elem_sz = 1;
+                                    int64_t signed_final = static_cast<int64_t>(base_off) + off + static_cast<int64_t>(e->y->numval() * elem_sz);
+                                    if (signed_final >= 0) {
+                                        uint64_t final_off = static_cast<uint64_t>(signed_final);
+                                        record_access(final_off, elem_sz, e->type, is_write);
                                     }
+                                }
+                            }
 
-                                    if (vtbl_ea != BADADDR) {
-                                        bool is_vtbl = false;
-                                        segment_t* seg = getseg(vtbl_ea);
-                                        if (seg && !(seg->perm & SEGPERM_WRITE)) {
-                                            ea_t first_method = get_qword(vtbl_ea);
-                                            if (first_method != 0 && first_method != BADADDR && get_func(first_method)) {
+                            // 4. Hex-Rays helper functions (LODWORD, HIDWORD, BYTE4, etc.)
+                            if (e->op == cot_call && e->x && e->x->op == cot_helper && e->a && !e->a->empty()) {
+                                size_t h_off = 0, h_sz = 0;
+                                bool h_signed = false;
+                                if (parse_helper(e->x->helper, h_off, h_sz, h_signed)) {
+                                    int64_t off = 0;
+                                    if (is_target(is_target, &(*e->a)[0], off)) {
+                                        int64_t signed_final = static_cast<int64_t>(base_off) + off + static_cast<int64_t>(h_off);
+                                        if (signed_final >= 0) {
+                                            uint64_t final_off = static_cast<uint64_t>(signed_final);
+                                            std::string t = h_signed ? ("int" + std::to_string(h_sz * 8) + "_t") : ("uint" + std::to_string(h_sz * 8) + "_t");
+                                            record_access(final_off, h_sz, tinfo_t(), is_write, t);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 5. Assignment inspection: check RHS for vtable, string literals, float constants, allocation
+                            if (e->op == cot_asg && e->x && e->y) {
+                                int64_t off = 0;
+                                size_t sz = 0;
+                                bool is_field_write = false;
+
+                                if (e->x->op == cot_ptr && e->x->x && is_target(is_target, e->x->x, off)) {
+                                    sz = e->x->ptrsize > 0 ? static_cast<size_t>(e->x->ptrsize) : e->x->type.get_size();
+                                    is_field_write = true;
+                                } else if ((e->x->op == cot_memptr || e->x->op == cot_memref) && e->x->x && is_target(is_target, e->x->x, off)) {
+                                    off += e->x->m;
+                                    sz = e->x->ptrsize > 0 ? static_cast<size_t>(e->x->ptrsize) : e->x->type.get_size();
+                                    is_field_write = true;
+                                } else if (e->x->op == cot_idx && e->x->x && is_target(is_target, e->x->x, off) && e->x->y && e->x->y->op == cot_num) {
+                                    size_t elem_sz = e->x->type.get_size();
+                                    if (elem_sz <= 0 || elem_sz == BADSIZE) elem_sz = 1;
+                                    off += e->x->y->numval() * elem_sz;
+                                    sz = elem_sz;
+                                    is_field_write = true;
+                                }
+
+                                if (is_field_write) {
+                                    int64_t signed_final = static_cast<int64_t>(base_off) + off;
+                                    if (signed_final >= 0) {
+                                        uint64_t final_off = static_cast<uint64_t>(signed_final);
+                                        const cexpr_t* r = e->y;
+                                        while (r && r->op == cot_cast) r = r->x;
+
+                                        ea_t vtbl_ea = BADADDR;
+                                        if (r) {
+                                            if (r->op == cot_obj) vtbl_ea = r->obj_ea;
+                                            else if (r->op == cot_ref && r->x && r->x->op == cot_obj) vtbl_ea = r->x->obj_ea;
+                                        }
+
+                                        if (vtbl_ea != BADADDR) {
+                                            bool is_vtbl = false;
+                                            segment_t* seg = getseg(vtbl_ea);
+                                            if (seg && !(seg->perm & SEGPERM_WRITE)) {
+                                                ea_t first_method = get_qword(vtbl_ea);
+                                                if (first_method != 0 && first_method != BADADDR && get_func(first_method)) {
+                                                    is_vtbl = true;
+                                                }
+                                            }
+                                            qstring sym_name;
+                                            get_name(&sym_name, vtbl_ea);
+                                            std::string sname = sym_name.c_str();
+                                            if (sname.find("vtbl") != std::string::npos ||
+                                                sname.find("vftable") != std::string::npos ||
+                                                sname.find("vtable") != std::string::npos ||
+                                                sname.find("??_7") != std::string::npos) {
                                                 is_vtbl = true;
                                             }
-                                        }
-                                        qstring sym_name;
-                                        get_name(&sym_name, vtbl_ea);
-                                        std::string sname = sym_name.c_str();
-                                        if (sname.find("vtbl") != std::string::npos ||
-                                            sname.find("vftable") != std::string::npos ||
-                                            sname.find("vtable") != std::string::npos ||
-                                            sname.find("??_7") != std::string::npos) {
-                                            is_vtbl = true;
-                                        }
 
-                                        if (is_vtbl) {
-                                            record_access(final_off, inf_is_64bit() ? 8 : 4, tinfo_t(), true, "void**", vtbl_ea);
+                                            if (is_vtbl) {
+                                                record_access(final_off, inf_is_64bit() ? 8 : 4, tinfo_t(), true, "void**", vtbl_ea);
+                                            }
+                                        } else if (r && (r->op == cot_str || (r->op == cot_obj && is_strlit(get_flags(r->obj_ea))))) {
+                                            record_access(final_off, inf_is_64bit() ? 8 : 4, tinfo_t(), true, "const char*");
+                                        } else if (r && (r->op == cot_fnum || r->type.is_floating())) {
+                                            record_access(final_off, sz == 8 ? 8 : 4, tinfo_t(), true, sz == 8 ? "double" : "float");
                                         }
-                                    } else if (r && (r->op == cot_str || (r->op == cot_obj && is_strlit(get_flags(r->obj_ea))))) {
-                                        record_access(final_off, inf_is_64bit() ? 8 : 4, tinfo_t(), true, "const char*");
-                                    } else if (r && (r->op == cot_fnum || r->type.is_floating())) {
-                                        record_access(final_off, sz == 8 ? 8 : 4, tinfo_t(), true, sz == 8 ? "double" : "float");
+                                    }
+                                }
+
+                                // Sniff allocation size: var = operator new(N) or malloc(N)
+                                int64_t target_off = 0;
+                                if (is_target(is_target, e->x, target_off) && target_off == 0) {
+                                    const cexpr_t* rhs_call = e->y;
+                                    while (rhs_call && rhs_call->op == cot_cast) rhs_call = rhs_call->x;
+                                    if (rhs_call && rhs_call->op == cot_call && rhs_call->a) {
+                                        std::string cname = get_cname(rhs_call);
+                                        if (!cname.empty()) {
+                                            std::string lc = cname;
+                                            for (char& c : lc) c = static_cast<char>(std::tolower(c));
+                                            uint64_t alloc_sz = 0;
+                                            if (lc.find("new") != std::string::npos || lc.find("malloc") != std::string::npos) {
+                                                if (!rhs_call->a->empty() && (*rhs_call->a)[0].op == cot_num) {
+                                                    alloc_sz = (*rhs_call->a)[0].numval();
+                                                }
+                                            } else if (lc.find("calloc") != std::string::npos) {
+                                                if (rhs_call->a->size() >= 2 && (*rhs_call->a)[0].op == cot_num && (*rhs_call->a)[1].op == cot_num) {
+                                                    alloc_sz = (*rhs_call->a)[0].numval() * (*rhs_call->a)[1].numval();
+                                                }
+                                            } else if (lc.find("heapalloc") != std::string::npos) {
+                                                if (rhs_call->a->size() >= 3 && (*rhs_call->a)[2].op == cot_num) {
+                                                    alloc_sz = (*rhs_call->a)[2].numval();
+                                                }
+                                            }
+                                            if (alloc_sz > 0 && alloc_sz < 0x200000) {
+                                                total_sz = std::max(total_sz, base_off + alloc_sz);
+                                                total_sz_src = "allocation (" + cname + ")";
+                                            }
+                                        }
                                     }
                                 }
                             }
 
-                            // Sniff allocation size: var = operator new(N) or malloc(N)
-                            int64_t target_off = 0;
-                            if (is_target(is_target, e->x, target_off) && target_off == 0) {
-                                const cexpr_t* rhs_call = e->y;
-                                while (rhs_call && rhs_call->op == cot_cast) rhs_call = rhs_call->x;
-                                if (rhs_call && rhs_call->op == cot_call && rhs_call->a) {
-                                    std::string cname = get_cname(rhs_call);
-                                    if (!cname.empty()) {
-                                        std::string lc = cname;
-                                        for (char& c : lc) c = static_cast<char>(std::tolower(c));
-                                        uint64_t alloc_sz = 0;
-                                        if (lc.find("new") != std::string::npos || lc.find("malloc") != std::string::npos) {
-                                            if (!rhs_call->a->empty() && (*rhs_call->a)[0].op == cot_num) {
-                                                alloc_sz = (*rhs_call->a)[0].numval();
-                                            }
-                                        } else if (lc.find("calloc") != std::string::npos) {
-                                            if (rhs_call->a->size() >= 2 && (*rhs_call->a)[0].op == cot_num && (*rhs_call->a)[1].op == cot_num) {
-                                                alloc_sz = (*rhs_call->a)[0].numval() * (*rhs_call->a)[1].numval();
-                                            }
-                                        } else if (lc.find("heapalloc") != std::string::npos) {
-                                            if (rhs_call->a->size() >= 3 && (*rhs_call->a)[2].op == cot_num) {
-                                                alloc_sz = (*rhs_call->a)[2].numval();
-                                            }
-                                        }
-                                        if (alloc_sz > 0 && alloc_sz < 0x200000) {
-                                            total_sz = std::max(total_sz, base_off + alloc_sz);
-                                            total_sz_src = "allocation (" + cname + ")";
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                            // 6. Sniff memset / memcpy / ZeroMemory
+                            if (e->op == cot_call && e->a) {
+                                std::string call_name = get_cname(e);
+                                if (!call_name.empty()) {
+                                    std::string lc = call_name;
+                                    for (char& c : lc) c = static_cast<char>(std::tolower(c));
 
-                        // 6. Sniff memset / memcpy / ZeroMemory
-                        if (e->op == cot_call && e->a) {
-                            std::string call_name = get_cname(e);
-                            if (!call_name.empty()) {
-                                std::string lc = call_name;
-                                for (char& c : lc) c = static_cast<char>(std::tolower(c));
-
-                                if (lc.find("memset") != std::string::npos ||
-                                    lc.find("memzero") != std::string::npos ||
-                                    lc.find("bzero") != std::string::npos ||
-                                    lc.find("zeromemory") != std::string::npos) {
-                                    if (e->a->size() >= 3) {
-                                        int64_t off = 0;
-                                        if (is_target(is_target, &(*e->a)[0], off)) {
-                                            if ((*e->a)[2].op == cot_num) {
-                                                uint64_t set_sz = (*e->a)[2].numval();
-                                                if (set_sz > 0 && set_sz < 0x200000) {
-                                                    total_sz = std::max(total_sz, static_cast<uint64_t>(base_off + off + set_sz));
-                                                    total_sz_src = "memset";
+                                    if (lc.find("memset") != std::string::npos ||
+                                        lc.find("memzero") != std::string::npos ||
+                                        lc.find("bzero") != std::string::npos ||
+                                        lc.find("zeromemory") != std::string::npos) {
+                                        if (e->a->size() >= 3) {
+                                            int64_t off = 0;
+                                            if (is_target(is_target, &(*e->a)[0], off)) {
+                                                if ((*e->a)[2].op == cot_num) {
+                                                    uint64_t set_sz = (*e->a)[2].numval();
+                                                    if (set_sz > 0 && set_sz < 0x200000) {
+                                                        total_sz = std::max(total_sz, static_cast<uint64_t>(base_off + off + set_sz));
+                                                        total_sz_src = "memset";
+                                                    }
                                                 }
                                             }
                                         }
-                                    }
-                                } else if (lc.find("memcpy") != std::string::npos ||
-                                           lc.find("memmove") != std::string::npos ||
-                                           lc.find("qmemcpy") != std::string::npos) {
-                                    if (e->a->size() >= 3) {
-                                        int64_t off_dst = 0, off_src = 0;
-                                        if (is_target(is_target, &(*e->a)[0], off_dst)) {
-                                            if ((*e->a)[2].op == cot_num) {
-                                                uint64_t cpy_sz = (*e->a)[2].numval();
-                                                if (cpy_sz > 0 && cpy_sz < 0x200000) {
-                                                    total_sz = std::max(total_sz, static_cast<uint64_t>(base_off + off_dst + cpy_sz));
-                                                    total_sz_src = "memcpy";
+                                    } else if (lc.find("memcpy") != std::string::npos ||
+                                               lc.find("memmove") != std::string::npos ||
+                                               lc.find("qmemcpy") != std::string::npos) {
+                                        if (e->a->size() >= 3) {
+                                            int64_t off_dst = 0, off_src = 0;
+                                            if (is_target(is_target, &(*e->a)[0], off_dst)) {
+                                                if ((*e->a)[2].op == cot_num) {
+                                                    uint64_t cpy_sz = (*e->a)[2].numval();
+                                                    if (cpy_sz > 0 && cpy_sz < 0x200000) {
+                                                        total_sz = std::max(total_sz, static_cast<uint64_t>(base_off + off_dst + cpy_sz));
+                                                        total_sz_src = "memcpy";
+                                                    }
                                                 }
-                                            }
-                                        } else if (is_target(is_target, &(*e->a)[1], off_src)) {
-                                            if ((*e->a)[2].op == cot_num) {
-                                                uint64_t cpy_sz = (*e->a)[2].numval();
-                                                if (cpy_sz > 0 && cpy_sz < 0x200000) {
-                                                    total_sz = std::max(total_sz, static_cast<uint64_t>(base_off + off_src + cpy_sz));
-                                                    total_sz_src = "memcpy";
+                                            } else if (is_target(is_target, &(*e->a)[1], off_src)) {
+                                                if ((*e->a)[2].op == cot_num) {
+                                                    uint64_t cpy_sz = (*e->a)[2].numval();
+                                                    if (cpy_sz > 0 && cpy_sz < 0x200000) {
+                                                        total_sz = std::max(total_sz, static_cast<uint64_t>(base_off + off_src + cpy_sz));
+                                                        total_sz_src = "memcpy";
+                                                    }
                                                 }
                                             }
                                         }
                                     }
                                 }
                             }
-                        }
 
-                        // 7. Inter-procedural propagation into called functions
-                        if (e->op == cot_call && e->a && depth < max_d) {
-                            ea_t callee_ea = (e->x && e->x->op == cot_obj) ? e->x->obj_ea : BADADDR;
-                            if (callee_ea != BADADDR) {
-                                func_t* callee_fn = get_func(callee_ea);
-                                if (callee_fn) {
-                                    for (size_t a_idx = 0; a_idx < e->a->size(); ++a_idx) {
-                                        int64_t off = 0;
-                                        if (is_target(is_target, &(*e->a)[a_idx], off)) {
-                                            int64_t next_base = static_cast<int64_t>(base_off) + off;
-                                            if (next_base >= 0) {
-                                                hexrays_failure_t c_hf;
-                                                cfuncptr_t callee_cf = decompile(callee_fn, &c_hf, DECOMP_WARNINGS | DECOMP_NO_WAIT);
-                                                if (callee_cf) {
-                                                    const lvars_t* callee_lvars = callee_cf->get_lvars();
-                                                    if (callee_lvars) {
-                                                        size_t arg_counter = 0;
-                                                        for (size_t k = 0; k < callee_lvars->size(); ++k) {
-                                                            if ((*callee_lvars)[k].is_arg_var()) {
-                                                                if (arg_counter == a_idx) {
-                                                                    recurse_fn(callee_fn, static_cast<int>(k), depth + 1, static_cast<uint64_t>(next_base));
-                                                                    break;
+                            // 7. Inter-procedural propagation into called functions
+                            if (e->op == cot_call && e->a && depth < max_d) {
+                                ea_t callee_ea = (e->x && e->x->op == cot_obj) ? e->x->obj_ea : BADADDR;
+                                if (callee_ea != BADADDR) {
+                                    func_t* callee_fn = get_func(callee_ea);
+                                    if (callee_fn) {
+                                        for (size_t a_idx = 0; a_idx < e->a->size(); ++a_idx) {
+                                            sync::Checkpoint();
+                                            int64_t off = 0;
+                                            if (is_target(is_target, &(*e->a)[a_idx], off)) {
+                                                int64_t next_base = static_cast<int64_t>(base_off) + off;
+                                                if (next_base >= 0) {
+                                                    hexrays_failure_t c_hf;
+                                                    cfuncptr_t callee_cf = decompile(callee_fn, &c_hf, DECOMP_WARNINGS | DECOMP_NO_WAIT);
+                                                    if (callee_cf) {
+                                                        const lvars_t* callee_lvars = callee_cf->get_lvars();
+                                                        if (callee_lvars) {
+                                                            size_t arg_counter = 0;
+                                                            for (size_t k = 0; k < callee_lvars->size(); ++k) {
+                                                                sync::Checkpoint();
+                                                                if ((*callee_lvars)[k].is_arg_var()) {
+                                                                    if (arg_counter == a_idx) {
+                                                                        recurse_fn(callee_fn, static_cast<int>(k), depth + 1, static_cast<uint64_t>(next_base));
+                                                                        break;
+                                                                    }
+                                                                    arg_counter++;
                                                                 }
-                                                                arg_counter++;
                                                             }
                                                         }
                                                     }
@@ -1802,9 +1848,12 @@ namespace tools::types {
                                     }
                                 }
                             }
-                        }
 
-                        return 0;
+                            return 0;
+                        } catch (...) {
+                            sync::SaveCallbackException();
+                            return 1;
+                        }
                     }
                 };
 
@@ -1812,6 +1861,7 @@ namespace tools::types {
                                       observed_fields, current_depth, max_depth, base_offset,
                                       inferred_total_size, inferred_size_source, scan_fn);
                 visitor.apply_to(&local_cf->body, nullptr);
+                sync::Checkpoint();
             };
 
             scan_fn(pfn, target_idx, 0, 0);
@@ -1826,6 +1876,7 @@ namespace tools::types {
 
         // Reconcile overlapping fields: split larger primitives when sub-accesses occur inside them
         for (auto it = observed_fields.begin(); it != observed_fields.end(); ++it) {
+            sync::Checkpoint();
             auto next_it = std::next(it);
             if (next_it != observed_fields.end()) {
                 uint64_t cur_end = it->first + it->second.size;
@@ -1845,6 +1896,7 @@ namespace tools::types {
 
         uint64_t cur_offset = 0;
         for (const auto& [off, field] : observed_fields) {
+            sync::Checkpoint();
             if (off < cur_offset) {
                 // Sub-access inside an already emitted field (e.g. pointer/vftable) - do not duplicate
                 continue;
@@ -1983,6 +2035,7 @@ namespace tools::types {
                     if (fresh_cf) {
                         const strvec_t& sv = fresh_cf->get_pseudocode();
                         for (size_t i = 0; i < sv.size(); ++i) {
+                            sync::Checkpoint();
                             qstring clean;
                             tag_remove(&clean, sv[i].line);
                             updated_decompiled_code += clean.c_str();
@@ -2001,7 +2054,6 @@ namespace tools::types {
         res["struct_name"] = struct_name;
         res["fields_count"] = observed_fields.size();
         res["total_size"] = cur_offset;
-        res["total_size_hex"] = tools::utils::FormatAddress(cur_offset);
         if (!inferred_size_source.empty()) {
             res["size_source"] = inferred_size_source;
         }

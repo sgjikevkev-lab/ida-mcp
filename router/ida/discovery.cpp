@@ -10,7 +10,7 @@
 
 #pragma warning(push, 0)
 #pragma warning(disable: 26819 26495 26812 26451 6001 6011)
-#include "!ibs/json.h"
+#include "shared/json.h"
 #pragma warning(pop)
 
 #include "ipc/pipe_client.h"

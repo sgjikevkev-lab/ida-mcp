@@ -10,7 +10,6 @@ namespace tools::types {
     public:
         ApiTypes() = default;
 
-        bool CanHandle(const std::string& name) const;
         nlohmann::json Dispatch(const nlohmann::json& id, const std::string& name, const nlohmann::json& args);
 
     private:

@@ -1,10 +1,12 @@
 #include "pipe_client.h"
 #include <vector>
 #include <algorithm>
+#include "shared/pipe_io.h"
 
 namespace ipc {
     PipeClient::~PipeClient() {
         Disconnect();
+        if (stop_event_) CloseHandle(stop_event_);
     }
 
     void PipeClient::Disconnect() {
@@ -21,6 +23,7 @@ namespace ipc {
             return true;
         }
         Disconnect();
+        if (!stop_event_ || WaitForSingleObject(stop_event_, 0) == WAIT_OBJECT_0) return false;
 
         DWORD start_time = GetTickCount();
         while (true) {
@@ -69,119 +72,38 @@ namespace ipc {
     }
 
     bool PipeClient::Transact(const std::string& request_json, std::string& out_response, DWORD timeout_ms) {
-        if (!IsConnected()) return false;
-
+        last_error_ = ERROR_SUCCESS;
+        if (!IsConnected()) { last_error_ = ERROR_PIPE_NOT_CONNECTED; return false; }
+        const ULONGLONG deadline = GetTickCount64() + timeout_ms;
         std::string payload = request_json;
-        if (payload.empty() || payload.back() != '\n') {
-            payload.push_back('\n');
-        }
-
-        // Overlapped Write
-        OVERLAPPED ov_write{};
-        ov_write.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (!ov_write.hEvent) return false;
-
-        DWORD written = 0;
-        BOOL write_ok = WriteFile(hPipe_, payload.data(), static_cast<DWORD>(payload.size()), &written, &ov_write);
-        if (!write_ok) {
-            DWORD err = GetLastError();
-            if (err == ERROR_IO_PENDING) {
-                DWORD wait_res = WaitForSingleObject(ov_write.hEvent, timeout_ms);
-                if (wait_res != WAIT_OBJECT_0) {
-                    CancelIo(hPipe_);
-                    CloseHandle(ov_write.hEvent);
-                    Disconnect();
-                    return false;
-                }
-                GetOverlappedResult(hPipe_, &ov_write, &written, FALSE);
-            } else {
-                CloseHandle(ov_write.hEvent);
-                Disconnect();
-                return false;
-            }
-        }
-        CloseHandle(ov_write.hEvent);
-
-        // Check if leftover_ already has a complete line
-        size_t existing_nl = leftover_.find('\n');
-        if (existing_nl != std::string::npos) {
-            out_response = leftover_.substr(0, existing_nl);
-            leftover_.erase(0, existing_nl + 1);
-            while (!out_response.empty() && (out_response.back() == '\r' || out_response.back() == ' ')) {
-                out_response.pop_back();
-            }
-            return true;
-        }
-
-        // Overlapped Read until newline in leftover_
-        out_response.clear();
-        char buf[8192];
-
-        OVERLAPPED ov_read{};
-        ov_read.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (!ov_read.hEvent) return false;
-
-        DWORD start_time = GetTickCount();
-
+        if (payload.empty() || payload.back() != '\n') payload += '\n';
+        auto fail = [&] {
+            last_error_ = GetLastError();
+            Disconnect();
+            return false;
+        };
+        if (payload.size() > mcp::limits::frame_bytes) { SetLastError(ERROR_BUFFER_OVERFLOW); return fail(); }
+        if (!WriteFrame(hPipe_, payload, deadline, stop_event_)) return fail();
         while (true) {
-            DWORD elapsed = GetTickCount() - start_time;
-            if (elapsed >= timeout_ms) {
-                CancelIo(hPipe_);
-                CloseHandle(ov_read.hEvent);
-                Disconnect();
-                return false;
+            size_t newline = leftover_.find('\n');
+            if (newline != std::string::npos) {
+                out_response = leftover_.substr(0, newline);
+                leftover_.erase(0, newline + 1);
+                return true;
             }
-            DWORD remaining_time = timeout_ms - elapsed;
-
-            ResetEvent(ov_read.hEvent);
-            DWORD bytes_read = 0;
-            BOOL read_ok = ReadFile(hPipe_, buf, sizeof(buf), &bytes_read, &ov_read);
-
-            if (!read_ok) {
-                DWORD err = GetLastError();
-                if (err == ERROR_IO_PENDING) {
-                    DWORD wait_res = WaitForSingleObject(ov_read.hEvent, remaining_time);
-                    if (wait_res != WAIT_OBJECT_0) {
-                        CancelIo(hPipe_);
-                        CloseHandle(ov_read.hEvent);
-                        Disconnect();
-                        return false;
-                    }
-                    if (!GetOverlappedResult(hPipe_, &ov_read, &bytes_read, FALSE)) {
-                        CloseHandle(ov_read.hEvent);
-                        Disconnect();
-                        return false;
-                    }
-                } else {
-                    // Pipe broken (IDA crashed or disconnected)
-                    CloseHandle(ov_read.hEvent);
-                    Disconnect();
-                    return false;
-                }
-            }
-
-            if (bytes_read == 0) {
-                // EOF / pipe closed
-                CloseHandle(ov_read.hEvent);
-                Disconnect();
-                return false;
-            }
-
-            leftover_.append(buf, bytes_read);
-
-            size_t nl = leftover_.find('\n');
-            if (nl != std::string::npos) {
-                out_response = leftover_.substr(0, nl);
-                leftover_.erase(0, nl + 1);
-                while (!out_response.empty() && (out_response.back() == '\r' || out_response.back() == ' ')) {
-                    out_response.pop_back();
-                }
-                break;
-            }
+            char buffer[8192];
+            DWORD count = 0;
+            if (!Transfer(hPipe_, false, buffer, sizeof(buffer), count, deadline, stop_event_)) return fail();
+            if (!count) { SetLastError(ERROR_BROKEN_PIPE); return fail(); }
+            leftover_.append(buffer, count);
+            if (leftover_.size() > mcp::limits::frame_bytes) { SetLastError(ERROR_BUFFER_OVERFLOW); return fail(); }
         }
+    }
 
-        CloseHandle(ov_read.hEvent);
-        return true;
+    bool PipeClient::NotifyOnce(const std::wstring& pipe_name, const std::string& request_json) {
+        PipeClient client;
+        if (!client.Connect(pipe_name, 500)) return false;
+        return WriteFrame(client.hPipe_, request_json + "\n", GetTickCount64() + 500);
     }
 
     bool PipeClient::CallOnce(
