@@ -6,7 +6,7 @@ Original ida-mcp code is licensed under MIT; third-party components remain
 under their own terms. See [LICENSE](LICENSE) and [NOTICE](NOTICE.md),
 especially for the IDA SDK and statically linked RAX dependency.
 
-The current unreleased development version is **2.2.0**. It adds isolated x86-64 function emulation through the bundled RAX engine alongside machine-level register flow. The plugin targets Windows x64 and the bundled **IDA Pro 9.2 SDK**. Other IDA versions require separate compatibility work.
+The current release is **2.2.0**. It adds isolated x86-64 function emulation through the bundled RAX engine alongside machine-level register flow. The plugin targets Windows x64 and the bundled **IDA Pro 9.2 SDK**. Other IDA versions require separate compatibility work.
 
 ## Model interface
 
