@@ -156,7 +156,7 @@ class RouterTests(unittest.TestCase):
 
     def test_initialize_reports_release_version(self):
         response = self.request('initialize', {'protocolVersion': '2025-06-18'})
-        self.assertEqual(response['result']['serverInfo']['version'], '2.0.0')
+        self.assertEqual(response['result']['serverInfo']['version'], '2.1.0')
 
     def select_fixture(self):
         response = self.tool('switch_file', {'filename': self.backend.binary})

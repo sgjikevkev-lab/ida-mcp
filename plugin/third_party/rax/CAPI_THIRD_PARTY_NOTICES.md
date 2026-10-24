@@ -61,10 +61,11 @@ crate.
 | `linux-aarch64/`, `linux-armv6/`, `linux-x86_64/`, `initrd.cpio.gz`, `initrd_root/` | Linux and BusyBox guest fixtures retain their upstream terms. |
 | `tests/generated/` | Source and generator records are in `tests/generated/manifest.toml`. |
 
-GPL-2.0 and LGPL-2.1 license texts are in `LICENSES/`. Rust and native
-dependencies carry their own notices with their source distributions.
+GPL-2.0, LGPL-2.1, and MIT-arm-js license texts are retained in the adjacent
+`licenses/` directory. Rust and native dependencies carry their own notices
+with their source distributions.
 
 The vendored `vm-memory` 0.17.1 source in `vendor/vm-memory/` is
-Apache-2.0 OR BSD-3-Clause. Both upstream license texts and the original
-file notices are retained there. `UPSTREAM.json` records the exact upstream
+Apache-2.0 OR BSD-3-Clause. Both upstream license texts are retained in the
+adjacent `licenses/` directory. `UPSTREAM.json` records the exact upstream
 commit and pre-patch source hashes; `RAX-PATCHES.md` describes local changes.
