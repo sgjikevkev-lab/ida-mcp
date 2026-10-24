@@ -20,8 +20,17 @@ extern "C" __declspec(dllexport) __declspec(noinline) int mcp_fixture_xor_accumu
     value ^= 0x55;
     return value;
 }
+extern "C" __declspec(dllexport) __declspec(noinline) int mcp_fixture_loop(int limit, int seed) {
+    int value = seed;
+    for (int i = 0; i < limit; ++i) value += (i ^ seed);
+    return value;
+}
 extern "C" __declspec(dllexport) int mcp_fixture_global = 7;
 extern "C" __declspec(dllexport) int* mcp_fixture_global_ptr = &mcp_fixture_global;
+extern "C" __declspec(dllexport) __declspec(noinline) int mcp_fixture_set_global(int value) {
+    mcp_fixture_global = value;
+    return value;
+}
 extern "C" __declspec(dllexport) __declspec(noinline) int mcp_fixture_read_global() {
     return mcp_fixture_global;
 }
@@ -46,6 +55,20 @@ extern "C" __declspec(dllexport) __declspec(noinline) int mcp_fixture_call(int v
 extern "C" __declspec(dllexport) __declspec(noinline) int mcp_fixture_outer(int value) {
     volatile int result = mcp_fixture_call(value);
     return result + 1;
+}
+extern "C" __declspec(dllexport) __declspec(noinline) int mcp_fixture_mutate_buffer(unsigned char* bytes, int delta) {
+    if (!bytes) return -1;
+    bytes[0] = static_cast<unsigned char>(bytes[0] + delta);
+    return bytes[0];
+}
+extern "C" __declspec(dllexport) __declspec(noinline) double mcp_fixture_double(double value) {
+    return value * 2.0;
+}
+extern "C" __declspec(dllexport) __declspec(noinline) int mcp_fixture_stub_target(int value) {
+    return value * 2;
+}
+extern "C" __declspec(dllexport) __declspec(noinline) int mcp_fixture_stub_caller(int value) {
+    return mcp_fixture_stub_target(value) + 1;
 }
 class MCPFixtureBase {
 public:

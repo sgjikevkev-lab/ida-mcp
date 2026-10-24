@@ -156,7 +156,7 @@ class RouterTests(unittest.TestCase):
 
     def test_initialize_reports_release_version(self):
         response = self.request('initialize', {'protocolVersion': '2025-06-18'})
-        self.assertEqual(response['result']['serverInfo']['version'], '2.1.0')
+        self.assertEqual(response['result']['serverInfo']['version'], '2.2.0')
 
     def select_fixture(self):
         response = self.tool('switch_file', {'filename': self.backend.binary})
@@ -164,7 +164,8 @@ class RouterTests(unittest.TestCase):
 
     def test_catalog_and_invalid_arguments_do_not_require_ida(self):
         result = self.request('tools/list')['result']
-        self.assertEqual(len(result['tools']), 33)
+        self.assertEqual(len(result['tools']), 34)
+        self.assertIn('emulate_function', {tool['name'] for tool in result['tools']})
         for name, arguments in [('get_bytes', {'addr': 'main', 'size': -1}),
                                 ('decompile', {}), ('py', {'code': '1', 'timeout': 1}),
                                 ('get_available_files', {'unused': True}),

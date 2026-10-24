@@ -2,7 +2,11 @@
 
 A native C++ MCP router and IDA Pro plugin for language-model agents. This repository is independent of Hex-Rays IDA Assist.
 
-The current release is **2.1.0**. It adds statically integrated RAX instruction analysis, compact function semantics, and machine-level register flow. The plugin targets Windows x64 and the bundled **IDA Pro 9.2 SDK**. Other IDA versions require separate compatibility work.
+Original ida-mcp code is licensed under MIT; third-party components remain
+under their own terms. See [LICENSE](LICENSE) and [NOTICE](NOTICE.md),
+especially for the IDA SDK and statically linked RAX dependency.
+
+The current unreleased development version is **2.2.0**. It adds isolated x86-64 function emulation through the bundled RAX engine alongside machine-level register flow. The plugin targets Windows x64 and the bundled **IDA Pro 9.2 SDK**. Other IDA versions require separate compatibility work.
 
 ## Model interface
 
@@ -95,9 +99,12 @@ The router discovers plugin pipes. If several databases are open, call `get_avai
 | `refactor` | Rename, retype and comment symbols or variables |
 | `make_signature` | Generate wildcard signatures |
 | `trace_data_flow` | Bounded interprocedural variable/data-flow analysis |
+| `emulate_function` | Call an x86-64 function in a private guest with arguments, optional buffers and explicit external-call stubs |
 | `py` | Run code or a script file with bounded stdout/stderr capture |
 
-RAX is available where its machine-level view removes work for the model: `disasm` and `insn_query` can return per-instruction effects, `analyze_function` can add a compact aggregate with `semantic_summary: true`, and `trace_data_flow` supports bounded x86-64 register def-use across CFG blocks with `machine_level: true`. Partial/unsupported lifts and machine-trace boundaries are reported; the machine trace does not model memory aliases, control dependencies, or calls. See [RAX integration notes](plugin/third_party/rax/README.md).
+RAX is available where its machine-level view removes work for the model: `disasm` and `insn_query` can return per-instruction effects, `analyze_function` can add a compact aggregate with `semantic_summary: true`, and `trace_data_flow` supports bounded x86-64 register and exact-memory def-use across CFG blocks with `machine_level: true`. It tracks register slices, direct absolute or stable stack-slot aliases, and common x64 callee-saved registers across unknown calls; computed-pointer aliases and control dependencies remain outside the model. Unsupported effects and discarded state are reported. See [RAX integration notes](plugin/third_party/rax/README.md).
+
+`emulate_function` runs a function in a private x86-64 user-mode guest using the Windows x64 ABI. It copies IDB segments into guest memory, defaults to 100,000 instructions, 5 seconds and 64 MiB of guest memory; hard caps are 5,000,000 instructions, 30 minutes and 256 MiB. Integer, floating-point, address and buffer arguments are supported; optional call stubs can provide a return value and bounded memory writes. Results contain only the return/stop summary and observed changed memory or buffers. Guest writes never modify the IDB. Unstubbed external calls and syscalls stop with a guest fault; the tool does not claim that one emulated path proves all function behavior.
 
 The tool catalog supplies exact arguments, bounds and descriptions. Analytical heuristics and traversal limits are not proofs of exhaustive behavior.
 

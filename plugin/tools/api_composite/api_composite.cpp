@@ -7,8 +7,13 @@
 #include <queue>
 #include <charconv>
 #include <array>
+#include <bitset>
 #include <cctype>
+#include <cstdlib>
 #include <deque>
+#include <limits>
+#include <map>
+#include <tuple>
 
 #pragma warning(push, 0)
 #include "json.h"
@@ -156,6 +161,8 @@ namespace tools::composite {
             if (name == "rflags" || name == "eflags" || name == "flags" ||
                 name == "rip" || name == "eip")
                 return name == "rip" || name == "eip" ? "rip" : "flags";
+            static constexpr std::array<const char*, 7> flag_names = {"cf", "zf", "sf", "of", "pf", "af", "df"};
+            if (std::find(flag_names.begin(), flag_names.end(), name) != flag_names.end()) return name;
             static const std::map<std::string, std::string> aliases = {
                 {"rax", "rax"}, {"eax", "rax"}, {"ax", "rax"}, {"al", "rax"}, {"ah", "rax"},
                 {"rcx", "rcx"}, {"ecx", "rcx"}, {"cx", "rcx"}, {"cl", "rcx"}, {"ch", "rcx"},
@@ -177,7 +184,7 @@ namespace tools::composite {
                     try { index = std::stoi(name.substr(1, digits_end - 1)); }
                     catch (...) { return {}; }
                     const std::string suffix = name.substr(digits_end);
-                    if (index >= 8 && index <= 31 &&
+                    if (index >= 8 && index <= 15 &&
                         (suffix.empty() || suffix == "d" || suffix == "w" || suffix == "b"))
                         return "r" + std::to_string(index);
                 }
@@ -187,27 +194,256 @@ namespace tools::composite {
                 if (std::all_of(name.begin() + digits_start, name.end(), [](unsigned char c) { return std::isdigit(c); })) {
                     try {
                         const int index = std::stoi(name.substr(digits_start));
-                        if (index >= 0 && index <= 31) return "vec" + std::to_string(index);
+                        if (index >= 0 && index <= 31) return name.substr(0, 3) + std::to_string(index);
                     } catch (...) {
                         return {};
                     }
                 }
             }
+            if (name.size() == 2 && name[0] == 'k' && name[1] >= '0' && name[1] <= '7') return name;
+            if (name.size() == 3 && name.rfind("mm", 0) == 0 && name[2] >= '0' && name[2] <= '7') return name;
+            if (name == "es" || name == "cs" || name == "ss" || name == "ds" || name == "fs" || name == "gs") return name;
+            if (name.size() == 3 && name.rfind("cr", 0) == 0 && name[2] >= '0' && name[2] <= '8') return name;
             return {};
+        }
+
+        constexpr size_t kMachineRegisterBits = 512;
+        using MachineRegisterBits = std::bitset<kMachineRegisterBits>;
+
+        struct RegisterSlice {
+            std::string family;
+            size_t offset = 0;
+            size_t width = 0;
+        };
+
+        using RegisterState = std::map<std::string, MachineRegisterBits>;
+
+        struct MemoryLocation {
+            std::string space;
+            int64_t offset = 0;
+            size_t size = 0;
+
+            bool operator<(const MemoryLocation& other) const {
+                return std::tie(space, offset, size) < std::tie(other.space, other.offset, other.size);
+            }
+            bool operator==(const MemoryLocation& other) const {
+                return space == other.space && offset == other.offset && size == other.size;
+            }
+        };
+
+        struct MemoryAccess {
+            MemoryLocation location;
+            bool reads = false;
+            bool writes = false;
+            bool trackable = false;
+        };
+
+        using MemoryState = std::set<MemoryLocation>;
+
+        int64_t MemoryEnd(const MemoryLocation& location) {
+            const int64_t max_value = std::numeric_limits<int64_t>::max();
+            if (location.size > static_cast<size_t>(max_value)) return max_value;
+            const int64_t size = static_cast<int64_t>(location.size);
+            return location.offset > max_value - size ? max_value : location.offset + size;
+        }
+
+        bool MemoryOverlaps(const MemoryLocation& left, const MemoryLocation& right) {
+            if (left.space != right.space || left.size == 0 || right.size == 0) return false;
+            const int64_t left_end = MemoryEnd(left);
+            const int64_t right_end = MemoryEnd(right);
+            return left.offset < right_end && right.offset < left_end;
+        }
+
+        bool MemoryIntersects(const MemoryState& state, const MemoryLocation& location) {
+            return std::any_of(state.begin(), state.end(), [&](const MemoryLocation& item) {
+                return MemoryOverlaps(item, location);
+            });
+        }
+
+        void KillMemoryAliases(MemoryState& state, const MemoryLocation& location) {
+            std::vector<MemoryLocation> residual;
+            for (auto it = state.begin(); it != state.end();) {
+                if (!MemoryOverlaps(*it, location)) {
+                    ++it;
+                    continue;
+                }
+                const int64_t old_end = MemoryEnd(*it);
+                const int64_t write_end = MemoryEnd(location);
+                const int64_t overlap_begin = std::max(it->offset, location.offset);
+                const int64_t overlap_end = std::min(old_end, write_end);
+                if (it->offset < overlap_begin)
+                    residual.push_back({it->space, it->offset, static_cast<size_t>(overlap_begin - it->offset)});
+                if (overlap_end < old_end)
+                    residual.push_back({it->space, overlap_end, static_cast<size_t>(old_end - overlap_end)});
+                it = state.erase(it);
+            }
+            state.insert(residual.begin(), residual.end());
+        }
+
+        void MergeMemoryState(MemoryState& destination, const MemoryState& source) {
+            destination.insert(source.begin(), source.end());
+        }
+
+        bool ParseRegisterSlice(const std::string& input, uint32_t width_hint, bool writing,
+                                RegisterSlice& slice) {
+            std::string name = input;
+            std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            static const std::map<std::string, std::tuple<std::string, size_t, size_t>> gpr = {
+                {"rax", {"rax", 0, 64}}, {"eax", {"rax", 0, 32}}, {"ax", {"rax", 0, 16}}, {"al", {"rax", 0, 8}}, {"ah", {"rax", 8, 8}},
+                {"rcx", {"rcx", 0, 64}}, {"ecx", {"rcx", 0, 32}}, {"cx", {"rcx", 0, 16}}, {"cl", {"rcx", 0, 8}}, {"ch", {"rcx", 8, 8}},
+                {"rdx", {"rdx", 0, 64}}, {"edx", {"rdx", 0, 32}}, {"dx", {"rdx", 0, 16}}, {"dl", {"rdx", 0, 8}}, {"dh", {"rdx", 8, 8}},
+                {"rbx", {"rbx", 0, 64}}, {"ebx", {"rbx", 0, 32}}, {"bx", {"rbx", 0, 16}}, {"bl", {"rbx", 0, 8}}, {"bh", {"rbx", 8, 8}},
+                {"rsp", {"rsp", 0, 64}}, {"esp", {"rsp", 0, 32}}, {"sp", {"rsp", 0, 16}}, {"spl", {"rsp", 0, 8}},
+                {"rbp", {"rbp", 0, 64}}, {"ebp", {"rbp", 0, 32}}, {"bp", {"rbp", 0, 16}}, {"bpl", {"rbp", 0, 8}},
+                {"rsi", {"rsi", 0, 64}}, {"esi", {"rsi", 0, 32}}, {"si", {"rsi", 0, 16}}, {"sil", {"rsi", 0, 8}},
+                {"rdi", {"rdi", 0, 64}}, {"edi", {"rdi", 0, 32}}, {"di", {"rdi", 0, 16}}, {"dil", {"rdi", 0, 8}}
+            };
+            auto found = gpr.find(name);
+            if (found != gpr.end()) {
+                std::tie(slice.family, slice.offset, slice.width) = found->second;
+            } else if (name.size() >= 2 && name[0] == 'r') {
+                size_t digits_end = 1;
+                while (digits_end < name.size() && std::isdigit(static_cast<unsigned char>(name[digits_end]))) ++digits_end;
+                if (digits_end == 1) return false;
+                int index = -1;
+                try { index = std::stoi(name.substr(1, digits_end - 1)); }
+                catch (...) { return false; }
+                if (index < 8 || index > 15) return false;
+                const std::string suffix = name.substr(digits_end);
+                size_t width = 64;
+                if (suffix == "d") width = 32;
+                else if (suffix == "w") width = 16;
+                else if (suffix == "b") width = 8;
+                else if (!suffix.empty()) return false;
+                slice.family = "r" + std::to_string(index);
+                slice.offset = 0;
+                slice.width = width;
+            } else if (name == "rip" || name == "eip") {
+                slice = {"rip", 0, name == "eip" ? 32u : 64u};
+            } else if (name == "rflags" || name == "eflags" || name == "flags") {
+                slice = {"flags", 0, 7};
+            } else if (name.size() >= 4 && (name.rfind("xmm", 0) == 0 || name.rfind("ymm", 0) == 0 || name.rfind("zmm", 0) == 0)) {
+                const int index = std::atoi(name.c_str() + 3);
+                if (index < 0 || index > 31) return false;
+                slice.family = "vec" + std::to_string(index);
+                slice.offset = 0;
+                slice.width = name.rfind("xmm", 0) == 0 ? 128 : name.rfind("ymm", 0) == 0 ? 256 : 512;
+            } else if (name.size() == 2 && name[0] == 'k' && name[1] >= '0' && name[1] <= '7') {
+                slice = {name, 0, 64};
+            } else if (name.size() == 3 && name.rfind("mm", 0) == 0 && name[2] >= '0' && name[2] <= '7') {
+                slice = {name, 0, 64};
+            } else if (name == "es" || name == "cs" || name == "ss" || name == "ds" || name == "fs" || name == "gs") {
+                slice = {name, 0, 16};
+            } else if (name.size() == 3 && name.rfind("cr", 0) == 0 && name[2] >= '0' && name[2] <= '8') {
+                slice = {name, 0, 64};
+            } else if (name.size() == 7 && name.rfind("flag_", 0) == 0) {
+                slice = {name, 0, 1};
+            } else {
+                return false;
+            }
+
+            if (width_hint != 0 && slice.family != "flags") slice.width = std::min<size_t>(width_hint, kMachineRegisterBits - slice.offset);
+            // In 64-bit mode, a 32-bit GPR destination clears the architectural upper half.
+            if (writing && slice.offset == 0 && slice.width == 32 &&
+                (slice.family == "rax" || slice.family == "rcx" || slice.family == "rdx" || slice.family == "rbx" ||
+                 slice.family == "rsp" || slice.family == "rbp" || slice.family == "rsi" || slice.family == "rdi" ||
+                 (slice.family.size() >= 2 && slice.family[0] == 'r' && slice.family[1] >= '8' && slice.family[1] <= '9') ||
+                 (slice.family.size() == 3 && slice.family[0] == 'r' && slice.family[1] == '1' && slice.family[2] >= '0' && slice.family[2] <= '5'))) {
+                slice.width = 64;
+            }
+            return slice.width != 0 && slice.offset + slice.width <= kMachineRegisterBits;
+        }
+
+        std::vector<RegisterSlice> ParseRegisterSlices(const std::string& name, uint32_t width_hint = 0,
+                                                       bool writing = false) {
+            std::vector<RegisterSlice> result;
+            std::string lowered = name;
+            std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            static constexpr std::array<const char*, 7> flags = {"cf", "zf", "sf", "of", "pf", "af", "df"};
+            if (lowered == "flags" || lowered == "eflags" || lowered == "rflags") {
+                for (const char* flag : flags) result.push_back({"flag_" + std::string(flag), 0, 1});
+                return result;
+            }
+            for (const char* flag : flags) {
+                if (lowered == flag || lowered == "flag_" + std::string(flag)) {
+                    result.push_back({"flag_" + std::string(flag), 0, 1});
+                    return result;
+                }
+            }
+            RegisterSlice slice;
+            if (ParseRegisterSlice(lowered, width_hint, writing, slice)) result.push_back(std::move(slice));
+            return result;
+        }
+
+        bool SliceIntersects(const RegisterState& state, const RegisterSlice& slice) {
+            auto found = state.find(slice.family);
+            if (found == state.end()) return false;
+            for (size_t bit = slice.offset; bit < slice.offset + slice.width; ++bit)
+                if (found->second.test(bit)) return true;
+            return false;
+        }
+
+        void AddSlice(RegisterState& state, const RegisterSlice& slice) {
+            auto& bits = state[slice.family];
+            for (size_t bit = slice.offset; bit < slice.offset + slice.width; ++bit) bits.set(bit);
+        }
+
+        void KillSlice(RegisterState& state, const RegisterSlice& slice) {
+            auto found = state.find(slice.family);
+            if (found == state.end()) return;
+            for (size_t bit = slice.offset; bit < slice.offset + slice.width; ++bit) found->second.reset(bit);
+            if (found->second.none()) state.erase(found);
+        }
+
+        void MergeState(RegisterState& destination, const RegisterState& source) {
+            for (const auto& [family, bits] : source) destination[family] |= bits;
+        }
+
+        bool IsCommonX64Nonvolatile(const std::string& family) {
+            return family == "rbx" || family == "rbp" || family == "rsp" ||
+                family == "r12" || family == "r13" || family == "r14" || family == "r15";
+        }
+
+        bool KeepCommonX64Nonvolatile(RegisterState& state) {
+            bool dropped = false;
+            for (auto it = state.begin(); it != state.end();) {
+                if (!IsCommonX64Nonvolatile(it->first)) {
+                    it = state.erase(it);
+                    dropped = true;
+                } else {
+                    ++it;
+                }
+            }
+            return dropped;
         }
 
         struct MachineInstruction {
             ea_t address = BADADDR;
+            std::string mnemonic;
             std::string control_flow = "unknown";
             bool complete = false;
             std::set<std::string> reads;
             std::set<std::string> writes;
+            std::vector<RegisterSlice> read_slices;
+            std::vector<RegisterSlice> write_slices;
+            std::vector<MemoryAccess> memory_accesses;
             nlohmann::json memory = nlohmann::json::array();
         };
 
         MachineInstruction AnalyzeMachineInstruction(ea_t ea) {
             MachineInstruction result;
             result.address = ea;
+            qstring mnemonic;
+            if (print_insn_mnem(&mnemonic, ea)) {
+                result.mnemonic = mnemonic.c_str();
+                std::transform(result.mnemonic.begin(), result.mnemonic.end(), result.mnemonic.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+            }
             const size_t item_size = get_item_size(ea);
             segment_t* segment = getseg(ea);
             if (!is_code(get_full_flags(ea)) || item_size == 0 || item_size > 15 || !segment ||
@@ -226,18 +462,24 @@ namespace tools::composite {
                  semantics["size"].get<size_t>() == item_size);
             if (!result.complete) return result;
 
-            auto add_read = [&](const std::string& reg) {
-                const std::string canonical = CanonicalX64Register(reg);
-                if (!canonical.empty()) result.reads.insert(canonical);
-            };
-            auto add_write = [&](const std::string& reg) {
-                const std::string canonical = CanonicalX64Register(reg);
-                if (!canonical.empty()) result.writes.insert(canonical);
+            bool register_model_complete = true;
+            auto add_access = [&](const std::string& reg, uint32_t width, bool writing) {
+                const auto slices = ParseRegisterSlices(reg, width, writing);
+                if (slices.empty()) {
+                    register_model_complete = false;
+                    return;
+                }
+                for (const auto& slice : slices) {
+                    const std::string display = slice.family.rfind("flag_", 0) == 0
+                        ? slice.family.substr(5) : slice.family;
+                    (writing ? result.writes : result.reads).insert(display);
+                    (writing ? result.write_slices : result.read_slices).push_back(slice);
+                }
             };
             for (const auto& flag : semantics.value("flags_read", nlohmann::ordered_json::array()))
-                if (flag.is_string()) add_read("flags");
+                if (flag.is_string()) add_access(flag.get<std::string>(), 1, false);
             for (const auto& flag : semantics.value("flags_written", nlohmann::ordered_json::array()))
-                if (flag.is_string()) add_write("flags");
+                if (flag.is_string()) add_access(flag.get<std::string>(), 1, true);
             if (semantics.contains("effects") && semantics["effects"].is_array()) {
                 for (const auto& effect : semantics["effects"]) {
                     const std::string kind = effect.value("kind", std::string());
@@ -247,22 +489,149 @@ namespace tools::composite {
                         std::find(effect["access"].begin(), effect["access"].end(), "write") != effect["access"].end();
                     if (kind == "register" && effect.contains("register") && effect["register"].is_string()) {
                         const std::string reg = effect["register"].get<std::string>();
-                        if (reads) add_read(reg);
-                        if (writes) add_write(reg);
+                        const bool is_flags = reg == "flags" || reg == "eflags" || reg == "rflags";
+                        if (reads && !is_flags) add_access(reg, effect.value("width_bits", 0u), false);
+                        if (writes && !is_flags) add_access(reg, effect.value("width_bits", 0u), true);
+                        if ((reads || writes) && is_flags &&
+                            semantics.value("flags_read", nlohmann::ordered_json::array()).empty() &&
+                            semantics.value("flags_written", nlohmann::ordered_json::array()).empty())
+                            add_access("flags", 0, writes);
                         if (effect.contains("source_register") && effect["source_register"].is_string())
-                            add_read(effect["source_register"].get<std::string>());
+                            add_access(effect["source_register"].get<std::string>(), 0, false);
                     } else if (kind == "memory") {
-                        if (reads || writes) result.memory.push_back(effect);
+                        if (reads || writes) {
+                            result.memory.push_back(effect);
+                            MemoryAccess access;
+                            access.reads = reads;
+                            access.writes = writes;
+                            const uint32_t width_bits = effect.value("width_bits", 0u);
+                            access.location.size = (static_cast<size_t>(width_bits) + 7) / 8;
+                            const auto address = effect.value("address", nlohmann::ordered_json::object());
+                            if (address.is_object() && address.contains("resolved") && address["resolved"].is_string()) {
+                                try {
+                                    access.location.space = "absolute";
+                                    access.location.offset = static_cast<int64_t>(std::stoull(address["resolved"].get<std::string>(), nullptr, 0));
+                                } catch (...) {
+                                    access.location.space.clear();
+                                }
+                            } else if (address.is_object() && address.value("kind", std::string()) == "base_disp" &&
+                                address.contains("base") && address["base"].is_string() &&
+                                !address.contains("index") && width_bits != 0) {
+                                const std::string base = address["base"].get<std::string>();
+                                if (base == "rbp" || base == "rsp") {
+                                    access.location.space = "stack_" + base;
+                                    access.location.offset = address.value("displacement", int64_t{0});
+                                }
+                            }
+                            access.trackable = !access.location.space.empty() && access.location.size != 0;
+                            if (result.control_flow != "call" && result.control_flow != "indirect_call" &&
+                                result.control_flow != "return")
+                                result.memory_accesses.push_back(std::move(access));
+                        }
                         if (effect.contains("address") && effect["address"].is_object()) {
                             for (const char* field : {"base", "index"})
                                 if (effect["address"].contains(field) && effect["address"][field].is_string())
-                                    add_read(effect["address"][field].get<std::string>());
+                                    add_access(effect["address"][field].get<std::string>(), 0, false);
                         }
                         if (effect.contains("source_register") && effect["source_register"].is_string())
-                            add_read(effect["source_register"].get<std::string>());
+                            add_access(effect["source_register"].get<std::string>(), effect.value("width_bits", 0u), false);
                     }
                 }
             }
+
+            // RAX intentionally normalizes some partial x86 register writes to the
+            // enclosing register (for example `mov ah, 1` may appear as RAX read/write).
+            // Restore explicit operand slices from IDA's decoded instruction so those
+            // implementation-level merge effects do not become false dependencies.
+            insn_t decoded_insn;
+            processor_t* processor = get_ph();
+            if (decode_insn(&decoded_insn, ea) <= 0 || !processor) {
+                register_model_complete = false;
+            } else {
+                const uint32_t feature = decoded_insn.get_canon_feature(*processor);
+                std::set<std::string> replace_reads;
+                std::set<std::string> replace_writes;
+                std::vector<RegisterSlice> explicit_reads;
+                std::vector<RegisterSlice> explicit_writes;
+                auto operand_width_bits = [](op_dtype_t dtype) -> uint32_t {
+                    switch (dtype) {
+                        case dt_byte: case dt_half: return 8;
+                        case dt_word: return 16;
+                        case dt_dword: case dt_float: return 32;
+                        case dt_qword: case dt_double: case dt_code: return 64;
+                        case dt_byte16: return 128;
+                        case dt_byte32: return 256;
+                        case dt_byte64: return 512;
+                        case dt_fword: return 48;
+                        default: return 0;
+                    }
+                };
+                for (uint operand_index = 0; operand_index < UA_MAXOP; ++operand_index) {
+                    const op_t& operand = decoded_insn.ops[operand_index];
+                    if (operand.type == o_void) break;
+                    if (operand.type != o_reg) continue;
+                    const bool reads = has_cf_use(feature, operand_index);
+                    const bool writes = has_cf_chg(feature, operand_index);
+                    if (!reads && !writes) continue;
+                    qstring operand_register;
+                    const uint32_t width_bits = operand_width_bits(operand.dtype);
+                    const size_t width_bytes = width_bits == 0 ? 8 : (width_bits + 7) / 8;
+                    if (get_reg_name(&operand_register, operand.reg, width_bytes) <= 0) {
+                        register_model_complete = false;
+                        continue;
+                    }
+                    auto slices = ParseRegisterSlices(operand_register.c_str(), width_bits, writes);
+                    if (slices.empty()) {
+                        register_model_complete = false;
+                        continue;
+                    }
+                    for (const auto& slice : slices) {
+                        if (reads) {
+                            replace_reads.insert(slice.family);
+                            explicit_reads.push_back(slice);
+                        }
+                        if (writes) {
+                            // A read of the written parent register without an explicit
+                            // operand read is often just RAX's partial-register merge.
+                            replace_reads.insert(slice.family);
+                            replace_writes.insert(slice.family);
+                            explicit_writes.push_back(slice);
+                        }
+                    }
+                }
+                auto remove_replaced = [](std::vector<RegisterSlice>& slices,
+                                          const std::set<std::string>& families) {
+                    slices.erase(std::remove_if(slices.begin(), slices.end(), [&](const RegisterSlice& slice) {
+                        return families.count(slice.family) != 0;
+                    }), slices.end());
+                };
+                remove_replaced(result.read_slices, replace_reads);
+                remove_replaced(result.write_slices, replace_writes);
+                result.read_slices.insert(result.read_slices.end(), explicit_reads.begin(), explicit_reads.end());
+                result.write_slices.insert(result.write_slices.end(), explicit_writes.begin(), explicit_writes.end());
+
+                // Address and store-value reads are implicit operands and are kept from
+                // RAX even when an explicit destination uses the same register family.
+                for (const auto& effect : result.memory) {
+                    if (!effect.is_object()) continue;
+                    if (effect.contains("address") && effect["address"].is_object()) {
+                        for (const char* field : {"base", "index"})
+                            if (effect["address"].contains(field) && effect["address"][field].is_string())
+                                add_access(effect["address"][field].get<std::string>(), 0, false);
+                    }
+                    if (effect.contains("source_register") && effect["source_register"].is_string())
+                        add_access(effect["source_register"].get<std::string>(), effect.value("width_bits", 0u), false);
+                }
+                result.reads.clear();
+                result.writes.clear();
+                for (const auto& slice : result.read_slices) {
+                    result.reads.insert(slice.family.rfind("flag_", 0) == 0 ? slice.family.substr(5) : slice.family);
+                }
+                for (const auto& slice : result.write_slices) {
+                    result.writes.insert(slice.family.rfind("flag_", 0) == 0 ? slice.family.substr(5) : slice.family);
+                }
+            }
+            result.complete = register_model_complete;
             return result;
         }
 
@@ -281,7 +650,8 @@ namespace tools::composite {
             constexpr size_t kMaxMachineFlowNodes = 200;
             constexpr size_t kMaxMachineWorkItems = 8192;
             const std::string root_register = CanonicalX64Register(requested_register);
-            if (root_register.empty()) {
+            const auto root_slices = ParseRegisterSlices(requested_register);
+            if (root_register.empty() || root_slices.empty()) {
                 error_code = "invalid_machine_register";
                 error_message = "Machine-level trace requires an x86-64 register name such as rax, rcx, r8, xmm0, or eflags";
                 return false;
@@ -341,15 +711,6 @@ namespace tools::composite {
                 error_message = "IDA did not expose the requested instruction in the function flow graph";
                 return false;
             }
-            for (size_t block_index = 0; block_index < chart.size(); ++block_index) {
-                for (int i = 0; i < chart.nsucc(static_cast<int>(block_index)); ++i) {
-                    int successor = chart.succ(static_cast<int>(block_index), i);
-                    if (successor >= 0 && successor < static_cast<int>(chart.size())) {
-                        blocks[block_index].successors.push_back(successor);
-                        blocks[successor].predecessors.push_back(static_cast<int>(block_index));
-                    }
-                }
-            }
             auto root_it = std::find_if(blocks[root_block].instructions.begin(), blocks[root_block].instructions.end(),
                 [&](const MachineInstruction& instruction) { return instruction.address == root_ea; });
             if (root_it == blocks[root_block].instructions.end()) {
@@ -359,68 +720,235 @@ namespace tools::composite {
             }
             const size_t root_instruction = static_cast<size_t>(std::distance(blocks[root_block].instructions.begin(), root_it));
 
-            using RegisterSet = std::set<std::string>;
+            bool rbp_stable = true;
+            bool rsp_stable = true;
+            int64_t last_rbp_write_in_entry = -1;
+            int64_t last_rsp_write_in_entry = -1;
+            std::vector<int64_t> epilogue_begin(blocks.size(), -1);
+            auto is_epilogue_instruction = [](const MachineInstruction& instruction) {
+                if (instruction.control_flow == "return" || instruction.mnemonic == "pop" ||
+                    instruction.mnemonic == "leave") return true;
+                return instruction.writes.count("rsp") != 0 &&
+                    (instruction.mnemonic == "add" || instruction.mnemonic == "lea" || instruction.mnemonic == "mov");
+            };
+            for (size_t block_index = 0; block_index < blocks.size(); ++block_index) {
+                const auto& instructions = blocks[block_index].instructions;
+                if (instructions.empty() || instructions.back().control_flow != "return") continue;
+                size_t begin = instructions.size() - 1;
+                while (begin > 0 && is_epilogue_instruction(instructions[begin - 1])) --begin;
+                epilogue_begin[block_index] = static_cast<int64_t>(begin);
+            }
+            size_t entry_prologue_end = 0;
+            if (!blocks.empty()) {
+                const auto& entry = blocks[0].instructions;
+                for (size_t index = 0; index < entry.size(); ++index) {
+                    const auto& instruction = entry[index];
+                    const bool prologue = instruction.mnemonic == "push" || instruction.mnemonic == "endbr64" ||
+                        instruction.mnemonic == "nop" ||
+                        (instruction.writes.count("rsp") != 0 &&
+                            (instruction.mnemonic == "sub" || instruction.mnemonic == "and" || instruction.mnemonic == "lea")) ||
+                        (instruction.writes.count("rbp") != 0 && instruction.mnemonic == "mov" && instruction.reads.count("rsp") != 0);
+                    if (!prologue) break;
+                    entry_prologue_end = index + 1;
+                    if (instruction.writes.count("rbp") != 0) last_rbp_write_in_entry = static_cast<int64_t>(index);
+                    if (instruction.writes.count("rsp") != 0 && instruction.control_flow != "call" &&
+                        instruction.control_flow != "indirect_call") last_rsp_write_in_entry = static_cast<int64_t>(index);
+                }
+            }
+            for (size_t block_index = 0; block_index < blocks.size(); ++block_index) {
+                for (size_t instruction_index = 0; instruction_index < blocks[block_index].instructions.size(); ++instruction_index) {
+                    const auto& instruction = blocks[block_index].instructions[instruction_index];
+                    if (instruction.writes.count("rbp") != 0) {
+                        const bool in_prologue = block_index == 0 && instruction_index < entry_prologue_end;
+                        const bool in_epilogue = epilogue_begin[block_index] >= 0 &&
+                            static_cast<int64_t>(instruction_index) >= epilogue_begin[block_index] &&
+                            (instruction.mnemonic == "pop" || instruction.mnemonic == "leave");
+                        if (!in_prologue && !in_epilogue) rbp_stable = false;
+                    }
+                    if (instruction.writes.count("rsp") != 0 && instruction.control_flow != "call" &&
+                        instruction.control_flow != "indirect_call") {
+                        const bool in_prologue = block_index == 0 && instruction_index < entry_prologue_end;
+                        const bool in_epilogue = epilogue_begin[block_index] >= 0 &&
+                            static_cast<int64_t>(instruction_index) >= epilogue_begin[block_index];
+                        if (!in_prologue && !in_epilogue) rsp_stable = false;
+                    }
+                }
+            }
+            size_t memory_accesses_tracked = 0;
+            size_t memory_accesses_untracked = 0;
+            for (size_t block_index = 0; block_index < blocks.size(); ++block_index) {
+                for (size_t instruction_index = 0; instruction_index < blocks[block_index].instructions.size(); ++instruction_index) {
+                    for (auto& access : blocks[block_index].instructions[instruction_index].memory_accesses) {
+                        if (access.location.space == "stack_rbp") {
+                            access.trackable = access.trackable && rbp_stable &&
+                                (block_index != 0 || static_cast<int64_t>(instruction_index) > last_rbp_write_in_entry) &&
+                                (epilogue_begin[block_index] < 0 || static_cast<int64_t>(instruction_index) < epilogue_begin[block_index]);
+                        } else if (access.location.space == "stack_rsp") {
+                            access.trackable = access.trackable && rsp_stable &&
+                                (block_index != 0 || static_cast<int64_t>(instruction_index) > last_rsp_write_in_entry) &&
+                                (epilogue_begin[block_index] < 0 || static_cast<int64_t>(instruction_index) < epilogue_begin[block_index]);
+                        }
+                        if (access.trackable) ++memory_accesses_tracked;
+                        else ++memory_accesses_untracked;
+                    }
+                }
+            }
+
+            // Split the block containing the requested instruction into prefix / root / suffix.
+            // A single state per IDA basic block otherwise loses instructions before the root
+            // when a loop back-edge re-enters that block, and can miss real dependencies.
+            std::vector<MachineBlock> source_blocks = std::move(blocks);
+            std::vector<int> first_split_block(source_blocks.size(), -1);
+            std::vector<int> last_split_block(source_blocks.size(), -1);
+            blocks.clear();
+            auto append_split_block = [&](size_t original_index, size_t begin, size_t end) {
+                const int split_index = static_cast<int>(blocks.size());
+                MachineBlock split_block;
+                split_block.instructions.insert(split_block.instructions.end(),
+                    source_blocks[original_index].instructions.begin() + static_cast<std::ptrdiff_t>(begin),
+                    source_blocks[original_index].instructions.begin() + static_cast<std::ptrdiff_t>(end));
+                blocks.push_back(std::move(split_block));
+                if (first_split_block[original_index] < 0) first_split_block[original_index] = split_index;
+                if (last_split_block[original_index] >= 0) {
+                    const int previous = last_split_block[original_index];
+                    blocks[previous].successors.push_back(split_index);
+                    blocks[split_index].predecessors.push_back(previous);
+                }
+                last_split_block[original_index] = split_index;
+                return split_index;
+            };
+            int split_root_block = -1;
+            for (size_t original_index = 0; original_index < source_blocks.size(); ++original_index) {
+                const size_t count = source_blocks[original_index].instructions.size();
+                if (static_cast<int>(original_index) != root_block) {
+                    append_split_block(original_index, 0, count);
+                    continue;
+                }
+                if (root_instruction != 0) append_split_block(original_index, 0, root_instruction);
+                split_root_block = append_split_block(original_index, root_instruction, root_instruction + 1);
+                if (root_instruction + 1 < count) append_split_block(original_index, root_instruction + 1, count);
+            }
+            for (size_t original_index = 0; original_index < source_blocks.size(); ++original_index) {
+                for (int i = 0; i < chart.nsucc(static_cast<int>(original_index)); ++i) {
+                    const int successor = chart.succ(static_cast<int>(original_index), i);
+                    if (successor < 0 || successor >= static_cast<int>(source_blocks.size())) continue;
+                    const int from = last_split_block[original_index];
+                    const int to = first_split_block[static_cast<size_t>(successor)];
+                    if (from >= 0 && to >= 0) {
+                        blocks[from].successors.push_back(to);
+                        blocks[to].predecessors.push_back(from);
+                    }
+                }
+            }
+            if (split_root_block < 0) {
+                error_code = "machine_trace_instruction_unavailable";
+                error_message = "IDA did not expose the requested instruction in the function flow graph";
+                return false;
+            }
+            root_block = split_root_block;
+            const size_t root_split_instruction = 0;
+
             const bool forward = direction == "forward";
-            std::vector<RegisterSet> block_states(blocks.size());
+            std::vector<RegisterState> block_states(blocks.size());
+            std::vector<MemoryState> block_memory_states(blocks.size());
             std::vector<bool> reachable(blocks.size(), false);
-            block_states[root_block].insert(root_register);
+            for (const auto& slice : root_slices) AddSlice(block_states[root_block], slice);
             reachable[root_block] = true;
             std::deque<int> worklist{root_block};
             size_t work_items = 0;
             bool incomplete = false;
             bool incomplete_lift_boundary = false;
             bool call_boundary = false;
+            bool memory_location_boundary = memory_accesses_untracked != 0;
             bool worklist_limit = false;
             bool flow_limit = false;
-            auto transfer_block = [&](int block_index, RegisterSet& registers, bool collect,
+            auto transfer_block = [&](int block_index, RegisterState& registers, MemoryState& memory_state, bool collect,
                                       size_t& node_visits) {
                 const auto& instructions = blocks[block_index].instructions;
                 auto process = [&](size_t instruction_index) {
                     const auto& instruction = instructions[instruction_index];
                     if (!instruction.complete) {
-                        if (!registers.empty()) {
+                        if (!registers.empty() || !memory_state.empty()) {
                             incomplete = true;
                             incomplete_lift_boundary = true;
                         }
                         registers.clear();
+                        memory_state.clear();
                         return;
                     }
-                    const RegisterSet& sources = forward ? instruction.reads : instruction.writes;
+                    const auto& sources = forward ? instruction.read_slices : instruction.write_slices;
                     const bool dependent = std::any_of(sources.begin(), sources.end(),
-                        [&](const std::string& reg) { return registers.count(reg) != 0; });
-                    if (collect && dependent) {
+                        [&](const RegisterSlice& slice) { return SliceIntersects(registers, slice); });
+                    const bool memory_dependent = std::any_of(instruction.memory_accesses.begin(), instruction.memory_accesses.end(),
+                        [&](const MemoryAccess& access) {
+                            return access.trackable && (forward ? access.reads : access.writes) &&
+                                MemoryIntersects(memory_state, access.location);
+                        });
+                    const bool any_dependent = dependent || memory_dependent;
+                    if (collect && any_dependent) {
                         nlohmann::json node = {
                             {"address", tools::utils::FormatAddress(instruction.address)},
                             {"type", forward ? "register_use" : "register_definition"},
-                            {"registers_read", nlohmann::json::array()},
-                            {"registers_written", nlohmann::json::array()},
-                            {"memory", instruction.memory},
                             {"control_flow", instruction.control_flow}
                         };
-                        for (const auto& reg : instruction.reads) node["registers_read"].push_back(reg);
-                        for (const auto& reg : instruction.writes) node["registers_written"].push_back(reg);
+                        if (!instruction.reads.empty()) {
+                            node["registers_read"] = nlohmann::json::array();
+                            for (const auto& reg : instruction.reads) node["registers_read"].push_back(reg);
+                        }
+                        if (!instruction.writes.empty()) {
+                            node["registers_written"] = nlohmann::json::array();
+                            for (const auto& reg : instruction.writes) node["registers_written"].push_back(reg);
+                        }
+                        if (!instruction.memory.empty()) node["memory"] = instruction.memory;
+                        if (memory_dependent) node["memory_dependency"] = true;
                         if (node_visits < kMaxMachineFlowNodes) flow.push_back(std::move(node));
                         else { incomplete = true; flow_limit = true; }
                         ++node_visits;
                     }
                     if (instruction.control_flow == "call" || instruction.control_flow == "indirect_call") {
-                        const bool has_live_registers = !registers.empty();
-                        registers.clear(); // Unknown callee side effects are an interprocedural boundary.
-                        if (has_live_registers) { incomplete = true; call_boundary = true; }
+                        const bool dropped_volatile = KeepCommonX64Nonvolatile(registers);
+                        const bool dropped_memory = !memory_state.empty();
+                        memory_state.clear();
+                        if (dropped_volatile || dropped_memory) { incomplete = true; call_boundary = true; }
+                        if (collect && !registers.empty()) {
+                            if (node_visits < kMaxMachineFlowNodes) {
+                                nlohmann::json preserved = nlohmann::json::array();
+                                for (const auto& [reg, bits] : registers) {
+                                    (void)bits;
+                                    preserved.push_back(reg);
+                                }
+                                flow.push_back({
+                                    {"address", tools::utils::FormatAddress(instruction.address)},
+                                    {"type", "call_boundary"},
+                                    {"preserved_registers", std::move(preserved)},
+                                    {"control_flow", instruction.control_flow}
+                                });
+                            } else {
+                                incomplete = true;
+                                flow_limit = true;
+                            }
+                            ++node_visits;
+                        }
                         return;
                     }
-                    const RegisterSet& definitions = forward ? instruction.writes : instruction.writes;
-                    for (const auto& reg : definitions) registers.erase(reg);
-                    if (dependent) {
-                        const RegisterSet& propagated = forward ? instruction.writes : instruction.reads;
-                        registers.insert(propagated.begin(), propagated.end());
+                    for (const auto& slice : instruction.write_slices) KillSlice(registers, slice);
+                    for (const auto& access : instruction.memory_accesses)
+                        if (access.trackable && access.writes) KillMemoryAliases(memory_state, access.location);
+                    if (any_dependent) {
+                        const auto& propagated = forward ? instruction.write_slices : instruction.read_slices;
+                        for (const auto& slice : propagated) AddSlice(registers, slice);
+                        for (const auto& access : instruction.memory_accesses) {
+                            if (!access.trackable) continue;
+                            if (forward && access.writes) memory_state.insert(access.location);
+                            if (!forward && access.reads) memory_state.insert(access.location);
+                        }
                     }
                 };
                 if (forward) {
-                    const size_t first = block_index == root_block ? root_instruction : 0;
+                    const size_t first = block_index == root_block ? root_split_instruction : 0;
                     for (size_t i = first; i < instructions.size(); ++i) process(i);
                 } else {
-                    size_t i = block_index == root_block ? root_instruction + 1 : instructions.size();
+                    size_t i = block_index == root_block ? root_split_instruction + 1 : instructions.size();
                     while (i > 0) process(--i);
                 }
             };
@@ -434,17 +962,21 @@ namespace tools::composite {
                 }
                 const int block_index = worklist.front();
                 worklist.pop_front();
-                RegisterSet output = block_states[block_index];
+                RegisterState output = block_states[block_index];
+                MemoryState memory_output = block_memory_states[block_index];
                 size_t ignored_nodes = 0;
-                transfer_block(block_index, output, false, ignored_nodes);
-                if (output.empty()) continue;
+                transfer_block(block_index, output, memory_output, false, ignored_nodes);
+                if (output.empty() && memory_output.empty()) continue;
                 const auto& next_blocks = forward ? blocks[block_index].successors : blocks[block_index].predecessors;
                 for (int next : next_blocks) {
-                    RegisterSet merged = block_states[next];
-                    merged.insert(output.begin(), output.end());
-                    if (!reachable[next] || merged != block_states[next]) {
+                    RegisterState merged = block_states[next];
+                    MergeState(merged, output);
+                    MemoryState merged_memory = block_memory_states[next];
+                    MergeMemoryState(merged_memory, memory_output);
+                    if (!reachable[next] || merged != block_states[next] || merged_memory != block_memory_states[next]) {
                         reachable[next] = true;
                         block_states[next] = std::move(merged);
+                        block_memory_states[next] = std::move(merged_memory);
                         worklist.push_back(next);
                     }
                 }
@@ -472,8 +1004,9 @@ namespace tools::composite {
             for (size_t block_index = 0; block_index < blocks.size(); ++block_index) {
                 if (!reachable[block_index]) continue;
                 const size_t first_flow_node = flow.size();
-                RegisterSet state = block_states[block_index];
-                transfer_block(static_cast<int>(block_index), state, true, node_visits);
+                RegisterState state = block_states[block_index];
+                MemoryState memory_state = block_memory_states[block_index];
+                transfer_block(static_cast<int>(block_index), state, memory_state, true, node_visits);
                 for (size_t i = first_flow_node; i < flow.size(); ++i)
                     flow[i]["depth"] = std::max(0, block_depth[block_index]);
             }
@@ -484,7 +1017,8 @@ namespace tools::composite {
             }
             nlohmann::json incomplete_reasons = nlohmann::json::array();
             if (incomplete_lift_boundary) incomplete_reasons.push_back("RAX lift was incomplete on a live register path; propagation stopped there");
-            if (call_boundary) incomplete_reasons.push_back("Unknown function calls stop interprocedural register propagation");
+            if (call_boundary) incomplete_reasons.push_back("Unknown calls discard volatile registers and tracked memory; common x64 nonvolatile registers are preserved by ABI");
+            if (memory_location_boundary) incomplete_reasons.push_back("Some memory accesses could not be normalized to an exact address or stable stack slot");
             if (worklist_limit) incomplete_reasons.push_back("CFG worklist step limit reached");
             if (flow_limit) incomplete_reasons.push_back("Flow output limit reached");
             analysis = {
@@ -498,9 +1032,12 @@ namespace tools::composite {
                 {"basic_blocks", blocks.size()},
                 {"worklist_steps", work_items},
                 {"interprocedural", false},
-                {"memory_aliases_tracked", false},
+                {"call_policy", "preserve_common_x64_nonvolatile"},
+                {"memory_aliases_tracked", memory_accesses_tracked != 0},
+                {"memory_accesses_tracked", memory_accesses_tracked},
+                {"memory_accesses_untracked", memory_accesses_untracked},
                 {"control_dependencies_tracked", false},
-                {"dataflow_complete", !incomplete},
+                {"dataflow_complete", !incomplete && !memory_location_boundary},
                 {"incomplete_reasons", std::move(incomplete_reasons)},
                 {"truncated", flow_limit || worklist_limit}
             };
@@ -857,9 +1394,8 @@ namespace tools::composite {
         if (direction != "forward" && direction != "backward")
             return tools::utils::MakeToolErrorJson(id, "Direction must be 'forward' or 'backward'", "invalid_direction");
 
-        int max_depth = static_cast<int>(tools::utils::GetIntArg(args, "depth", 2));
-        if (max_depth <= 0) max_depth = 2;
-        if (max_depth > 5) max_depth = 5;
+        const int max_depth = static_cast<int>(std::clamp<int64_t>(
+            tools::utils::GetIntArg(args, "depth", 2), 0, 5));
 
         bool include_calls = tools::utils::GetBoolArg(args, "include_calls", true);
         const bool machine_level = tools::utils::GetBoolArg(args, "machine_level", false);

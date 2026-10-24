@@ -128,6 +128,7 @@
     <ClCompile Include="main.cpp" />
     <ClCompile Include="server\pipe_server.cpp" />
     <ClCompile Include="tools\api_analysis\api_analysis.cpp" />
+    <ClCompile Include="tools\api_analysis\api_emulation.cpp" />
     <ClCompile Include="third_party\rax\rax_bridge.cpp" />
     <ClCompile Include="tools\api_composite\api_composite.cpp" />
     <ClCompile Include="tools\api_core\api_core.cpp" />

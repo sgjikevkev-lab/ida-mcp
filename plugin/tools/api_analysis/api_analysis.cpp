@@ -423,6 +423,7 @@ namespace tools::analysis {
         if (name == "find_bytes") return FindBytes(id, args);
         if (name == "insn_query") return InsnQuery(id, args);
         if (name == "find_path") return FindPath(id, args);
+        if (name == "emulate_function") return EmulateFunction(id, args);
 
         return tools::utils::MakeToolErrorJson(id, "Method not found: " + name, "method_not_found");
     }

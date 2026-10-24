@@ -177,6 +177,44 @@ def main():
                 raise TimeoutError(f'IDA startup timeout; see {directory / "ida.log"}')
             time.sleep(0.1)
         catalog = call(method='tools/list')['result']['tools']
+        emulate_tool = next(tool for tool in catalog if tool['name'] == 'emulate_function')
+        assert 'call_stubs' in emulate_tool['inputSchema']['properties'], 'Loaded plugin is not the new emulation build'
+        successful('py', {'code': '''import idc
+assert idc.SetType(idc.get_name_ea(idc.BADADDR, 'mcp_fixture_add'), 'int mcp_fixture_add(int a, int b);')
+assert idc.SetType(idc.get_name_ea(idc.BADADDR, 'mcp_fixture_double'), 'double mcp_fixture_double(double value);')'''} )
+        emulated_add = decode_tool_text(successful('emulate_function', {
+            'addr': 'mcp_fixture_add', 'arguments': [19, 23]
+        }))
+        assert emulated_add['returned'] and int(emulated_add['return_value'], 0) == 42, emulated_add
+        emulated_named_add = decode_tool_text(successful('emulate_function', {
+            'addr': 'mcp_fixture_add', 'arguments': {'a': 20, 'b': 22}
+        }))
+        assert emulated_named_add['returned'] and int(emulated_named_add['return_value'], 0) == 42, emulated_named_add
+        emulated_double = decode_tool_text(successful('emulate_function', {
+            'addr': 'mcp_fixture_double', 'arguments': {'value': 21.5}
+        }))
+        assert emulated_double['returned'] and emulated_double['floating_return']['value'] == 43.0, emulated_double
+        emulated_buffer = decode_tool_text(successful('emulate_function', {
+            'addr': 'mcp_fixture_mutate_buffer', 'arguments': [{'bytes': '41'}, 1]
+        }))
+        assert emulated_buffer['returned'] and int(emulated_buffer['return_value'], 0) == 66, emulated_buffer
+        assert emulated_buffer['buffers'][0]['bytes'] == '42', emulated_buffer
+        emulated_global = decode_tool_text(successful('emulate_function', {
+            'addr': 'mcp_fixture_set_global', 'arguments': [99]
+        }))
+        assert emulated_global['returned'] and emulated_global['memory_writes'], emulated_global
+        unchanged_global = decode_tool_text(successful('get_bytes', {'addr': 'mcp_fixture_global', 'size': 4}))
+        assert unchanged_global['hex'].lower().split() == ['07', '00', '00', '00'], unchanged_global
+        emulated_stub = decode_tool_text(successful('emulate_function', {
+            'addr': 'mcp_fixture_stub_caller', 'arguments': [4],
+            'call_stubs': [{'addr': 'mcp_fixture_stub_target', 'return': 40}]
+        }))
+        assert emulated_stub['returned'] and int(emulated_stub['return_value'], 0) == 41, emulated_stub
+        assert emulated_stub['modeled_calls'][0]['calls'] == 1, emulated_stub
+        emulated_limited = decode_tool_text(successful('emulate_function', {
+            'addr': 'mcp_fixture_loop', 'arguments': [1000, 1], 'max_instructions': 10
+        }))
+        assert not emulated_limited['returned'] and emulated_limited['outcome'] == 'instruction_limit', emulated_limited
         malformed_initialize = call(method='initialize', params='bad')
         assert malformed_initialize['error']['code'] == -32602, malformed_initialize
         malformed_protocol = call(method='initialize', params={'protocolVersion': []})
@@ -229,6 +267,9 @@ def main():
             ('xref_query', {'addr': 'mcp_fixture_add', 'cursor': '1junk'}),
             ('callgraph', {'addr': 'mcp_fixture_add', 'direction': 'sideways'}),
             ('trace_data_flow', {'addr': 'mcp_fixture_add', 'direction': 'sideways'}),
+            ('emulate_function', {'addr': '__missing_fixture_function__'}),
+            ('emulate_function', {'addr': 'mcp_fixture_add', 'timeout_ms': 1800001}),
+            ('emulate_function', {'addr': 'mcp_fixture_add', 'arguments': [1, 2, 3]}),
             ('get_ast', {'pattern': {'op': 'cot_call'}, 'addr': '__missing_fixture_function__'}),
             ('get_ast', {'pattern': {'op': 'cot_call'}}),
             ('mba_simplify', {'addr': 'mcp_fixture_add', 'expr_addr': 'not-an-address'}),
@@ -355,6 +396,240 @@ def main():
         assert branch_machine_flow['analysis']['worklist_steps'] > 1, branch_machine_flow
         assert any(item.get('depth', 0) > 0 for item in branch_machine_flow['flow']), branch_machine_flow
         assert branch_machine_flow['analysis']['scope'].endswith('merged conservatively'), branch_machine_flow
+        partial_register_disasm = decode_tool_text(successful('disasm', {
+            'addr': 'mcp_fixture_partial_register', 'count': 16, 'detailed': True
+        }))
+        partial_consumer = next(
+            item for item in partial_register_disasm['items']
+            if 'mov rbx, rax' in ' '.join(item.get('disasm', '').lower().split())
+        )
+        partial_write = next(
+            item for item in partial_register_disasm['items']
+            if 'mov al, 1' in ' '.join(item.get('disasm', '').lower().split())
+        )
+        partial_register_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': partial_write['address'], 'var': 'rax', 'direction': 'forward',
+            'machine_level': True
+        }))
+        assert any(item.get('address') == partial_consumer['address'] for item in partial_register_flow['flow']), (partial_register_flow, partial_register_disasm)
+        zero_extend_disasm = decode_tool_text(successful('disasm', {
+            'addr': 'mcp_fixture_zero_extend', 'count': 16, 'detailed': True
+        }))
+        zero_extend_consumer = next(
+            item for item in zero_extend_disasm['items']
+            if 'mov rbx, rax' in ' '.join(item.get('disasm', '').lower().split())
+        )
+        zero_extend_write = next(
+            item for item in zero_extend_disasm['items']
+            if 'mov eax, 1' in ' '.join(item.get('disasm', '').lower().split())
+        )
+        zero_extend_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': zero_extend_write['address'], 'var': 'rax', 'direction': 'forward',
+            'machine_level': True
+        }))
+        assert not any(item.get('address') == zero_extend_consumer['address'] for item in zero_extend_flow['flow']), zero_extend_flow
+        backward_partial_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': partial_consumer['address'], 'var': 'rbx', 'direction': 'backward',
+            'machine_level': True
+        }))
+        assert any(item.get('address') == partial_write['address'] for item in backward_partial_flow['flow']), backward_partial_flow
+        backward_zero_extend_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': zero_extend_consumer['address'], 'var': 'rbx', 'direction': 'backward',
+            'machine_level': True
+        }))
+        assert not any(item.get('address') == zero_extend_disasm['items'][0]['address']
+            for item in backward_zero_extend_flow['flow']), backward_zero_extend_flow
+        high_byte_disasm = decode_tool_text(successful('disasm', {
+            'addr': 'mcp_fixture_high_byte_register', 'count': 16, 'semantic_effects': True
+        }))
+        high_byte_write = next(item for item in high_byte_disasm['items']
+            if 'mov ah, 1' in ' '.join(item.get('disasm', '').lower().split()))
+        high_byte_consumer = next(item for item in high_byte_disasm['items']
+            if 'mov rbx, rax' in ' '.join(item.get('disasm', '').lower().split()))
+        low_byte_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': high_byte_write['address'], 'var': 'al', 'direction': 'forward',
+            'machine_level': True
+        }))
+        high_byte_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': high_byte_write['address'], 'var': 'ah', 'direction': 'forward',
+            'machine_level': True
+        }))
+        assert any(item.get('address') == high_byte_consumer['address'] for item in low_byte_flow['flow']), low_byte_flow
+        assert not any(item.get('address') == high_byte_consumer['address'] for item in high_byte_flow['flow']), (high_byte_flow, high_byte_disasm)
+        flag_disasm = decode_tool_text(successful('disasm', {
+            'addr': 'mcp_fixture_flag_slice', 'count': 16, 'semantic_effects': True
+        }))
+        flag_branch = next(item for item in flag_disasm['items'] if item.get('semantics', {}).get('control_flow') == 'conditional_branch')
+        zero_flag_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': flag_branch['address'], 'var': 'zf', 'direction': 'forward',
+            'machine_level': True
+        }))
+        carry_flag_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': flag_branch['address'], 'var': 'cf', 'direction': 'forward',
+            'machine_level': True
+        }))
+        assert any(item.get('address') == flag_branch['address'] and item.get('type') == 'register_use'
+            for item in zero_flag_flow['flow']), zero_flag_flow
+        assert zero_flag_flow['root']['var'] == 'zf', zero_flag_flow
+        assert not any(item.get('address') == flag_branch['address'] and item.get('type') == 'register_use'
+            for item in carry_flag_flow['flow']), carry_flag_flow
+        loop_disasm = decode_tool_text(successful('disasm', {
+            'addr': 'mcp_fixture_loop', 'count': 128, 'semantic_effects': True
+        }))
+        if len(loop_disasm['items']) == 1 and loop_disasm['items'][0].get('semantics', {}).get('target'):
+            loop_disasm = decode_tool_text(successful('disasm', {
+                'addr': loop_disasm['items'][0]['semantics']['target'], 'count': 128,
+                'semantic_effects': True
+            }))
+        loop_items = loop_disasm['items']
+        loop_back_edge = next(
+            (item for item in loop_items
+             if item.get('semantics', {}).get('control_flow') in ('branch', 'conditional_branch')
+             and item.get('semantics', {}).get('target')
+             and int(item['semantics']['target'], 16) < int(item['address'], 16)),
+            None
+        )
+        assert loop_back_edge is not None, loop_disasm
+        loop_target = next(item for item in loop_items if item['address'] == loop_back_edge['semantics']['target'])
+        loop_target_index = loop_items.index(loop_target)
+        assert loop_target_index + 1 < len(loop_items), loop_disasm
+        loop_root = loop_items[loop_target_index + 1]
+        loop_target_registers = set()
+        for effect in loop_target.get('semantics', {}).get('effects', []):
+            if effect.get('kind') == 'register' and 'read' in effect.get('access', []):
+                loop_target_registers.add(effect.get('register', '').lower())
+            if effect.get('kind') == 'memory' and 'read' in effect.get('access', []):
+                address = effect.get('address', {})
+                loop_target_registers.update(address.get(key, '').lower() for key in ('base', 'index'))
+        loop_target_registers.discard('')
+        assert loop_target_registers, loop_target
+        loop_register = next(iter(sorted(loop_target_registers)))
+        loop_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': loop_root['address'], 'var': loop_register, 'direction': 'forward',
+            'machine_level': True
+        }))
+        assert any(item.get('address') == loop_target['address'] for item in loop_flow['flow']), loop_flow
+        stack_disasm = decode_tool_text(successful('disasm', {
+            'addr': 'mcp_fixture_stack_alias', 'count': 32, 'detailed': True
+        }))
+        stack_store = next((item for item in stack_disasm['items']
+            if 'rbp' in item.get('disasm', '').lower() and 'rcx' in item.get('disasm', '').lower()
+            and item.get('semantics') is None), None)
+        stack_load = next((item for item in stack_disasm['items']
+            if 'rbp' in item.get('disasm', '').lower() and 'eax' in item.get('disasm', '').lower()
+            and 'rcx' not in item.get('disasm', '').lower()), None)
+        assert stack_store is not None and stack_load is not None, stack_disasm
+        stack_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': stack_store['address'], 'var': 'rcx', 'direction': 'forward',
+            'machine_level': True
+        }))
+        stack_load_node = next((item for item in stack_flow['flow'] if item.get('address') == stack_load['address']), None)
+        assert stack_load_node is not None and stack_load_node.get('memory_dependency') is True, (stack_flow, stack_disasm)
+        assert stack_flow['analysis']['memory_aliases_tracked'] is True, stack_flow
+        assert stack_flow['analysis']['memory_accesses_tracked'] >= 2, stack_flow
+        backward_stack_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': stack_load['address'], 'var': 'rax', 'direction': 'backward',
+            'machine_level': True
+        }))
+        backward_store_node = next((item for item in backward_stack_flow['flow'] if item.get('address') == stack_store['address']), None)
+        assert backward_store_node is not None and backward_store_node.get('memory_dependency') is True, backward_stack_flow
+        rsp_disasm = decode_tool_text(successful('disasm', {
+            'addr': 'mcp_fixture_rsp_alias', 'count': 16, 'detailed': True
+        }))
+        rsp_store = next(item for item in rsp_disasm['items']
+            if 'rsp' in item.get('disasm', '').lower() and 'rcx' in item.get('disasm', '').lower())
+        rsp_load = next(item for item in rsp_disasm['items']
+            if 'rsp' in item.get('disasm', '').lower() and 'eax' in item.get('disasm', '').lower())
+        rsp_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': rsp_store['address'], 'var': 'rcx', 'direction': 'forward',
+            'machine_level': True
+        }))
+        rsp_load_node = next((item for item in rsp_flow['flow'] if item.get('address') == rsp_load['address']), None)
+        assert rsp_load_node is not None and rsp_load_node.get('memory_dependency') is True, rsp_flow
+        assert rsp_flow['analysis']['memory_aliases_tracked'] is True, rsp_flow
+        partial_memory_disasm = decode_tool_text(successful('disasm', {
+            'addr': 'mcp_fixture_stack_partial_overwrite', 'count': 24, 'semantic_effects': True
+        }))
+        partial_memory_store = next(item for item in partial_memory_disasm['items']
+            if any(effect.get('kind') == 'memory' and effect.get('width_bits') == 64
+                and effect.get('access') and 'write' in effect['access']
+                and effect.get('source_register') == 'rcx'
+                for effect in item.get('semantics', {}).get('effects', [])))
+        partial_memory_load = next(item for item in partial_memory_disasm['items']
+            if any(effect.get('kind') == 'memory' and effect.get('width_bits') == 64
+                and effect.get('access') and 'read' in effect['access']
+                for effect in item.get('semantics', {}).get('effects', [])))
+        partial_memory_forward = decode_tool_text(successful('trace_data_flow', {
+            'addr': partial_memory_store['address'], 'var': 'rcx', 'direction': 'forward',
+            'machine_level': True
+        }))
+        assert any(item.get('address') == partial_memory_load['address'] and item.get('memory_dependency')
+            for item in partial_memory_forward['flow']), partial_memory_forward
+        partial_memory_backward = decode_tool_text(successful('trace_data_flow', {
+            'addr': partial_memory_load['address'], 'var': 'rax', 'direction': 'backward',
+            'machine_level': True
+        }))
+        assert any(item.get('address') == partial_memory_store['address'] and item.get('memory_dependency')
+            for item in partial_memory_backward['flow']), partial_memory_backward
+        global_disasm = decode_tool_text(successful('disasm', {
+            'addr': 'mcp_fixture_global_alias', 'count': 12, 'semantic_effects': True
+        }))
+        global_store = next((item for item in global_disasm['items']
+            if any(effect.get('kind') == 'memory' and 'write' in effect.get('access', [])
+                and effect.get('source_register') in ('ecx', 'rcx')
+                for effect in item.get('semantics', {}).get('effects', []))), None)
+        assert global_store is not None, global_disasm
+        global_load = next((item for item in global_disasm['items']
+            if any(effect.get('kind') == 'memory' and 'read' in effect.get('access', [])
+                for effect in item.get('semantics', {}).get('effects', []))), None)
+        assert global_load is not None, global_disasm
+        global_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': global_store['address'], 'var': 'rcx', 'direction': 'forward',
+            'machine_level': True
+        }))
+        assert any(item.get('address') == global_load['address'] and item.get('memory_dependency')
+            for item in global_flow['flow']), global_flow
+        assert global_flow['analysis']['memory_aliases_tracked'] is True, global_flow
+        preserved_call_disasm = decode_tool_text(successful('disasm', {
+            'addr': 'mcp_fixture_call_preserved', 'count': 16, 'semantic_effects': True
+        }))
+        preserved_root = preserved_call_disasm['items'][0]
+        preserved_consumer = next(item for item in preserved_call_disasm['items']
+            if 'rbx' in item.get('disasm', '').lower() and 'rax' in item.get('disasm', '').lower())
+        preserved_call_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': preserved_root['address'], 'var': 'rcx', 'direction': 'forward',
+            'machine_level': True
+        }))
+        assert any(item.get('address') == preserved_consumer['address'] for item in preserved_call_flow['flow']), preserved_call_flow
+        assert any(item.get('type') == 'call_boundary' for item in preserved_call_flow['flow']), preserved_call_flow
+        assert preserved_call_flow['analysis']['dataflow_complete'] is False, preserved_call_flow
+        assert any('volatile registers' in reason for reason in preserved_call_flow['analysis']['incomplete_reasons']), preserved_call_flow
+        preserved_call_instruction = next(item for item in preserved_call_disasm['items']
+            if item.get('semantics', {}).get('control_flow') == 'call')
+        preserved_direct_call_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': preserved_call_instruction['address'], 'var': 'rbx', 'direction': 'forward',
+            'machine_level': True
+        }))
+        assert any(item.get('address') == preserved_consumer['address'] for item in preserved_direct_call_flow['flow']), preserved_direct_call_flow
+        assert preserved_direct_call_flow['analysis']['dataflow_complete'] is True, preserved_direct_call_flow
+        volatile_direct_call_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': preserved_call_instruction['address'], 'var': 'rax', 'direction': 'forward',
+            'machine_level': True
+        }))
+        assert not any(item.get('address') == preserved_consumer['address'] for item in volatile_direct_call_flow['flow']), volatile_direct_call_flow
+        assert any('volatile registers' in reason for reason in volatile_direct_call_flow['analysis']['incomplete_reasons']), volatile_direct_call_flow
+        volatile_call_disasm = decode_tool_text(successful('disasm', {
+            'addr': 'mcp_fixture_call_volatile', 'count': 16, 'detailed': True
+        }))
+        volatile_root = volatile_call_disasm['items'][0]
+        volatile_consumer = next(item for item in volatile_call_disasm['items']
+            if 'rbx' in item.get('disasm', '').lower() and 'rax' in item.get('disasm', '').lower())
+        volatile_call_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': volatile_root['address'], 'var': 'rcx', 'direction': 'forward',
+            'machine_level': True
+        }))
+        assert not any(item.get('address') == volatile_consumer['address'] for item in volatile_call_flow['flow']), volatile_call_flow
+        assert any('volatile registers' in reason for reason in volatile_call_flow['analysis']['incomplete_reasons']), volatile_call_flow
         assert call('trace_data_flow', {
             'addr': 'mcp_fixture_add_0', 'var': 'not_a_register', 'machine_level': True
         })['result']['isError']
@@ -521,6 +796,10 @@ def main():
             item.get('type') == 'caller_arg_passed' and item.get('caller') == 'mcp_fixture_outer'
             for item in backward_interprocedural_flow['flow']
         ), backward_interprocedural_flow
+        zero_depth_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': 'mcp_fixture_call', 'var': 'arg0', 'direction': 'backward', 'depth': 0
+        }))
+        assert not any(item.get('type') == 'caller_arg_passed' for item in zero_depth_flow['flow']), zero_depth_flow
         direct_update_calls = decode_tool_text(successful('xref_query', {
             'addr': 'mcp_fixture_update', 'direction': 'to', 'type': 'call'
         }))

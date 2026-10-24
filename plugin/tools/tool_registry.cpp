@@ -84,6 +84,7 @@ namespace tools {
         reg_ana("find_bytes");
         reg_ana("insn_query");
         reg_ana("find_path");
+        reg_ana("emulate_function");
 
         // api_modify
         auto reg_mod = [this](const char* name) {
@@ -190,7 +191,7 @@ namespace tools {
                     {"protocolVersion", "2024-11-05"},
                     {"serverInfo", {
                         {"name", "ida-pro-mcp"},
-                        {"version", "2.0.0"}
+                        {"version", "2.2.0"}
                     }},
                     {"capabilities", {
                         {"tools", nlohmann::json::object()}

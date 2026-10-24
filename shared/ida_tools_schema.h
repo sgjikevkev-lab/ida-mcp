@@ -1090,7 +1090,7 @@ namespace mcp {
   },
   {
     "name": "trace_data_flow",
-    "description": "Trace data flow using Hex-Rays AST analysis or memory/XREF traversal. Set 'machine_level': true to use RAX for bounded x86-64 register def-use tracing through a function CFG; specify a register in 'var'. Machine-level mode merges branches conservatively, stops at unknown calls or incomplete instruction lifts, and reports that it does not track memory aliases, control dependencies, or cross function calls.",
+    "description": "Trace data flow using Hex-Rays AST analysis or memory/XREF traversal. Set 'machine_level': true to use RAX for bounded x86-64 register-slice and exact-memory def-use tracing through a function CFG; specify a register in 'var'. Machine-level mode merges branches conservatively, tracks common x64 nonvolatile registers across unknown calls, and reports discarded volatile state, unmodeled memory locations, and incomplete instruction lifts. It does not track computed-pointer aliases, control dependencies, or analyze callee bodies.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1101,7 +1101,7 @@ namespace mcp {
         },
         "var": {
           "type": "string",
-          "description": "Hex-Rays mode: optional variable, index, or argument such as 'arg0'. Machine-level mode: required x86-64 register such as 'rax', 'rcx', 'r8', 'xmm0', or 'eflags'.",
+          "description": "Hex-Rays mode: optional variable, index, or argument such as 'arg0'. Machine-level mode: required x86-64 register or flag such as 'rax', 'rcx', 'r8', 'xmm0', 'k1', 'zf', or 'eflags'.",
           "maxLength": 2097152
         },
         "direction": {
@@ -1120,7 +1120,7 @@ namespace mcp {
         },
         "include_calls": {
           "type": "boolean",
-          "description": "Hex-Rays mode: whether to follow data flow across function boundaries (default true); machine-level mode always stops at calls"
+          "description": "Hex-Rays mode: whether to follow data flow across function boundaries (default true); machine-level mode never analyzes callee bodies and applies the reported x64 call-preservation policy"
         },
         "machine_level": {
           "type": "boolean",
@@ -1130,6 +1130,64 @@ namespace mcp {
       "required": [
         "addr"
       ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "emulate_function",
+    "description": "Call an x86-64 function in a private RAX guest using the Windows x64 ABI. Positional arguments accept integers, IDB addresses, floats, UTF-8 buffers, byte buffers, or zeroed buffers. Optional call_stubs model selected external calls. Returns the guest result, stop reason, bounded writes to IDB-backed memory, and changed input buffers. The IDB is never modified. Unstubbed external calls stop with a guest fault. Defaults: 100000 instructions, 5000 ms, 64 MiB guest memory; caps: 5000000 instructions, 30 minutes, 256 MiB.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "addr": {"type": "string", "description": "Function name or address inside a recognized function", "maxLength": 4096},
+        "arguments": {
+          "description": "Pass values positionally or use an object keyed by parameter names from the IDA prototype. The Windows x64 ABI places the first four positional values in RCX, RDX, R8, R9 or XMM0-XMM3, then uses stack slots. Missing prototype parameters are zero-filled.",
+          "anyOf": [
+            {"type": "array", "maxItems": 64, "items": {"anyOf": [
+              {"type": "null"},
+              {"type": "boolean"},
+              {"type": "integer"},
+              {"type": "number"},
+              {"type": "string", "description": "Integer literal or hexadecimal address, for example 0x140001000"},
+              {"type": "object", "properties": {
+                "address": {"type": "string", "description": "Pointer to an address already mapped from the IDB"},
+                "utf8": {"type": "string", "description": "UTF-8 input buffer with a trailing NUL"},
+                "bytes": {"type": "string", "description": "Hexadecimal input buffer"},
+                "zero_bytes": {"type": "integer", "minimum": 0, "maximum": 1048576, "description": "Zero-filled output/input buffer size"},
+                "float32": {"type": "number"},
+                "float64": {"type": "number"}
+              }, "additionalProperties": false, "minProperties": 1, "maxProperties": 1}
+            ]}},
+            {"type": "object", "maxProperties": 64, "additionalProperties": {"anyOf": [
+              {"type": "null"},
+              {"type": "boolean"},
+              {"type": "integer"},
+              {"type": "number"},
+              {"type": "string"},
+              {"type": "object", "properties": {
+                "address": {"type": "string"}, "utf8": {"type": "string"}, "bytes": {"type": "string"},
+                "zero_bytes": {"type": "integer", "minimum": 0, "maximum": 1048576},
+                "float32": {"type": "number"}, "float64": {"type": "number"}
+              }, "additionalProperties": false, "minProperties": 1, "maxProperties": 1}
+            ]}}
+          ]
+        },
+        "call_stubs": {
+          "type": "array", "maxItems": 64,
+          "description": "Optional external/helper call models; a matching call returns the chosen integer in RAX and applies only the listed guest-memory writes.",
+          "items": {"type": "object", "properties": {
+            "addr": {"type": "string", "description": "Imported/helper function address or name"},
+            "return": {"type": "integer", "description": "Value returned in RAX (default 0)"},
+            "mem_writes": {"type": "array", "maxItems": 32, "items": {"type": "object", "properties": {
+              "addr": {"type": "string"}, "bytes": {"type": "string", "description": "Hex bytes written into guest memory"}
+            }, "required": ["addr", "bytes"], "additionalProperties": false}}
+          }, "required": ["addr"], "additionalProperties": false}
+        },
+        "max_instructions": {"type": "integer", "minimum": 1, "maximum": 5000000, "description": "Instruction budget (default 100000)"},
+        "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 1800000, "description": "Wall-clock timeout in milliseconds (default 5000; maximum 30 minutes)"},
+        "max_memory_bytes": {"type": "integer", "minimum": 4194304, "maximum": 268435456, "description": "Maximum guest memory including IDB segments, buffers, and stack (default 64 MiB; maximum 256 MiB)"}
+      },
+      "required": ["addr"],
       "additionalProperties": false
     }
   },

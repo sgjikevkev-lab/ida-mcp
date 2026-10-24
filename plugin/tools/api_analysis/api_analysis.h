@@ -23,5 +23,6 @@ namespace tools::analysis {
         nlohmann::json FindBytes(const nlohmann::json& id, const nlohmann::json& args);
         nlohmann::json InsnQuery(const nlohmann::json& id, const nlohmann::json& args);
         nlohmann::json FindPath(const nlohmann::json& id, const nlohmann::json& args);
+        nlohmann::json EmulateFunction(const nlohmann::json& id, const nlohmann::json& args);
     };
 }
