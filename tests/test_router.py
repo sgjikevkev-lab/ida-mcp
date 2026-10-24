@@ -154,6 +154,10 @@ class RouterTests(unittest.TestCase):
     def tool(self, name, arguments=None):
         return self.request('tools/call', {'name': name, 'arguments': arguments or {}})
 
+    def test_initialize_reports_release_version(self):
+        response = self.request('initialize', {'protocolVersion': '2025-06-18'})
+        self.assertEqual(response['result']['serverInfo']['version'], '2.0.0')
+
     def select_fixture(self):
         response = self.tool('switch_file', {'filename': self.backend.binary})
         self.assertFalse(response['result'].get('isError', False), response)
@@ -163,6 +167,8 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(len(result['tools']), 33)
         for name, arguments in [('get_bytes', {'addr': 'main', 'size': -1}),
                                 ('decompile', {}), ('py', {'code': '1', 'timeout': 1}),
+                                ('get_available_files', {'unused': True}),
+                                ('switch_file', {'filename': self.backend.binary, 'unused': True}),
                                 ('unknown_tool', {})]:
             self.assertTrue(self.tool(name, arguments)['result']['isError'])
         self.assertFalse(self.backend.calls)

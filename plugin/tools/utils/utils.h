@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include "shared/utf8.h"
 
 #pragma warning(push, 0)
 #include "json.h"
@@ -60,7 +61,8 @@ namespace tools::utils {
         if (payload.is_object() && payload.value("status", nlohmann::json(nullptr)) == "error")
             return MakeToolResultJson(id, payload, true);
         bool all_failed = payload.is_object() && payload.contains("failed") && payload.contains("succeeded")
-            && payload["succeeded"] == 0 && payload["failed"].is_number() && payload["failed"].get<int64_t>() > 0;
+            && payload["succeeded"] == 0 && payload["failed"].is_number() && payload["failed"].get<int64_t>() > 0
+            && (!payload.contains("partial") || (payload["partial"].is_number() && payload["partial"].get<int64_t>() == 0));
         if (all_failed) return MakeToolResultJson(id, payload, true);
         return MakeToolResultJson(id, payload, false);
     }

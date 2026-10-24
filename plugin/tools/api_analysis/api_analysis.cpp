@@ -6,6 +6,8 @@
 #include <set>
 #include <queue>
 #include <unordered_map>
+#include <limits>
+#include <stdexcept>
 
 #pragma warning(push, 0)
 #include "json.h"
@@ -32,6 +34,40 @@
 
 namespace tools::analysis {
     namespace {
+        constexpr size_t kMaxPseudocodeBytes = 512 * 1024;
+        constexpr size_t kMaxLocalVariables = 128;
+        constexpr size_t kMaxDecompileResponseEstimate = mcp::limits::result_bytes - 128 * 1024;
+
+        std::string Utf8Prefix(const std::string& value, size_t max_bytes) {
+            size_t length = std::min(value.size(), max_bytes);
+            while (length > 0 && length < value.size() &&
+                   (static_cast<unsigned char>(value[length]) & 0xC0) == 0x80) {
+                --length;
+            }
+            return value.substr(0, length);
+        }
+
+        std::string ReadItemBytes(ea_t ea, size_t item_size, size_t byte_limit, bool& truncated) {
+            std::string hex;
+            const size_t requested = std::min(item_size, byte_limit);
+            if (item_size > requested) truncated = true;
+            segment_t* segment = getseg(ea);
+            for (size_t index = 0; index < requested; ++index) {
+                sync::Checkpoint();
+                if (index > BADADDR - ea) { truncated = true; break; }
+                const ea_t byte_ea = ea + index;
+                if (!segment || byte_ea >= segment->end_ea || !is_loaded(byte_ea)) {
+                    truncated = true;
+                    break;
+                }
+                char byte_text[4]{};
+                qsnprintf(byte_text, sizeof(byte_text), "%02X", get_byte(byte_ea));
+                if (!hex.empty()) hex.push_back(' ');
+                hex += byte_text;
+            }
+            return hex;
+        }
+
         struct PathEdge {
             ea_t caller_start_ea = BADADDR;
             ea_t call_site_ea = BADADDR;
@@ -293,7 +329,9 @@ namespace tools::analysis {
             return true;
         }
 
-        std::string GetCleanPseudocode(func_t* pfn, std::string* err_out = nullptr, nlohmann::json* out_lvars = nullptr) {
+        std::string GetCleanPseudocode(func_t* pfn, std::string* err_out = nullptr, nlohmann::json* out_lvars = nullptr,
+                                       size_t code_limit = kMaxPseudocodeBytes, bool* code_truncated = nullptr,
+                                       bool* lvars_truncated = nullptr) {
             if (!init_hexrays_plugin()) {
                 if (err_out) *err_out = "Hex-Rays decompiler is not loaded or not supported for this architecture";
                 return "";
@@ -315,14 +353,24 @@ namespace tools::analysis {
                 sync::Checkpoint();
                 qstring clean_line;
                 tag_remove(&clean_line, sv[i].line);
-                code += tools::utils::SanitizeUtf8(clean_line.c_str()) + "\n";
+                std::string line = tools::utils::SanitizeUtf8(clean_line.c_str());
+                line.push_back('\n');
+                const size_t remaining = code_limit > code.size() ? code_limit - code.size() : 0;
+                if (line.size() > remaining) {
+                    code += Utf8Prefix(line, remaining);
+                    if (code_truncated) *code_truncated = true;
+                    break;
+                }
+                code += line;
             }
 
             if (out_lvars) {
                 *out_lvars = nlohmann::json::array();
                 const lvars_t* lvs = cfunc->get_lvars();
                 if (lvs) {
-                    for (size_t i = 0; i < lvs->size(); ++i) {
+                    const size_t variable_limit = std::min(lvs->size(), kMaxLocalVariables);
+                    if (lvs->size() > variable_limit && lvars_truncated) *lvars_truncated = true;
+                    for (size_t i = 0; i < variable_limit; ++i) {
                         sync::Checkpoint();
                         const lvar_t& v = (*lvs)[i];
                         if (v.name.empty() && !v.used()) continue;
@@ -330,8 +378,8 @@ namespace tools::analysis {
                         v.tif.print(&tbuf, nullptr, PRTYPE_1LINE | PRTYPE_SEMI);
                         nlohmann::ordered_json v_obj;
                         v_obj["index"] = i;
-                        v_obj["name"] = v.name.c_str();
-                        v_obj["type"] = tools::utils::SanitizeUtf8(tbuf.c_str());
+                        v_obj["name"] = Utf8Prefix(tools::utils::SanitizeUtf8(v.name.c_str()), 512);
+                        v_obj["type"] = Utf8Prefix(tools::utils::SanitizeUtf8(tbuf.c_str()), 1024);
                         v_obj["is_arg"] = v.is_arg_var();
                         v_obj["location"] = v.is_stk_var() ? "stack" : (v.is_reg_var() ? "reg" : "other");
                         out_lvars->push_back(std::move(v_obj));
@@ -358,16 +406,30 @@ namespace tools::analysis {
 
     nlohmann::json ApiAnalysis::Decompile(const nlohmann::json& id, const nlohmann::json& args) {
         const bool batched = args.contains("addrs");
+        if (batched && (!args["addrs"].is_array() || args["addrs"].empty() || args["addrs"].size() > 64))
+            return tools::utils::MakeToolErrorJson(id, "addrs must contain between 1 and 64 addresses", "invalid_addrs");
+        if (!batched && (!args.contains("addr") || !args["addr"].is_string()))
+            return tools::utils::MakeToolErrorJson(id, "Parameter 'addr' must be a string", "invalid_addr");
         const bool include_lvars = tools::utils::GetBoolArg(args, "include_lvars", false);
         const nlohmann::json addresses = batched ? args["addrs"] : nlohmann::json::array({args["addr"]});
         nlohmann::json results = nlohmann::json::array();
         size_t failed = 0;
+        size_t output_estimate = 0;
         for (const auto& address : addresses) {
             sync::Checkpoint();
-            const ea_t ea = tools::utils::ParseAddress(address.get<std::string>());
-            func_t* function = ea == BADADDR ? nullptr : get_func(ea);
             nlohmann::json item;
-            item["address"] = function ? tools::utils::FormatAddress(function->start_ea) : address.get<std::string>();
+            if (!address.is_string() || address.get_ref<const std::string&>().size() > 4096) {
+                item["address"] = "<invalid address>";
+                item["error_code"] = "invalid_addr";
+                item["message"] = "Address must be a string of at most 4096 characters";
+                results.push_back(std::move(item));
+                ++failed;
+                continue;
+            }
+            const std::string& address_text = address.get_ref<const std::string&>();
+            const ea_t ea = tools::utils::ParseAddress(address_text);
+            func_t* function = ea == BADADDR ? nullptr : get_func(ea);
+            item["address"] = function ? tools::utils::FormatAddress(function->start_ea) : address_text;
             if (!function) {
                 item["error_code"] = "function_not_found";
                 item["message"] = "Address is not inside a recognized function";
@@ -375,14 +437,54 @@ namespace tools::analysis {
             } else {
                 std::string error;
                 nlohmann::json lvars;
-                auto code = GetCleanPseudocode(function, &error, include_lvars ? &lvars : nullptr);
+                const size_t remaining = output_estimate < kMaxDecompileResponseEstimate
+                    ? kMaxDecompileResponseEstimate - output_estimate : 0;
+                const size_t code_limit = std::min(kMaxPseudocodeBytes, remaining / 2);
+                if (code_limit < 1024) {
+                    item["error_code"] = "result_limit_reached";
+                    item["message"] = "Decompilation output limit reached for this request";
+                    ++failed;
+                    results.push_back(std::move(item));
+                    continue;
+                }
+                bool code_truncated = false;
+                bool lvars_truncated = false;
+                auto code = GetCleanPseudocode(function, &error, include_lvars ? &lvars : nullptr,
+                                               code_limit, &code_truncated, &lvars_truncated);
                 if (code.empty()) {
                     item["error_code"] = "decompilation_failed";
-                    item["message"] = error;
+                    item["message"] = Utf8Prefix(error, 4096);
                     ++failed;
                 } else {
                     item["code"] = std::move(code);
                     if (include_lvars) item["lvars"] = std::move(lvars);
+                    if (code_truncated) item["code_truncated"] = true;
+                    if (lvars_truncated) item["lvars_truncated"] = true;
+
+                    size_t item_estimate = item.dump().size();
+                    const size_t item_budget = kMaxDecompileResponseEstimate - output_estimate;
+                    if (item_estimate > item_budget && include_lvars) {
+                        item.erase("lvars");
+                        item["lvars_truncated"] = true;
+                        item_estimate = item.dump().size();
+                    }
+                    if (item_estimate > item_budget) {
+                        std::string bounded_code = item["code"].get<std::string>();
+                        const size_t allowed = item_budget / 2;
+                        item["code"] = Utf8Prefix(bounded_code, allowed);
+                        item["code_truncated"] = true;
+                        item_estimate = item.dump().size();
+                    }
+                    if (item_estimate > item_budget) {
+                        item = {
+                            {"address", tools::utils::FormatAddress(function->start_ea)},
+                            {"error_code", "result_limit_reached"},
+                            {"message", "Decompilation output limit reached for this request"}
+                        };
+                        ++failed;
+                        item_estimate = item.dump().size();
+                    }
+                    output_estimate += item_estimate;
                 }
             }
             results.push_back(std::move(item));
@@ -395,24 +497,66 @@ namespace tools::analysis {
 
     nlohmann::json ApiAnalysis::Disasm(const nlohmann::json& id, const nlohmann::json& args) {
         // 1. Batch disassembly support
-        if ((args.contains("targets") && args["targets"].is_array()) ||
-            (args.contains("addrs") && args["addrs"].is_array())) {
-            const auto& t_arr = args.contains("targets") ? args["targets"] : args["addrs"];
-            size_t count_per_target = static_cast<size_t>(tools::utils::GetIntArg(args, "count", 5));
-            if (count_per_target <= 0) count_per_target = 5;
-            if (count_per_target > 100) count_per_target = 100;
+        const bool batched = args.contains("targets");
+        if (batched) {
+            if (!args["targets"].is_array() || args["targets"].empty() || args["targets"].size() > 64)
+                return tools::utils::MakeToolErrorJson(id, "targets must contain between 1 and 64 addresses", "invalid_targets");
+        } else if (!args.contains("addr") || !args["addr"].is_string()) {
+            return tools::utils::MakeToolErrorJson(id, "Parameter 'addr' must be a string", "invalid_addr");
+        }
+
+        int64_t count_arg = batched ? 5 : 50;
+        if (args.contains("count")) {
+            const auto& value = args["count"];
+            if (value.is_number_unsigned()) {
+                const uint64_t parsed = value.get<uint64_t>();
+                if (parsed > 1000) return tools::utils::MakeToolErrorJson(id, "count must not exceed 1000", "invalid_count");
+                count_arg = static_cast<int64_t>(parsed);
+            } else if (value.is_number_integer()) {
+                count_arg = value.get<int64_t>();
+            } else {
+                return tools::utils::MakeToolErrorJson(id, "count must be an integer", "invalid_count");
+            }
+        }
+        if (count_arg < 0 || count_arg > 1000)
+            return tools::utils::MakeToolErrorJson(id, "count must be between 0 and 1000", "invalid_count");
+        if (batched && count_arg > 100)
+            return tools::utils::MakeToolErrorJson(id, "Batch disassembly count must not exceed 100 per target", "invalid_count");
+
+        const size_t count = count_arg == 0 ? (batched ? 5 : 50) : static_cast<size_t>(count_arg);
+        if (batched) {
+            const auto& t_arr = args["targets"];
+            const size_t count_per_target = count;
             bool show_bytes = tools::utils::GetBoolArg(args, "bytes", false);
             std::string mnem_filter = tools::utils::GetStringArg(args, "mnemonic");
-            std::transform(mnem_filter.begin(), mnem_filter.end(), mnem_filter.begin(), ::tolower);
+            if (mnem_filter.size() > 1024)
+                return tools::utils::MakeToolErrorJson(id, "mnemonic must not exceed 1024 characters", "invalid_mnemonic");
+            mnem_filter = mcp::LowerAscii(std::move(mnem_filter));
 
             nlohmann::json batch_res = nlohmann::json::array();
+            size_t batch_failed = 0;
             sync::SyncRead([&]() {
                 for (const auto& t : t_arr) {
                     sync::Checkpoint();
                     ea_t t_ea = BADADDR;
-                    if (t.is_string()) t_ea = tools::utils::ParseAddress(t.get<std::string>());
-                    else if (t.is_number_integer()) t_ea = static_cast<ea_t>(t.get<uint64_t>());
-                    if (t_ea == BADADDR || !is_mapped(t_ea)) continue;
+                    if (t.is_string() && t.get_ref<const std::string&>().size() <= 4096)
+                        t_ea = tools::utils::ParseAddress(t.get_ref<const std::string&>());
+                    else if (t.is_number_unsigned()) t_ea = static_cast<ea_t>(t.get<uint64_t>());
+                    else if (t.is_number_integer()) {
+                        const int64_t numeric = t.get<int64_t>();
+                        if (numeric >= 0) t_ea = static_cast<ea_t>(numeric);
+                    }
+
+                    nlohmann::ordered_json item;
+                    if (t_ea == BADADDR || !is_mapped(t_ea)) {
+                        item["address"] = t.is_string() && t.get_ref<const std::string&>().size() <= 4096
+                            ? t.get<std::string>() : "<invalid address>";
+                        item["error_code"] = "invalid_addr";
+                        item["message"] = "Target address could not be resolved to mapped memory";
+                        batch_res.push_back(std::move(item));
+                        ++batch_failed;
+                        continue;
+                    }
 
                     ea_t head = get_item_head(t_ea);
                     if (head != BADADDR && is_mapped(head) && head <= t_ea) {
@@ -420,6 +564,7 @@ namespace tools::analysis {
                     }
 
                     std::vector<std::string> insns;
+                    bool bytes_truncated = false;
                     ea_t cur = t_ea;
                     size_t fetched = 0;
                     while (fetched < count_per_target && cur != BADADDR && is_mapped(cur)) {
@@ -432,7 +577,7 @@ namespace tools::analysis {
                             qstring mn_buf;
                             print_insn_mnem(&mn_buf, cur);
                             std::string mn = mn_buf.c_str();
-                            std::transform(mn.begin(), mn.end(), mn.begin(), ::tolower);
+                            mn = mcp::LowerAscii(std::move(mn));
                             if (mn != mnem_filter) keep = false;
                         }
 
@@ -440,14 +585,8 @@ namespace tools::analysis {
                             if (show_bytes) {
                                 ea_t sz = get_item_size(cur);
                                 if (sz == 0) sz = 1;
-                                size_t max_b = std::min<size_t>(sz, 8);
-                                std::string hex_col;
-                                for (size_t b = 0; b < max_b; ++b) {
-                                    sync::Checkpoint();
-                                    char h[4];
-                                    qsnprintf(h, sizeof(h), "%02X ", get_byte(cur + b));
-                                    hex_col += h;
-                                }
+                                std::string hex_col = ReadItemBytes(cur, static_cast<size_t>(sz), 8, bytes_truncated);
+                                if (get_item_size(cur) > 8) hex_col += " ...";
                                 insns.push_back(tools::utils::FormatAddress(cur) + ":  " + hex_col + "  " + dis);
                             } else {
                                 insns.push_back(tools::utils::FormatAddress(cur) + ":  " + dis);
@@ -460,10 +599,10 @@ namespace tools::analysis {
                         cur = nxt;
                     }
 
-                    nlohmann::ordered_json item;
                     item["address"] = tools::utils::FormatAddress(t_ea);
                     item["count"] = insns.size();
                     item["instructions"] = insns;
+                    if (bytes_truncated) item["bytes_truncated"] = true;
                     batch_res.push_back(std::move(item));
                 }
             });
@@ -472,23 +611,19 @@ namespace tools::analysis {
             res["status"] = "success";
             res["count"] = batch_res.size();
             res["results"] = batch_res;
-            return tools::utils::MakeToolSuccessJson(id, res);
+            return tools::utils::MakeToolResultJson(id, res, !batch_res.empty() && batch_failed == batch_res.size());
         }
 
         // 2. Single address disassembly
         ea_t start_ea = tools::utils::GetAddressArg(args, "addr");
-        if (start_ea == BADADDR) start_ea = tools::utils::GetAddressArg(args, "func");
-        if (start_ea == BADADDR) start_ea = tools::utils::GetAddressArg(args, "start");
-
-        size_t count = static_cast<size_t>(tools::utils::GetIntArg(args, "count", 50));
-        if (count <= 0) count = 50;
-        if (count > 1000) count = 1000;
 
         bool show_bytes = tools::utils::GetBoolArg(args, "bytes", false);
         bool stop_at_func_end = tools::utils::GetBoolArg(args, "stop_at_func_end", true);
         bool detailed = tools::utils::GetBoolArg(args, "detailed", false);
         std::string mnem_filter = tools::utils::GetStringArg(args, "mnemonic");
-        std::transform(mnem_filter.begin(), mnem_filter.end(), mnem_filter.begin(), ::tolower);
+        if (mnem_filter.size() > 1024)
+            return tools::utils::MakeToolErrorJson(id, "mnemonic must not exceed 1024 characters", "invalid_mnemonic");
+        mnem_filter = mcp::LowerAscii(std::move(mnem_filter));
 
         if (start_ea == BADADDR) {
             return tools::utils::MakeToolErrorJson(id, "Parameter 'addr' could not be resolved", "invalid_addr");
@@ -497,6 +632,7 @@ namespace tools::analysis {
         std::vector<std::string> instructions;
         std::vector<nlohmann::ordered_json> items;
         bool decoded_any = false;
+        bool bytes_truncated = false;
         ea_t next_ea = BADADDR;
         std::string func_name;
 
@@ -534,7 +670,7 @@ namespace tools::analysis {
                         qstring mn_buf;
                         print_insn_mnem(&mn_buf, cur);
                         std::string mn = mn_buf.c_str();
-                        std::transform(mn.begin(), mn.end(), mn.begin(), ::tolower);
+                        mn = mcp::LowerAscii(std::move(mn));
                         if (mn != mnem_filter) keep = false;
                     }
 
@@ -543,20 +679,13 @@ namespace tools::analysis {
                         if (item_size == 0) item_size = 1;
 
                         std::string hex_str;
+                        bool item_bytes_truncated = false;
                         if (show_bytes || detailed) {
-                            size_t max_bytes = std::min<size_t>(item_size, 15);
-                            for (size_t b = 0; b < max_bytes; ++b) {
-                                sync::Checkpoint();
-                                uint8_t byte_val = get_byte(cur + b);
-                                char hex_b[4];
-                                qsnprintf(hex_b, sizeof(hex_b), "%02X ", byte_val);
-                                hex_str += hex_b;
-                            }
+                            hex_str = ReadItemBytes(cur, static_cast<size_t>(item_size), 15, item_bytes_truncated);
                             if (item_size > 15) {
-                                hex_str += "...";
-                            } else if (!hex_str.empty()) {
-                                hex_str.pop_back();
+                                hex_str += " ...";
                             }
+                            bytes_truncated = bytes_truncated || item_bytes_truncated;
                         }
 
                         if (show_bytes) {
@@ -575,6 +704,7 @@ namespace tools::analysis {
                             item["size"] = item_size;
                             item["bytes"] = hex_str;
                             item["disasm"] = dis;
+                            if (item_bytes_truncated) item["bytes_truncated"] = true;
                             items.push_back(std::move(item));
                         }
 
@@ -609,7 +739,7 @@ namespace tools::analysis {
                         qstring mn_buf;
                         print_insn_mnem(&mn_buf, cur);
                         std::string mn = mn_buf.c_str();
-                        std::transform(mn.begin(), mn.end(), mn.begin(), ::tolower);
+                        mn = mcp::LowerAscii(std::move(mn));
                         if (mn != mnem_filter) keep = false;
                     }
 
@@ -618,20 +748,13 @@ namespace tools::analysis {
                         if (item_size == 0) item_size = 1;
 
                         std::string hex_str;
+                        bool item_bytes_truncated = false;
                         if (show_bytes || detailed) {
-                            size_t max_bytes = std::min<size_t>(item_size, 15);
-                            for (size_t b = 0; b < max_bytes; ++b) {
-                                sync::Checkpoint();
-                                uint8_t byte_val = get_byte(cur + b);
-                                char hex_b[4];
-                                qsnprintf(hex_b, sizeof(hex_b), "%02X ", byte_val);
-                                hex_str += hex_b;
-                            }
+                            hex_str = ReadItemBytes(cur, static_cast<size_t>(item_size), 15, item_bytes_truncated);
                             if (item_size > 15) {
-                                hex_str += "...";
-                            } else if (!hex_str.empty()) {
-                                hex_str.pop_back();
+                                hex_str += " ...";
                             }
+                            bytes_truncated = bytes_truncated || item_bytes_truncated;
                         }
 
                         if (show_bytes) {
@@ -650,6 +773,7 @@ namespace tools::analysis {
                             item["size"] = item_size;
                             item["bytes"] = hex_str;
                             item["disasm"] = dis;
+                            if (item_bytes_truncated) item["bytes_truncated"] = true;
                             items.push_back(std::move(item));
                         }
 
@@ -687,6 +811,7 @@ namespace tools::analysis {
         if (detailed) {
             res["items"] = items;
         }
+        if (bytes_truncated) res["bytes_truncated"] = true;
         if (next_ea != BADADDR && is_mapped(next_ea)) {
             res["next_cursor"] = tools::utils::FormatAddress(next_ea);
         }
@@ -695,19 +820,18 @@ namespace tools::analysis {
 
     nlohmann::json ApiAnalysis::BasicBlocks(const nlohmann::json& id, const nlohmann::json& args) {
         ea_t start_ea = tools::utils::GetAddressArg(args, "addr");
-        if (start_ea == BADADDR) start_ea = tools::utils::GetAddressArg(args, "func");
-        if (start_ea == BADADDR) start_ea = tools::utils::GetAddressArg(args, "target");
-        if (start_ea == BADADDR) start_ea = tools::utils::GetAddressArg(args, "function");
-
         if (start_ea == BADADDR) {
-            std::string raw = tools::utils::GetStringArg(args, "addr", tools::utils::GetStringArg(args, "func"));
+            std::string raw = tools::utils::GetStringArg(args, "addr");
             std::string msg = "Parameter 'addr' could not be resolved";
             if (!raw.empty()) msg += ": " + raw;
             return tools::utils::MakeToolErrorJson(id, msg, "invalid_addr");
         }
 
-        bool no_external = tools::utils::GetBoolArg(args, "no_external", tools::utils::GetBoolArg(args, "internal_only", false));
-        bool include_instructions = tools::utils::GetBoolArg(args, "include_instructions", tools::utils::GetBoolArg(args, "disasm", false));
+        constexpr size_t kMaxBasicBlocks = 512;
+        constexpr size_t kMaxInstructions = 2048;
+        constexpr size_t kMaxInstructionTextBytes = 512 * 1024;
+        bool no_external = tools::utils::GetBoolArg(args, "no_external", false);
+        bool include_instructions = tools::utils::GetBoolArg(args, "include_instructions", false);
 
         std::vector<nlohmann::ordered_json> blocks_arr;
         ea_t fn_start = BADADDR;
@@ -716,15 +840,14 @@ namespace tools::analysis {
         bool found_fn = false;
         size_t total_edges = 0;
         int cyclomatic_complexity = 1;
+        size_t total_blocks = 0;
+        size_t instruction_count = 0;
+        size_t instruction_text_bytes = 0;
+        bool blocks_truncated = false;
+        bool instructions_truncated = false;
 
         sync::SyncRead([&]() {
             func_t* fn = get_func(start_ea);
-            if (!fn) {
-                if (is_code(get_flags(start_ea))) {
-                    add_func(start_ea);
-                    fn = get_func(start_ea);
-                }
-            }
             if (!fn) return;
 
             found_fn = true;
@@ -743,6 +866,9 @@ namespace tools::analysis {
             if (no_external) fc_flags |= FC_NOEXT;
 
             qflow_chart_t fc("", fn, fn->start_ea, fn->end_ea, fc_flags);
+            total_blocks = fc.blocks.size();
+            const size_t emitted_blocks = std::min(total_blocks, kMaxBasicBlocks);
+            blocks_truncated = total_blocks > emitted_blocks;
 
             // 1. Identify loop headers across the flow chart
             std::set<int> loop_header_ids;
@@ -751,7 +877,10 @@ namespace tools::analysis {
                 sync::Checkpoint();
                 const qbasic_block_t& b = fc.blocks[i];
                 int n_succ = fc.nsucc(static_cast<int>(i));
-                total_edges += n_succ;
+                if (static_cast<size_t>(n_succ) > std::numeric_limits<size_t>::max() - total_edges)
+                    total_edges = std::numeric_limits<size_t>::max();
+                else
+                    total_edges += static_cast<size_t>(n_succ);
                 for (int s = 0; s < n_succ; ++s) {
                     sync::Checkpoint();
                     int succ_idx = fc.succ(static_cast<int>(i), s);
@@ -765,11 +894,14 @@ namespace tools::analysis {
 
             cyclomatic_complexity = 1;
             if (!fc.blocks.empty()) {
-                cyclomatic_complexity = static_cast<int>(total_edges) - static_cast<int>(fc.blocks.size()) + 2;
+                const int64_t complexity = total_edges > static_cast<size_t>(std::numeric_limits<int64_t>::max())
+                    ? std::numeric_limits<int64_t>::max()
+                    : static_cast<int64_t>(total_edges) - static_cast<int64_t>(fc.blocks.size()) + 2;
+                cyclomatic_complexity = static_cast<int>(std::clamp<int64_t>(complexity, 1, std::numeric_limits<int>::max()));
                 if (cyclomatic_complexity < 1) cyclomatic_complexity = 1;
             }
 
-            for (size_t i = 0; i < fc.blocks.size(); ++i) {
+            for (size_t i = 0; i < emitted_blocks; ++i) {
                 sync::Checkpoint();
                 const qbasic_block_t& b = fc.blocks[i];
                 size_t blk_size = (b.end_ea >= b.start_ea) ? (b.end_ea - b.start_ea) : 0;
@@ -891,9 +1023,20 @@ namespace tools::analysis {
                     ea_t cur = b.start_ea;
                     while (cur < b.end_ea && cur != BADADDR && is_mapped(cur)) {
                         sync::Checkpoint();
+                        if (instruction_count >= kMaxInstructions || instruction_text_bytes >= kMaxInstructionTextBytes) {
+                            instructions_truncated = true;
+                            break;
+                        }
                         std::string dis = CleanDisasmLine(cur);
                         if (!dis.empty()) {
-                            insns.push_back(tools::utils::FormatAddress(cur) + ":  " + dis);
+                            std::string line = tools::utils::FormatAddress(cur) + ":  " + dis;
+                            if (line.size() > kMaxInstructionTextBytes - instruction_text_bytes) {
+                                instructions_truncated = true;
+                                break;
+                            }
+                            instruction_text_bytes += line.size();
+                            ++instruction_count;
+                            insns.push_back(std::move(line));
                         }
                         ea_t nxt = get_item_end(cur);
                         if (nxt == BADADDR || nxt <= cur) break;
@@ -922,45 +1065,81 @@ namespace tools::analysis {
             res["demangled"] = demangled_str;
         }
         res["block_count"] = blocks_arr.size();
+        if (blocks_truncated) {
+            res["total_block_count"] = total_blocks;
+            res["blocks_truncated"] = true;
+        }
         res["edge_count"] = total_edges;
         res["cyclomatic_complexity"] = cyclomatic_complexity;
         res["blocks"] = blocks_arr;
+        if (instructions_truncated) {
+            res["instruction_count"] = instruction_count;
+            res["instructions_truncated"] = true;
+        }
         return tools::utils::MakeToolSuccessJson(id, res);
     }
 
     nlohmann::json ApiAnalysis::XrefQuery(const nlohmann::json& id, const nlohmann::json& args) {
         ea_t target_ea = tools::utils::GetAddressArg(args, "addr");
-        if (target_ea == BADADDR) target_ea = tools::utils::GetAddressArg(args, "target");
-        if (target_ea == BADADDR) target_ea = tools::utils::GetAddressArg(args, "func");
 
         if (target_ea == BADADDR) {
-            std::string raw = tools::utils::GetStringArg(args, "addr", tools::utils::GetStringArg(args, "target"));
+            std::string raw = tools::utils::GetStringArg(args, "addr");
             std::string msg = "Parameter 'addr' could not be resolved";
             if (!raw.empty()) msg += ": " + raw;
             return tools::utils::MakeToolErrorJson(id, msg, "invalid_addr");
         }
 
         std::string direction = tools::utils::GetStringArg(args, "direction", "to");
-        std::string type_filter = tools::utils::GetStringArg(args, "type", tools::utils::GetStringArg(args, "xref_type", "all"));
-        std::transform(type_filter.begin(), type_filter.end(), type_filter.begin(), ::tolower);
+        std::string type_filter = tools::utils::GetStringArg(args, "type", "all");
+        type_filter = mcp::LowerAscii(std::move(type_filter));
+        if (direction != "to" && direction != "from" && direction != "both")
+            return tools::utils::MakeToolErrorJson(id, "Direction must be 'to', 'from', or 'both'", "invalid_direction");
+        if (type_filter != "all" && type_filter != "*" && type_filter != "code" && type_filter != "data"
+            && type_filter != "call" && type_filter != "jump" && type_filter != "read" && type_filter != "write" && type_filter != "offset")
+            return tools::utils::MakeToolErrorJson(id, "Unsupported xref type: " + type_filter, "invalid_xref_type");
 
         bool include_flow = tools::utils::GetBoolArg(args, "include_flow", false);
 
-        size_t offset = static_cast<size_t>(tools::utils::GetIntArg(args, "offset", 0));
-        if (offset == 0) {
-            std::string cursor_str = tools::utils::GetStringArg(args, "cursor");
-            if (!cursor_str.empty()) {
-                try {
-                    offset = static_cast<size_t>(std::stoull(cursor_str, nullptr, 0));
-                } catch (const sync::OperationStopped&) { throw; } catch (...) {}
+        size_t offset = 0;
+        const std::string cursor_str = tools::utils::GetStringArg(args, "cursor");
+        if (!cursor_str.empty()) {
+            try {
+                if (cursor_str.find_first_not_of("0123456789") != std::string::npos) throw std::invalid_argument("cursor");
+                size_t consumed = 0;
+                const unsigned long long parsed = std::stoull(cursor_str, &consumed, 10);
+                if (consumed != cursor_str.size() || parsed > std::numeric_limits<size_t>::max()) throw std::invalid_argument("cursor");
+                offset = static_cast<size_t>(parsed);
+            } catch (...) {
+                return tools::utils::MakeToolErrorJson(id, "Cursor must be a non-negative integer offset", "invalid_cursor");
             }
         }
 
-        size_t count = static_cast<size_t>(tools::utils::GetIntArg(args, "count", 100));
-        if (count <= 0) count = 100;
-        if (count > 2000) count = 2000;
+        size_t count = 100;
+        if (args.contains("count")) {
+            const auto& count_arg = args["count"];
+            if (!count_arg.is_number_integer()) {
+                return tools::utils::MakeToolErrorJson(id, "Count must be an integer from 1 to 2000", "invalid_count");
+            }
+            if (count_arg.is_number_unsigned()) {
+                const uint64_t parsed = count_arg.get<uint64_t>();
+                if (parsed < 1 || parsed > 2000)
+                    return tools::utils::MakeToolErrorJson(id, "Count must be an integer from 1 to 2000", "invalid_count");
+                count = static_cast<size_t>(parsed);
+            } else {
+                const int64_t parsed = count_arg.get<int64_t>();
+                if (parsed < 1 || parsed > 2000)
+                    return tools::utils::MakeToolErrorJson(id, "Count must be an integer from 1 to 2000", "invalid_count");
+                count = static_cast<size_t>(parsed);
+            }
+        }
 
-        std::vector<nlohmann::ordered_json> all_xrefs;
+        std::vector<nlohmann::ordered_json> paged_xrefs;
+        size_t total_matches = 0;
+        auto append_xref = [&](nlohmann::ordered_json&& item) {
+            if (total_matches >= offset && paged_xrefs.size() < count)
+                paged_xrefs.push_back(std::move(item));
+            ++total_matches;
+        };
         std::string target_name;
         std::string target_demangled;
 
@@ -1047,7 +1226,7 @@ namespace tools::analysis {
                         }
                     }
 
-                    all_xrefs.push_back(std::move(item));
+                    append_xref(std::move(item));
                 }
             }
 
@@ -1101,24 +1280,12 @@ namespace tools::analysis {
                         }
                     }
 
-                    all_xrefs.push_back(std::move(item));
+                    append_xref(std::move(item));
                 }
             }
         });
 
-        size_t total_matches = all_xrefs.size();
-        std::vector<nlohmann::ordered_json> paged_xrefs;
-        int next_offset = -1;
-
-        for (size_t i = offset; i < all_xrefs.size() && paged_xrefs.size() < count; ++i) {
-            sync::Checkpoint();
-            paged_xrefs.push_back(std::move(all_xrefs[i]));
-            next_offset = static_cast<int>(i + 1);
-        }
-
-        if (next_offset >= static_cast<int>(total_matches)) {
-            next_offset = -1;
-        }
+        const bool has_next_page = !paged_xrefs.empty() && offset + paged_xrefs.size() < total_matches;
 
         nlohmann::ordered_json res;
         res["status"] = "success";
@@ -1132,17 +1299,12 @@ namespace tools::analysis {
         res["total"] = total_matches;
 
         res["xrefs"] = paged_xrefs;
-        if (next_offset != -1) {
-            res["next_cursor"] = std::to_string(next_offset);
-
-        }
+        if (has_next_page) res["next_cursor"] = std::to_string(offset + paged_xrefs.size());
         return tools::utils::MakeToolSuccessJson(id, res);
     }
 
     nlohmann::json ApiAnalysis::Callgraph(const nlohmann::json& id, const nlohmann::json& args) {
         ea_t root_ea = tools::utils::GetAddressArg(args, "addr");
-        if (root_ea == BADADDR) root_ea = tools::utils::GetAddressArg(args, "root");
-        if (root_ea == BADADDR) root_ea = tools::utils::GetAddressArg(args, "func");
 
         if (root_ea == BADADDR) {
             std::string raw = tools::utils::GetStringArg(args, "addr", tools::utils::GetStringArg(args, "root"));
@@ -1160,9 +1322,9 @@ namespace tools::analysis {
         if (max_nodes > 2000) max_nodes = 2000;
 
         std::string direction = tools::utils::GetStringArg(args, "direction", "callees");
-        std::transform(direction.begin(), direction.end(), direction.begin(), ::tolower);
+        direction = mcp::LowerAscii(std::move(direction));
         if (direction != "callees" && direction != "callers" && direction != "both") {
-            direction = "callees";
+            return tools::utils::MakeToolErrorJson(id, "Direction must be 'callees', 'callers', or 'both'", "invalid_direction");
         }
 
         bool include_nodes = tools::utils::GetBoolArg(args, "include_nodes", true);
@@ -1195,6 +1357,11 @@ namespace tools::analysis {
 
         std::map<EdgeKey, EdgeInfo> edge_map;
         std::map<ea_t, NodeInfo> node_map;
+        constexpr size_t MAX_GRAPH_EDGES = 4096;
+        constexpr size_t MAX_CALL_SITES_PER_EDGE = 16;
+        constexpr size_t MAX_GRAPH_STEPS = 200000;
+        size_t graph_steps = 0;
+        bool graph_truncated = false;
         ea_t root_fn_ea = BADADDR;
         std::string root_name;
         std::string root_demangled;
@@ -1223,7 +1390,7 @@ namespace tools::analysis {
                 q.push({root_fn_ea, 0});
                 visited_callees.insert(root_fn_ea);
 
-                while (!q.empty() && node_map.size() < static_cast<size_t>(max_nodes)) {
+                while (!q.empty() && node_map.size() < static_cast<size_t>(max_nodes) && !graph_truncated) {
                     sync::Checkpoint();
                     auto item = q.front();
                     q.pop();
@@ -1237,12 +1404,13 @@ namespace tools::analysis {
                     std::string caller_dem = tools::utils::Demangle(caller_name);
 
                     func_item_iterator_t fii;
-                    for (bool ok = fii.set(fn, fn->start_ea); ok; ok = fii.next_head()) {
+                    for (bool ok = fii.set(fn, fn->start_ea); ok && !graph_truncated; ok = fii.next_head()) {
                         sync::Checkpoint();
                         ea_t cur = fii.current();
                         xrefblk_t xb;
-                        for (bool xok = xb.first_from(cur, XREF_ALL); xok; xok = xb.next_from()) {
+                        for (bool xok = xb.first_from(cur, XREF_ALL); xok && !graph_truncated; xok = xb.next_from()) {
                             sync::Checkpoint();
+                            if (++graph_steps > MAX_GRAPH_STEPS) { graph_truncated = true; break; }
                             uint8_t base_type = xb.type & XREF_MASK;
                             if (xb.iscode && (base_type == fl_CN || base_type == fl_CF)) {
                                 ea_t target = xb.to;
@@ -1259,6 +1427,10 @@ namespace tools::analysis {
                                     }
                                 }
 
+                                if (node_map.find(target) == node_map.end() && node_map.size() >= static_cast<size_t>(max_nodes)) {
+                                    graph_truncated = true;
+                                    break;
+                                }
                                 if (node_map.find(target) == node_map.end()) {
                                     node_map[target] = NodeInfo{target, target_name, target_dem, false, target_is_import};
                                 }
@@ -1266,6 +1438,7 @@ namespace tools::analysis {
                                 EdgeKey key{fn->start_ea, target};
                                 auto it = edge_map.find(key);
                                 if (it == edge_map.end()) {
+                                    if (edge_map.size() >= MAX_GRAPH_EDGES) { graph_truncated = true; break; }
                                     EdgeInfo einfo;
                                     einfo.caller_name = caller_name;
                                     einfo.caller_demangled = caller_dem;
@@ -1275,7 +1448,8 @@ namespace tools::analysis {
                                     einfo.call_sites.push_back(tools::utils::FormatAddress(cur));
                                     edge_map[key] = std::move(einfo);
                                 } else {
-                                    it->second.call_sites.push_back(tools::utils::FormatAddress(cur));
+                                    if (it->second.call_sites.size() < MAX_CALL_SITES_PER_EDGE)
+                                        it->second.call_sites.push_back(tools::utils::FormatAddress(cur));
                                 }
 
                                 if (!target_is_import && visited_callees.find(target) == visited_callees.end()) {
@@ -1286,6 +1460,7 @@ namespace tools::analysis {
                         }
                     }
                 }
+                if (!q.empty() && node_map.size() >= static_cast<size_t>(max_nodes)) graph_truncated = true;
             };
 
             auto traverse_callers = [&]() {
@@ -1295,7 +1470,7 @@ namespace tools::analysis {
                 q.push({root_fn_ea, 0});
                 visited_callers.insert(root_fn_ea);
 
-                while (!q.empty() && node_map.size() < static_cast<size_t>(max_nodes)) {
+                while (!q.empty() && node_map.size() < static_cast<size_t>(max_nodes) && !graph_truncated) {
                     sync::Checkpoint();
                     auto item = q.front();
                     q.pop();
@@ -1306,8 +1481,9 @@ namespace tools::analysis {
                     std::string callee_dem = tools::utils::Demangle(callee_name);
 
                     xrefblk_t xb;
-                    for (bool ok = xb.first_to(item.ea, XREF_ALL); ok; ok = xb.next_to()) {
+                    for (bool ok = xb.first_to(item.ea, XREF_ALL); ok && !graph_truncated; ok = xb.next_to()) {
                         sync::Checkpoint();
+                        if (++graph_steps > MAX_GRAPH_STEPS) { graph_truncated = true; break; }
                         uint8_t base_type = xb.type & XREF_MASK;
                         if (xb.iscode && (base_type == fl_CN || base_type == fl_CF)) {
                             func_t* caller_fn = get_func(xb.from);
@@ -1317,6 +1493,10 @@ namespace tools::analysis {
                             std::string caller_name = GetSymbolName(caller_ea);
                             std::string caller_dem = tools::utils::Demangle(caller_name);
 
+                            if (node_map.find(caller_ea) == node_map.end() && node_map.size() >= static_cast<size_t>(max_nodes)) {
+                                graph_truncated = true;
+                                break;
+                            }
                             if (node_map.find(caller_ea) == node_map.end()) {
                                 node_map[caller_ea] = NodeInfo{caller_ea, caller_name, caller_dem, false, false};
                             }
@@ -1324,6 +1504,7 @@ namespace tools::analysis {
                             EdgeKey key{caller_ea, item.ea};
                             auto it = edge_map.find(key);
                             if (it == edge_map.end()) {
+                                if (edge_map.size() >= MAX_GRAPH_EDGES) { graph_truncated = true; break; }
                                 EdgeInfo einfo;
                                 einfo.caller_name = caller_name;
                                 einfo.caller_demangled = caller_dem;
@@ -1333,7 +1514,8 @@ namespace tools::analysis {
                                 einfo.call_sites.push_back(tools::utils::FormatAddress(xb.from));
                                 edge_map[key] = std::move(einfo);
                             } else {
-                                it->second.call_sites.push_back(tools::utils::FormatAddress(xb.from));
+                                if (it->second.call_sites.size() < MAX_CALL_SITES_PER_EDGE)
+                                    it->second.call_sites.push_back(tools::utils::FormatAddress(xb.from));
                             }
 
                             if (visited_callers.find(caller_ea) == visited_callers.end()) {
@@ -1343,6 +1525,7 @@ namespace tools::analysis {
                         }
                     }
                 }
+                if (!q.empty() && node_map.size() >= static_cast<size_t>(max_nodes)) graph_truncated = true;
             };
 
             if (direction == "callees" || direction == "both") {
@@ -1396,6 +1579,7 @@ namespace tools::analysis {
             res["nodes"] = nodes_arr;
         }
         res["edges"] = edges_arr;
+        if (graph_truncated) res["truncated"] = true;
         return tools::utils::MakeToolSuccessJson(id, res);
     }
 
@@ -1404,6 +1588,9 @@ namespace tools::analysis {
         if (raw_pattern.empty()) {
             return tools::utils::MakeToolErrorJson(id, "Parameter 'pattern' is required", "pattern_required");
         }
+        if (raw_pattern.size() > 1024) {
+            return tools::utils::MakeToolErrorJson(id, "Parameter 'pattern' must not exceed 1024 characters", "invalid_pattern");
+        }
 
         std::string pattern_str;
         std::string sanitize_err;
@@ -1411,24 +1598,44 @@ namespace tools::analysis {
             return tools::utils::MakeToolErrorJson(id, sanitize_err, "invalid_pattern");
         }
 
-        size_t offset = static_cast<size_t>(tools::utils::GetIntArg(args, "offset", 0));
         ea_t cursor_ea = tools::utils::GetAddressArg(args, "cursor", BADADDR);
-        std::string cursor_str = tools::utils::GetStringArg(args, "cursor");
-        if (cursor_ea == BADADDR && !cursor_str.empty()) {
-            try { offset = static_cast<size_t>(std::stoul(cursor_str)); } catch (const sync::OperationStopped&) { throw; } catch (...) {}
+        if (args.contains("cursor") && cursor_ea == BADADDR) {
+            return tools::utils::MakeToolErrorJson(id, "Cursor is not a valid address", "invalid_cursor");
         }
 
-        size_t count = static_cast<size_t>(tools::utils::GetIntArg(args, "count", 50));
-        if (count <= 0) count = 50;
-        if (count > 1000) count = 1000;
+        int64_t count_arg = 50;
+        if (args.contains("count")) {
+            const auto& count_value = args["count"];
+            if (count_value.is_number_unsigned()) {
+                const uint64_t value = count_value.get<uint64_t>();
+                if (value > 1000) return tools::utils::MakeToolErrorJson(id, "count must be between 1 and 1000", "invalid_count");
+                count_arg = static_cast<int64_t>(value);
+            } else if (count_value.is_number_integer()) {
+                count_arg = count_value.get<int64_t>();
+            } else {
+                return tools::utils::MakeToolErrorJson(id, "count must be an integer", "invalid_count");
+            }
+        }
+        if (count_arg < 1 || count_arg > 1000)
+            return tools::utils::MakeToolErrorJson(id, "count must be between 1 and 1000", "invalid_count");
+        const size_t count = static_cast<size_t>(count_arg);
 
         ea_t start_scope = BADADDR;
         ea_t max_ea = BADADDR;
+        std::string scope_error;
 
-        std::string seg_name_arg = tools::utils::GetStringArg(args, "segment", tools::utils::GetStringArg(args, "seg"));
-        ea_t fn_ea = tools::utils::GetAddressArg(args, "func", tools::utils::GetAddressArg(args, "function", BADADDR));
-        ea_t explicit_start = tools::utils::GetAddressArg(args, "start", tools::utils::GetAddressArg(args, "start_ea", BADADDR));
-        ea_t explicit_end = tools::utils::GetAddressArg(args, "end", tools::utils::GetAddressArg(args, "end_ea", BADADDR));
+        std::string seg_name_arg = tools::utils::GetStringArg(args, "segment");
+        ea_t fn_ea = tools::utils::GetAddressArg(args, "func");
+        ea_t explicit_start = tools::utils::GetAddressArg(args, "start");
+        ea_t explicit_end = tools::utils::GetAddressArg(args, "end");
+        if (args.contains("segment") && args.contains("func"))
+            return tools::utils::MakeToolErrorJson(id, "Specify either 'segment' or 'func' as the base scope", "conflicting_scope");
+        if (args.contains("func") && fn_ea == BADADDR)
+            return tools::utils::MakeToolErrorJson(id, "Function address or name could not be resolved", "invalid_function");
+        if (args.contains("start") && explicit_start == BADADDR)
+            return tools::utils::MakeToolErrorJson(id, "Start address could not be resolved", "invalid_start");
+        if (args.contains("end") && explicit_end == BADADDR)
+            return tools::utils::MakeToolErrorJson(id, "End address could not be resolved", "invalid_end");
 
         sync::SyncRead([&]() {
             if (!seg_name_arg.empty()) {
@@ -1436,25 +1643,43 @@ namespace tools::analysis {
                 if (s) {
                     start_scope = s->start_ea;
                     max_ea = s->end_ea;
+                } else {
+                    scope_error = "Segment '" + seg_name_arg + "' was not found";
                 }
             } else if (fn_ea != BADADDR) {
                 func_t* f = get_func(fn_ea);
                 if (f) {
                     start_scope = f->start_ea;
                     max_ea = f->end_ea;
+                } else {
+                    scope_error = "Function target does not belong to a recognized function";
                 }
             }
 
-            if (explicit_start != BADADDR) start_scope = explicit_start;
-            if (explicit_end != BADADDR) max_ea = explicit_end;
-            if (cursor_ea != BADADDR) start_scope = cursor_ea;
-
             if (start_scope == BADADDR) start_scope = inf_get_min_ea();
             if (max_ea == BADADDR) max_ea = inf_get_max_ea();
+            const ea_t scope_start = start_scope;
+            const ea_t scope_end = max_ea;
+            if (explicit_start != BADADDR) {
+                if (explicit_start < scope_start || explicit_start >= scope_end)
+                    scope_error = "Start address lies outside the selected search scope";
+                else start_scope = explicit_start;
+            }
+            if (explicit_end != BADADDR) {
+                if (explicit_end > scope_end || explicit_end <= scope_start)
+                    scope_error = "End address lies outside the selected search scope";
+                else max_ea = explicit_end;
+            }
+            if (start_scope >= max_ea) scope_error = "Search range must have start < end";
+            if (cursor_ea != BADADDR) {
+                if (cursor_ea < start_scope || cursor_ea >= max_ea)
+                    scope_error = "Cursor lies outside the selected search range";
+                else start_scope = cursor_ea;
+            }
         });
+        if (!scope_error.empty()) return tools::utils::MakeToolErrorJson(id, scope_error, "invalid_scope");
 
         nlohmann::ordered_json matches = nlohmann::ordered_json::array();
-        int next_offset = -1;
         ea_t next_cursor_ea = BADADDR;
         std::string parse_err;
 
@@ -1467,7 +1692,6 @@ namespace tools::analysis {
             }
 
             ea_t search_cur = start_scope;
-            size_t current_idx = 0;
             size_t fetched = 0;
 
             while (search_cur != BADADDR && search_cur < max_ea && fetched < count) {
@@ -1475,36 +1699,40 @@ namespace tools::analysis {
                 ea_t match_ea = bin_search(search_cur, max_ea, bbv, BIN_SEARCH_FORWARD | BIN_SEARCH_NOBREAK | BIN_SEARCH_NOSHOW);
                 if (match_ea == BADADDR) break;
 
-                if (current_idx >= offset) {
-                    nlohmann::ordered_json item;
-                    item["address"] = tools::utils::FormatAddress(match_ea);
+                nlohmann::ordered_json item;
+                item["address"] = tools::utils::FormatAddress(match_ea);
 
-                    segment_t* seg = getseg(match_ea);
-                    if (seg) {
-                        qstring seg_name;
-                        get_segm_name(&seg_name, seg);
-                        item["segment"] = seg_name.c_str();
-                    }
-
-                    func_t* fn = get_func(match_ea);
-                    if (fn) {
-                        qstring fn_name;
-                        get_func_name(&fn_name, fn->start_ea);
-                        item["function"] = fn_name.c_str();
-                    }
-
-                    qstring sym;
-                    if (get_name(&sym, match_ea)) {
-                        item["symbol"] = sym.c_str();
-                    }
-
-                    matches.push_back(std::move(item));
-                    fetched++;
-                    next_offset = static_cast<int>(current_idx + 1);
-                    next_cursor_ea = match_ea + 1;
+                segment_t* seg = getseg(match_ea);
+                if (seg) {
+                    qstring seg_name;
+                    get_segm_name(&seg_name, seg);
+                    item["segment"] = seg_name.c_str();
                 }
-                current_idx++;
+
+                func_t* fn = get_func(match_ea);
+                if (fn) {
+                    qstring fn_name;
+                    get_func_name(&fn_name, fn->start_ea);
+                    item["function"] = fn_name.c_str();
+                }
+
+                qstring sym;
+                if (get_name(&sym, match_ea)) {
+                    item["symbol"] = sym.c_str();
+                }
+
+                matches.push_back(std::move(item));
+                fetched++;
+                if (match_ea == BADADDR - 1) {
+                    next_cursor_ea = BADADDR;
+                    break;
+                }
                 search_cur = match_ea + 1;
+            }
+            if (fetched == count && search_cur != BADADDR && search_cur < max_ea) {
+                sync::Checkpoint();
+                if (bin_search(search_cur, max_ea, bbv, BIN_SEARCH_FORWARD | BIN_SEARCH_NOBREAK | BIN_SEARCH_NOSHOW) != BADADDR)
+                    next_cursor_ea = search_cur;
             }
         });
 
@@ -1518,38 +1746,75 @@ namespace tools::analysis {
         res["matches_count"] = matches.size();
         res["matches"] = matches;
 
-        if (next_offset != -1) {
-
-            if (next_cursor_ea != BADADDR) {
-                res["next_cursor"] = tools::utils::FormatAddress(next_cursor_ea);
-            }
+        if (next_cursor_ea != BADADDR) {
+            res["next_cursor"] = tools::utils::FormatAddress(next_cursor_ea);
         }
         return tools::utils::MakeToolSuccessJson(id, res);
     }
 
     nlohmann::json ApiAnalysis::InsnQuery(const nlohmann::json& id, const nlohmann::json& args) {
-        std::string mnem_filter = tools::utils::GetStringArg(args, "mnemonic", tools::utils::GetStringArg(args, "mnem", "*"));
+        std::string mnem_filter = tools::utils::GetStringArg(args, "mnemonic", "*");
         if (mnem_filter.empty()) mnem_filter = "*";
 
-        std::string query_filter = tools::utils::GetStringArg(args, "query", tools::utils::GetStringArg(args, "text"));
+        std::string query_filter = tools::utils::GetStringArg(args, "query");
+        if (mnem_filter.size() > 1024 || query_filter.size() > 1024)
+            return tools::utils::MakeToolErrorJson(id, "mnemonic and query filters must not exceed 1024 characters", "invalid_filter");
 
-        ea_t fn_ea = tools::utils::GetAddressArg(args, "addr");
-        if (fn_ea == BADADDR) fn_ea = tools::utils::GetAddressArg(args, "func");
+        ea_t fn_ea = tools::utils::GetAddressArg(args, "func");
 
-        size_t count = static_cast<size_t>(tools::utils::GetIntArg(args, "count", 50));
-        if (count <= 0) count = 50;
-        if (count > 1000) count = 1000;
+        int64_t count_arg = 50;
+        if (args.contains("count")) {
+            const auto& value = args["count"];
+            if (value.is_number_unsigned()) {
+                const uint64_t parsed = value.get<uint64_t>();
+                if (parsed > 1000) return tools::utils::MakeToolErrorJson(id, "count must not exceed 1000", "invalid_count");
+                count_arg = static_cast<int64_t>(parsed);
+            } else if (value.is_number_integer()) {
+                count_arg = value.get<int64_t>();
+            } else {
+                return tools::utils::MakeToolErrorJson(id, "count must be an integer", "invalid_count");
+            }
+        }
+        if (count_arg < 0 || count_arg > 1000)
+            return tools::utils::MakeToolErrorJson(id, "count must be between 0 and 1000", "invalid_count");
+        const size_t count = count_arg == 0 ? 50 : static_cast<size_t>(count_arg);
 
-        size_t max_scan = static_cast<size_t>(tools::utils::GetIntArg(args, "max_scan", 250000));
-        if (max_scan == 0 || max_scan > 1000000) max_scan = 250000;
+        int64_t max_scan_arg = 250000;
+        if (args.contains("max_scan")) {
+            const auto& value = args["max_scan"];
+            if (value.is_number_unsigned()) {
+                const uint64_t parsed = value.get<uint64_t>();
+                if (parsed > 1000000) return tools::utils::MakeToolErrorJson(id, "max_scan must not exceed 1000000", "invalid_max_scan");
+                max_scan_arg = static_cast<int64_t>(parsed);
+            } else if (value.is_number_integer()) {
+                max_scan_arg = value.get<int64_t>();
+            } else {
+                return tools::utils::MakeToolErrorJson(id, "max_scan must be an integer", "invalid_max_scan");
+            }
+        }
+        if (max_scan_arg < 0 || max_scan_arg > 1000000)
+            return tools::utils::MakeToolErrorJson(id, "max_scan must be between 0 and 1000000", "invalid_max_scan");
+        const size_t max_scan = max_scan_arg == 0 ? 250000 : static_cast<size_t>(max_scan_arg);
 
         ea_t cursor_ea = tools::utils::GetAddressArg(args, "cursor", BADADDR);
-        std::string seg_name_arg = tools::utils::GetStringArg(args, "segment", tools::utils::GetStringArg(args, "seg"));
-        ea_t explicit_start = tools::utils::GetAddressArg(args, "start", tools::utils::GetAddressArg(args, "start_ea", BADADDR));
-        ea_t explicit_end = tools::utils::GetAddressArg(args, "end", tools::utils::GetAddressArg(args, "end_ea", BADADDR));
+        if (args.contains("cursor") && cursor_ea == BADADDR)
+            return tools::utils::MakeToolErrorJson(id, "Cursor is not a valid address", "invalid_cursor");
+        std::string seg_name_arg = tools::utils::GetStringArg(args, "segment");
+        ea_t explicit_start = tools::utils::GetAddressArg(args, "start");
+        ea_t explicit_end = tools::utils::GetAddressArg(args, "end");
+        if (args.contains("segment") && args.contains("func"))
+            return tools::utils::MakeToolErrorJson(id, "Specify either 'segment' or 'func' as the base scope", "conflicting_scope");
+        if (args.contains("func") && fn_ea == BADADDR)
+            return tools::utils::MakeToolErrorJson(id, "Function address or name could not be resolved", "invalid_function");
+        if (args.contains("start") && explicit_start == BADADDR)
+            return tools::utils::MakeToolErrorJson(id, "Start address could not be resolved", "invalid_start");
+        if (args.contains("end") && explicit_end == BADADDR)
+            return tools::utils::MakeToolErrorJson(id, "End address could not be resolved", "invalid_end");
 
         ea_t start_scope = BADADDR;
         ea_t max_ea = BADADDR;
+        bool executable_only = false;
+        std::string scope_error;
 
         sync::SyncRead([&]() {
             if (fn_ea != BADADDR) {
@@ -1557,18 +1822,19 @@ namespace tools::analysis {
                 if (fn) {
                     start_scope = fn->start_ea;
                     max_ea = fn->end_ea;
-                }
+                } else scope_error = "Target does not belong to a recognized function";
             } else if (!seg_name_arg.empty()) {
                 segment_t* s = get_segm_by_name(seg_name_arg.c_str());
                 if (s) {
                     start_scope = s->start_ea;
                     max_ea = s->end_ea;
-                }
+                } else scope_error = "Segment '" + seg_name_arg + "' was not found";
             } else if (explicit_start != BADADDR || explicit_end != BADADDR) {
                 start_scope = (explicit_start != BADADDR) ? explicit_start : inf_get_min_ea();
                 max_ea = (explicit_end != BADADDR) ? explicit_end : inf_get_max_ea();
             } else {
                 // Default global: scan all executable segments
+                executable_only = true;
                 for (int i = 0; i < get_segm_qty(); ++i) {
                     sync::Checkpoint();
                     segment_t* s = getnseg(i);
@@ -1578,29 +1844,58 @@ namespace tools::analysis {
                     }
                 }
                 if (start_scope == BADADDR) {
-                    start_scope = inf_get_min_ea();
-                    max_ea = inf_get_max_ea();
+                    scope_error = "No executable segments are available to scan";
+                }
+            }
+
+            if (fn_ea != BADADDR || !seg_name_arg.empty()) {
+                const ea_t base_start = start_scope;
+                const ea_t base_end = max_ea;
+                if (explicit_start != BADADDR) {
+                    if (explicit_start < base_start || explicit_start >= base_end)
+                        scope_error = "Start address lies outside the selected search scope";
+                    else start_scope = explicit_start;
+                }
+                if (explicit_end != BADADDR) {
+                    if (explicit_end > base_end || explicit_end <= base_start)
+                        scope_error = "End address lies outside the selected search scope";
+                    else max_ea = explicit_end;
                 }
             }
 
             if (cursor_ea != BADADDR) {
-                start_scope = cursor_ea;
+                segment_t* cursor_seg = getseg(cursor_ea);
+                if (cursor_ea < start_scope || cursor_ea >= max_ea ||
+                    (executable_only && (!cursor_seg || (cursor_seg->perm & SEGPERM_EXEC) == 0)))
+                    scope_error = "Cursor lies outside the selected scan range";
+                else start_scope = cursor_ea;
             }
+            if (start_scope != BADADDR && start_scope >= max_ea) scope_error = "Search range must have start < end";
         });
+        if (!scope_error.empty()) return tools::utils::MakeToolErrorJson(id, scope_error, "invalid_scope");
 
         nlohmann::ordered_json insns_arr = nlohmann::ordered_json::array();
         ea_t next_cursor_ea = BADADDR;
 
         sync::SyncRead([&]() {
             ea_t cur = start_scope;
-            size_t scanned = 0;
+            size_t visited_heads = 0;
             size_t fetched = 0;
 
-            while (cur != BADADDR && cur < max_ea && fetched < count && scanned < max_scan) {
+            while (cur != BADADDR && cur < max_ea && fetched < count && visited_heads < max_scan) {
                 sync::Checkpoint();
+                if (executable_only) {
+                    segment_t* current_seg = getseg(cur);
+                    if (!current_seg || (current_seg->perm & SEGPERM_EXEC) == 0) {
+                        segment_t* next_seg = current_seg ? get_next_seg(current_seg->start_ea) : get_next_seg(cur);
+                        if (!next_seg || next_seg->start_ea >= max_ea) { cur = BADADDR; break; }
+                        cur = next_seg->start_ea;
+                        continue;
+                    }
+                }
+                ++visited_heads;
                 flags_t flags = get_flags(cur);
                 if (is_code(flags)) {
-                    scanned++;
                     qstring mnem;
                     print_insn_mnem(&mnem, cur);
 
@@ -1632,11 +1927,21 @@ namespace tools::analysis {
                 }
 
                 ea_t next = next_head(cur, max_ea);
-                if (next == BADADDR || next <= cur) break;
+                if (next == BADADDR || next <= cur) {
+                    if (executable_only) {
+                        segment_t* current_seg = getseg(cur);
+                        segment_t* next_seg = current_seg ? get_next_seg(current_seg->start_ea) : get_next_seg(cur);
+                        if (next_seg && next_seg->start_ea < max_ea) {
+                            cur = next_seg->start_ea;
+                            continue;
+                        }
+                    }
+                    break;
+                }
                 cur = next;
             }
 
-            if (cur < max_ea && (fetched >= count || scanned >= max_scan)) {
+            if (cur != BADADDR && cur < max_ea && (fetched >= count || visited_heads >= max_scan)) {
                 next_cursor_ea = cur;
             }
         });
@@ -1691,6 +1996,12 @@ namespace tools::analysis {
 
         bool valid_start = false;
         bool valid_target = false;
+        size_t edge_scan_steps = 0;
+        size_t total_nodes_explored = 0;
+        size_t total_edges_built = 0;
+        bool graph_truncated = false;
+        constexpr size_t kMaxPathEdgesPerNode = 4096;
+        constexpr size_t kMaxPathEdgesPerSearch = 100000;
 
         sync::SyncRead([&]() {
             func_t* f_from = get_func(from_ea);
@@ -1717,6 +2028,18 @@ namespace tools::analysis {
                 return;
             }
 
+            auto ReadLoadedPointer = [](ea_t address) -> ea_t {
+                const size_t pointer_size = inf_is_64bit() ? 8 : 4;
+                segment_t* seg = getseg(address);
+                if (!seg || address > BADADDR - pointer_size || address + pointer_size > seg->end_ea)
+                    return BADADDR;
+                for (size_t i = 0; i < pointer_size; ++i) {
+                    sync::Checkpoint();
+                    if (!is_loaded(address + i)) return BADADDR;
+                }
+                return inf_is_64bit() ? get_qword(address) : static_cast<ea_t>(get_dword(address));
+            };
+
             auto get_out_edges = [&](ea_t caller_ea) -> std::vector<PathEdge> {
                 uint64_t cur_gen = cache::CurrentGeneration();
                 std::vector<PathEdge> cached;
@@ -1732,6 +2055,11 @@ namespace tools::analysis {
                 auto add_edge = [&](PathEdge&& e) {
                     auto it = unique_edges.find(e.callee_start_ea);
                     if (it == unique_edges.end()) {
+                        if (unique_edges.size() >= kMaxPathEdgesPerNode || total_edges_built >= kMaxPathEdgesPerSearch) {
+                            graph_truncated = true;
+                            return;
+                        }
+                        ++total_edges_built;
                         unique_edges[e.callee_start_ea] = std::move(e);
                     } else {
                         if (it->second.is_indirect && !e.is_indirect) {
@@ -1743,12 +2071,14 @@ namespace tools::analysis {
                 size_t ptr_size = inf_is_64bit() ? 8 : 4;
 
                 func_item_iterator_t fii;
-                for (bool ok = fii.set(fn); ok; ok = fii.next_code()) {
+                for (bool ok = fii.set(fn); ok && !graph_truncated; ok = fii.next_code()) {
                     sync::Checkpoint();
+                    if (++edge_scan_steps > budget) { graph_truncated = true; break; }
                     ea_t cur = fii.current();
                     xrefblk_t xb;
-                    for (bool xok = xb.first_from(cur, XREF_ALL); xok; xok = xb.next_from()) {
+                    for (bool xok = xb.first_from(cur, XREF_ALL); xok && !graph_truncated; xok = xb.next_from()) {
                         sync::Checkpoint();
+                        if (++edge_scan_steps > budget) { graph_truncated = true; break; }
                         uint8_t base_type = xb.type & XREF_MASK;
                         if (xb.iscode) {
                             bool is_call = (base_type == fl_CN || base_type == fl_CF);
@@ -1788,9 +2118,10 @@ namespace tools::analysis {
                                     size_t found_in_tbl = 0;
                                     for (size_t mi = 0; mi < max_vtable_methods; ++mi) {
                                         sync::Checkpoint();
-                                        ea_t slot_ea = ref_ea + mi * ptr_size;
-                                        if (!is_mapped(slot_ea) || !is_loaded(slot_ea)) break;
-                                        ea_t ptr_val = inf_is_64bit() ? get_qword(slot_ea) : get_dword(slot_ea);
+                                        const size_t slot_offset = mi * ptr_size;
+                                        if (ref_ea > BADADDR - slot_offset) break;
+                                        ea_t slot_ea = ref_ea + slot_offset;
+                                        ea_t ptr_val = ReadLoadedPointer(slot_ea);
                                         if (ptr_val == 0 || ptr_val == BADADDR || !is_mapped(ptr_val)) break;
                                         func_t* m_fn = get_func(ptr_val);
                                         if (!m_fn || m_fn->start_ea != ptr_val) break;
@@ -1835,26 +2166,29 @@ namespace tools::analysis {
                         if (disp >= 0) {
                             size_t target_idx = static_cast<size_t>(disp / ptr_size);
                             xrefblk_t fn_xb;
-                            for (bool f_ok = fn_xb.first_to(fn->start_ea, XREF_ALL); f_ok; f_ok = fn_xb.next_to()) {
+                            for (bool f_ok = fn_xb.first_to(fn->start_ea, XREF_ALL); f_ok && !graph_truncated; f_ok = fn_xb.next_to()) {
                                 sync::Checkpoint();
+                                if (++edge_scan_steps > budget) { graph_truncated = true; break; }
                                 if (!fn_xb.iscode && fn_xb.from != BADADDR && is_mapped(fn_xb.from)) {
                                     ea_t vtbl_curr = fn_xb.from;
-                                    for (int back_i = 0; back_i <= 64; ++back_i) {
+                                    for (int back_i = 0; back_i <= 64 && !graph_truncated; ++back_i) {
                                         sync::Checkpoint();
+                                        if (++edge_scan_steps > budget) { graph_truncated = true; break; }
                                         if (back_i > 0) {
                                             if (vtbl_curr < ptr_size) break;
                                             ea_t prev_slot = vtbl_curr - ptr_size;
-                                            if (!is_mapped(prev_slot) || !is_loaded(prev_slot)) break;
-                                            ea_t pval = inf_is_64bit() ? get_qword(prev_slot) : get_dword(prev_slot);
+                                            ea_t pval = ReadLoadedPointer(prev_slot);
                                             if (pval == 0 || pval == BADADDR || !is_mapped(pval)) break;
                                             func_t* pfn = get_func(pval);
                                             if (!pfn || pfn->start_ea != pval) break;
                                             vtbl_curr = prev_slot;
                                         }
                                     }
-                                    ea_t call_target_slot = vtbl_curr + target_idx * ptr_size;
-                                    if (is_mapped(call_target_slot) && is_loaded(call_target_slot)) {
-                                        ea_t target_fn_ea = inf_is_64bit() ? get_qword(call_target_slot) : get_dword(call_target_slot);
+                                    const size_t target_offset = target_idx * ptr_size;
+                                    if (vtbl_curr > BADADDR - target_offset) continue;
+                                    ea_t call_target_slot = vtbl_curr + target_offset;
+                                    if (is_mapped(call_target_slot)) {
+                                        ea_t target_fn_ea = ReadLoadedPointer(call_target_slot);
                                         if (target_fn_ea != 0 && target_fn_ea != BADADDR && is_mapped(target_fn_ea)) {
                                             func_t* tfn = get_func(target_fn_ea);
                                             if (tfn && tfn->start_ea == target_fn_ea && tfn->start_ea != fn->start_ea) {
@@ -1881,7 +2215,7 @@ namespace tools::analysis {
                     sync::Checkpoint();
                     edges.push_back(std::move(pair.second));
                 }
-                FunctionEdgeCache::Instance().PutOut(caller_ea, cur_gen, edges);
+                if (!graph_truncated) FunctionEdgeCache::Instance().PutOut(caller_ea, cur_gen, edges);
                 return edges;
             };
 
@@ -1899,6 +2233,11 @@ namespace tools::analysis {
                 auto add_edge = [&](PathEdge&& e) {
                     auto it = unique_edges.find(e.caller_start_ea);
                     if (it == unique_edges.end()) {
+                        if (unique_edges.size() >= kMaxPathEdgesPerNode || total_edges_built >= kMaxPathEdgesPerSearch) {
+                            graph_truncated = true;
+                            return;
+                        }
+                        ++total_edges_built;
                         unique_edges[e.caller_start_ea] = std::move(e);
                     } else {
                         if (it->second.is_indirect && !e.is_indirect) {
@@ -1910,8 +2249,9 @@ namespace tools::analysis {
                 size_t ptr_size = inf_is_64bit() ? 8 : 4;
 
                 xrefblk_t xb;
-                for (bool ok = xb.first_to(target_ea, XREF_ALL); ok; ok = xb.next_to()) {
+                for (bool ok = xb.first_to(target_ea, XREF_ALL); ok && !graph_truncated; ok = xb.next_to()) {
                     sync::Checkpoint();
+                    if (++edge_scan_steps > budget) { graph_truncated = true; break; }
                     uint8_t base_type = xb.type & XREF_MASK;
                     if (xb.iscode && (base_type == fl_CN || base_type == fl_CF || base_type == fl_JN || base_type == fl_JF)) {
                         func_t* caller = get_func(xb.from);
@@ -1941,8 +2281,9 @@ namespace tools::analysis {
                         } else if (xb.from != BADADDR && is_mapped(xb.from)) {
                             ea_t slot_ea = xb.from;
                             xrefblk_t xb_slot;
-                            for (bool sok = xb_slot.first_to(slot_ea, XREF_ALL); sok; sok = xb_slot.next_to()) {
+                            for (bool sok = xb_slot.first_to(slot_ea, XREF_ALL); sok && !graph_truncated; sok = xb_slot.next_to()) {
                                 sync::Checkpoint();
+                                if (++edge_scan_steps > budget) { graph_truncated = true; break; }
                                 func_t* slot_caller = get_func(xb_slot.from);
                                 if (slot_caller && slot_caller->start_ea != target_ea) {
                                     PathEdge e;
@@ -1956,11 +2297,13 @@ namespace tools::analysis {
                             }
 
                             ea_t curr = slot_ea;
-                            for (int step = 0; step <= 64; ++step) {
+                            for (int step = 0; step <= 64 && !graph_truncated; ++step) {
                                 sync::Checkpoint();
+                                if (++edge_scan_steps > budget) { graph_truncated = true; break; }
                                 xrefblk_t xb_tbl;
-                                for (bool tok = xb_tbl.first_to(curr, XREF_ALL); tok; tok = xb_tbl.next_to()) {
+                                for (bool tok = xb_tbl.first_to(curr, XREF_ALL); tok && !graph_truncated; tok = xb_tbl.next_to()) {
                                     sync::Checkpoint();
+                                    if (++edge_scan_steps > budget) { graph_truncated = true; break; }
                                     func_t* tbl_caller = get_func(xb_tbl.from);
                                     if (tbl_caller && tbl_caller->start_ea != target_ea) {
                                         PathEdge e;
@@ -1981,8 +2324,7 @@ namespace tools::analysis {
 
                                 if (curr < ptr_size) break;
                                 ea_t prev = curr - ptr_size;
-                                if (!is_mapped(prev) || !is_loaded(prev)) break;
-                                ea_t val = inf_is_64bit() ? get_qword(prev) : get_dword(prev);
+                                ea_t val = ReadLoadedPointer(prev);
                                 if (val == 0 || val == BADADDR || !is_mapped(val)) break;
                                 func_t* prev_fn = get_func(val);
                                 if (!prev_fn || prev_fn->start_ea != val) break;
@@ -1996,7 +2338,7 @@ namespace tools::analysis {
                     sync::Checkpoint();
                     edges.push_back(std::move(pair.second));
                 }
-                FunctionEdgeCache::Instance().PutIn(target_ea, cur_gen, edges);
+                if (!graph_truncated) FunctionEdgeCache::Instance().PutIn(target_ea, cur_gen, edges);
                 return edges;
             };
 
@@ -2016,14 +2358,12 @@ namespace tools::analysis {
                 dist_bwd[target_func_ea] = 0;
 
                 ea_t intersection = BADADDR;
-                size_t nodes_explored = 0;
-
-                while (!q_fwd.empty() && !q_bwd.empty() && nodes_explored < budget) {
+                while (!q_fwd.empty() && !q_bwd.empty() && total_nodes_explored < budget && !graph_truncated) {
                     sync::Checkpoint();
                     if (q_fwd.size() <= q_bwd.size()) {
                         ea_t cur_ea = q_fwd.front();
                         q_fwd.pop();
-                        nodes_explored++;
+                        total_nodes_explored++;
                         int cur_d = dist_fwd[cur_ea];
                         if (cur_d >= max_depth) continue;
 
@@ -2031,23 +2371,21 @@ namespace tools::analysis {
                         for (const auto& e : edges) {
                             sync::Checkpoint();
                             if (banned_edges.count({e.caller_start_ea, e.callee_start_ea, e.call_site_ea})) continue;
-
-                            if (parent_bwd.count(e.callee_start_ea) || e.callee_start_ea == target_func_ea) {
-                                parent_fwd[e.callee_start_ea] = e;
-                                intersection = e.callee_start_ea;
-                                break;
-                            }
-
-                            if (!dist_fwd.count(e.callee_start_ea)) {
-                                dist_fwd[e.callee_start_ea] = cur_d + 1;
+                            auto [dist_it, inserted] = dist_fwd.emplace(e.callee_start_ea, cur_d + 1);
+                            if (inserted) {
                                 parent_fwd[e.callee_start_ea] = e;
                                 q_fwd.push(e.callee_start_ea);
+                            }
+                            auto opposite = dist_bwd.find(e.callee_start_ea);
+                            if (opposite != dist_bwd.end() && dist_it->second + opposite->second <= max_depth) {
+                                intersection = e.callee_start_ea;
+                                break;
                             }
                         }
                     } else {
                         ea_t cur_ea = q_bwd.front();
                         q_bwd.pop();
-                        nodes_explored++;
+                        total_nodes_explored++;
                         int cur_d = dist_bwd[cur_ea];
                         if (cur_d >= max_depth) continue;
 
@@ -2055,17 +2393,15 @@ namespace tools::analysis {
                         for (const auto& e : edges) {
                             sync::Checkpoint();
                             if (banned_edges.count({e.caller_start_ea, e.callee_start_ea, e.call_site_ea})) continue;
-
-                            if (parent_fwd.count(e.caller_start_ea) || e.caller_start_ea == start_func_ea) {
-                                parent_bwd[e.caller_start_ea] = e;
-                                intersection = e.caller_start_ea;
-                                break;
-                            }
-
-                            if (!dist_bwd.count(e.caller_start_ea)) {
-                                dist_bwd[e.caller_start_ea] = cur_d + 1;
+                            auto [dist_it, inserted] = dist_bwd.emplace(e.caller_start_ea, cur_d + 1);
+                            if (inserted) {
                                 parent_bwd[e.caller_start_ea] = e;
                                 q_bwd.push(e.caller_start_ea);
+                            }
+                            auto opposite = dist_fwd.find(e.caller_start_ea);
+                            if (opposite != dist_fwd.end() && dist_it->second + opposite->second <= max_depth) {
+                                intersection = e.caller_start_ea;
+                                break;
                             }
                         }
                     }
@@ -2073,7 +2409,10 @@ namespace tools::analysis {
                     if (intersection != BADADDR) break;
                 }
 
-                if (intersection == BADADDR) break;
+                if (intersection == BADADDR) {
+                    if (total_nodes_explored >= budget && !q_fwd.empty() && !q_bwd.empty()) graph_truncated = true;
+                    break;
+                }
 
                 std::vector<PathEdge> path_left;
                 ea_t trace_ea = intersection;
@@ -2184,6 +2523,7 @@ namespace tools::analysis {
         res["to_addr"] = tools::utils::FormatAddress(target_func_ea);
         res["paths_count"] = paths_arr.size();
         res["paths"] = paths_arr;
+        if (graph_truncated) res["truncated"] = true;
         return tools::utils::MakeToolSuccessJson(id, res);
     }
 }

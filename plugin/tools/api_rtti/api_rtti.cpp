@@ -17,6 +17,8 @@
 #include <auto.hpp>
 #include <algorithm>
 #include <regex>
+#include <limits>
+#include <stdexcept>
 #include <unordered_set>
 #include <unordered_map>
 
@@ -142,6 +144,7 @@ namespace tools::rtti {
 
             for (size_t i = 0; i < max_len; ++i) {
                 sync::Checkpoint();
+                if (i > BADADDR - ea) break;
                 ea_t cur = ea + i;
                 if (!is_mapped(cur) || !is_loaded(cur)) break;
                 char c = static_cast<char>(get_byte(cur));
@@ -149,6 +152,30 @@ namespace tools::rtti {
                 s.push_back(c);
             }
             return s;
+        }
+
+        bool IsReadableRange(ea_t ea, size_t size) {
+            if (ea == BADADDR || size == 0 || size - 1 > BADADDR - ea) return false;
+            segment_t* seg = getseg(ea);
+            const ea_t last_ea = ea + size - 1;
+            if (!seg || last_ea >= seg->end_ea) return false;
+            for (size_t i = 0; i < size; ++i) {
+                if (!is_loaded(ea + i)) return false;
+            }
+            return true;
+        }
+
+        bool SafeAdd(ea_t base, uint64_t offset, ea_t& result) {
+            if (base == BADADDR || offset > BADADDR - base) return false;
+            result = base + static_cast<ea_t>(offset);
+            return result != BADADDR;
+        }
+
+        bool ReadPointer(ea_t ea, bool is64, ea_t& value) {
+            const size_t ptr_size = is64 ? 8 : 4;
+            if (!IsReadableRange(ea, ptr_size)) return false;
+            value = is64 ? get_qword(ea) : get_dword(ea);
+            return value != BADADDR;
         }
 
         static std::string GetRegisterName(int reg, size_t width) {
@@ -232,15 +259,16 @@ namespace tools::rtti {
 
             for (size_t i = 0; i < max_methods; ++i) {
                 sync::Checkpoint();
+                if (i > (BADADDR - vtable_ea) / ptr_size) break;
                 ea_t entry_ea = vtable_ea + i * ptr_size;
-                if (!is_mapped(entry_ea) || !is_loaded(entry_ea)) break;
+                ea_t fn_ea = BADADDR;
+                if (!ReadPointer(entry_ea, is64, fn_ea)) break;
 
                 // Stop if another xref points here (start of another vftable/symbol)
                 if (i > 0 && has_xref(get_flags(entry_ea))) {
                     break;
                 }
 
-                ea_t fn_ea = is64 ? get_qword(entry_ea) : get_dword(entry_ea);
                 if (fn_ea == 0 || fn_ea == BADADDR || !is_mapped(fn_ea) || !is_loaded(fn_ea)) {
                     break;
                 }
@@ -260,7 +288,7 @@ namespace tools::rtti {
         }
 
         bool ParseColAndClass(ea_t col_ea, ea_t vtable_ea, bool is64, ea_t img_base, RttiClassEntry& entry) {
-            if (col_ea == BADADDR || !is_mapped(col_ea) || !is_loaded(col_ea)) return false;
+            if (!IsReadableRange(col_ea, is64 ? 24 : 20)) return false;
             segment_t* s = getseg(col_ea);
             if (!s || s->type == SEG_CODE) return false;
 
@@ -283,18 +311,19 @@ namespace tools::rtti {
                     uint32_t td_rva = get_dword(col_ea + 12);
                     uint32_t self_rva = get_dword(col_ea + 20);
                     if (self_rva == 0) return false;
+                    if (self_rva > col_ea) return false;
                     col_base = col_ea - self_rva;
                     // Validate base sanity
                     if (col_base != img_base && col_base > col_ea) return false;
-                    td_ea = col_base + td_rva;
+                    if (!SafeAdd(col_base, td_rva, td_ea)) return false;
                 }
 
                 if (td_ea == BADADDR || !is_mapped(td_ea) || !is_loaded(td_ea)) return false;
                 entry.type_desc_ea = td_ea;
 
                 // Read raw name from TypeDescriptor
-                ea_t raw_str_ea = td_ea + (is64 ? 16 : 8);
-                if (!is_mapped(raw_str_ea)) return false;
+                ea_t raw_str_ea = BADADDR;
+                if (!SafeAdd(td_ea, is64 ? 16 : 8, raw_str_ea) || !is_mapped(raw_str_ea)) return false;
                 entry.raw_name = ReadNullTermString(raw_str_ea);
                 if (entry.raw_name.empty() || entry.raw_name.rfind(".?A", 0) != 0) return false;
                 entry.clean_name = tools::utils::SanitizeUtf8(CleanTypeName(entry.raw_name));
@@ -305,24 +334,44 @@ namespace tools::rtti {
                     chd_ea = get_dword(col_ea + 16);
                 } else {
                     uint32_t chd_rva = get_dword(col_ea + 16);
-                    chd_ea = col_base + chd_rva;
+                    if (!SafeAdd(col_base, chd_rva, chd_ea)) return false;
                 }
 
-                if (chd_ea != BADADDR && is_mapped(chd_ea) && is_loaded(chd_ea)) {
+                if (IsReadableRange(chd_ea, 16)) {
                     entry.chd_ea = chd_ea;
                     entry.chd_attributes = get_dword(chd_ea + 4);
                     uint32_t num_bases = get_dword(chd_ea + 8);
-                    ea_t bca_ea = is64 ? (col_base + get_dword(chd_ea + 12)) : get_dword(chd_ea + 12);
+                    ea_t bca_ea = BADADDR;
+                    const uint32_t bca_ref = get_dword(chd_ea + 12);
+                    if (is64) {
+                        if (!SafeAdd(col_base, bca_ref, bca_ea)) return false;
+                    } else {
+                        bca_ea = bca_ref;
+                    }
 
                     if (is_mapped(bca_ea) && is_loaded(bca_ea)) {
-                        for (uint32_t bi = 0; bi < std::min(num_bases, 128u); ++bi) {
+                        const uint32_t base_count = std::min(num_bases, 128u);
+                        for (uint32_t bi = 0; bi < base_count; ++bi) {
                             sync::Checkpoint();
+                            if (bi > (BADADDR - bca_ea) / sizeof(uint32_t)) break;
                             ea_t bcd_ptr = bca_ea + bi * 4;
-                            if (!is_mapped(bcd_ptr) || !is_loaded(bcd_ptr)) break;
+                            if (!IsReadableRange(bcd_ptr, sizeof(uint32_t))) break;
 
-                            ea_t bcd_ea = is64 ? (col_base + get_dword(bcd_ptr)) : get_dword(bcd_ptr);
-                            if (is_mapped(bcd_ea) && is_loaded(bcd_ea)) {
-                                ea_t b_td = is64 ? (col_base + get_dword(bcd_ea)) : get_dword(bcd_ea);
+                            ea_t bcd_ea = BADADDR;
+                            const uint32_t bcd_ref = get_dword(bcd_ptr);
+                            if (is64) {
+                                if (!SafeAdd(col_base, bcd_ref, bcd_ea)) continue;
+                            } else {
+                                bcd_ea = bcd_ref;
+                            }
+                            if (IsReadableRange(bcd_ea, 24)) {
+                                ea_t b_td = BADADDR;
+                                const uint32_t btd_ref = get_dword(bcd_ea);
+                                if (is64) {
+                                    if (!SafeAdd(col_base, btd_ref, b_td)) continue;
+                                } else {
+                                    b_td = btd_ref;
+                                }
                                 if (is_mapped(b_td) && is_loaded(b_td)) {
                                     RttiBaseClassInfo base_info;
                                     base_info.bcd_ea = bcd_ea;
@@ -401,7 +450,9 @@ namespace tools::rtti {
                     if (strncmp(sym_name, "??_7", 4) == 0) {
                         ea_t vt_ea = get_nlist_ea(i);
                         if (vt_ea != BADADDR && is_mapped(vt_ea) && seen_vtables.insert(vt_ea).second) {
-                            ea_t col_ea = is64 ? get_qword(vt_ea - 8) : get_dword(vt_ea - 4);
+                            ea_t col_ea = BADADDR;
+                            const size_t ptr_size = is64 ? 8 : 4;
+                            if (vt_ea < ptr_size || !ReadPointer(vt_ea - ptr_size, is64, col_ea)) continue;
                             if (col_ea != BADADDR && is_mapped(col_ea) && seen_cols.insert(col_ea).second) {
                                 RttiClassEntry entry;
                                 if (ParseColAndClass(col_ea, vt_ea, is64, img_base, entry)) {
@@ -419,9 +470,10 @@ namespace tools::rtti {
                             xrefblk_t cxb;
                             for (bool cok = cxb.first_to(col_ea, XREF_DATA); cok; cok = cxb.next_to()) {
                                 sync::Checkpoint();
-                                ea_t cand = is64 ? (cxb.from + 8) : (cxb.from + 4);
-                                if (is_mapped(cand) && is_loaded(cand)) {
-                                    ea_t m0 = is64 ? get_qword(cand) : get_dword(cand);
+                                ea_t cand = BADADDR;
+                                if (!SafeAdd(cxb.from, is64 ? 8 : 4, cand)) continue;
+                                ea_t m0 = BADADDR;
+                                if (ReadPointer(cand, is64, m0)) {
                                     if (m0 != 0 && m0 != BADADDR && is_mapped(m0)) {
                                         vt_ea = cand;
                                         seen_vtables.insert(vt_ea);
@@ -449,7 +501,9 @@ namespace tools::rtti {
 
                         std::string s_text = ReadNullTermString(si.ea, 128);
                         if (s_text.rfind(".?AV", 0) == 0 || s_text.rfind(".?AU", 0) == 0) {
-                            ea_t td_ea = is64 ? (si.ea - 16) : (si.ea - 8);
+                            const size_t td_name_offset = is64 ? 16 : 8;
+                            if (si.ea < td_name_offset) continue;
+                            ea_t td_ea = si.ea - td_name_offset;
                             if (!is_mapped(td_ea)) continue;
 
                             // Find COL referencing this TD
@@ -457,15 +511,17 @@ namespace tools::rtti {
                             for (bool tok = tdxb.first_to(td_ea, XREF_DATA); tok; tok = tdxb.next_to()) {
                                 sync::Checkpoint();
                                 if (tdxb.from == BADADDR) continue;
+                                if (tdxb.from < 12) continue;
                                 ea_t col_cand = tdxb.from - 12;
                                 if (is_mapped(col_cand) && seen_cols.insert(col_cand).second) {
                                     ea_t vt_ea = BADADDR;
                                     xrefblk_t cxb;
                                     for (bool cok = cxb.first_to(col_cand, XREF_DATA); cok; cok = cxb.next_to()) {
                                         sync::Checkpoint();
-                                        ea_t cand = is64 ? (cxb.from + 8) : (cxb.from + 4);
-                                        if (is_mapped(cand) && is_loaded(cand)) {
-                                            ea_t m0 = is64 ? get_qword(cand) : get_dword(cand);
+                                        ea_t cand = BADADDR;
+                                        if (!SafeAdd(cxb.from, is64 ? 8 : 4, cand)) continue;
+                                        ea_t m0 = BADADDR;
+                                        if (ReadPointer(cand, is64, m0)) {
                                             if (m0 != 0 && m0 != BADADDR && is_mapped(m0)) {
                                                 vt_ea = cand;
                                                 seen_vtables.insert(vt_ea);
@@ -552,19 +608,23 @@ namespace tools::rtti {
                     size_t ptr_sz = is64 ? 8 : 4;
                     for (const auto& c : clist) {
                         sync::Checkpoint();
-                        if (c.vtable_ea != BADADDR && query_ea >= c.vtable_ea && query_ea < c.vtable_ea + c.methods_count * ptr_sz) {
+                        if (c.vtable_ea != BADADDR && c.methods_count <= (BADADDR - c.vtable_ea) / ptr_sz &&
+                            query_ea >= c.vtable_ea && query_ea < c.vtable_ea + c.methods_count * ptr_sz) {
                             return &c;
                         }
                     }
 
                     // Check if query_ea is a virtual method function (referenced by data XREF from a vtable slot)
                     xrefblk_t xb;
+                    size_t xref_count = 0;
                     for (bool ok = xb.first_to(query_ea, XREF_DATA); ok; ok = xb.next_to()) {
                         sync::Checkpoint();
+                        if (++xref_count > 200000) break;
                         if (xb.from == BADADDR) continue;
                         for (const auto& c : clist) {
                             sync::Checkpoint();
-                            if (c.vtable_ea != BADADDR && xb.from >= c.vtable_ea && xb.from < c.vtable_ea + c.methods_count * ptr_sz) {
+                            if (c.vtable_ea != BADADDR && c.methods_count <= (BADADDR - c.vtable_ea) / ptr_sz &&
+                                xb.from >= c.vtable_ea && xb.from < c.vtable_ea + c.methods_count * ptr_sz) {
                                 return &c;
                             }
                         }
@@ -631,7 +691,7 @@ namespace tools::rtti {
 
     nlohmann::json ApiRtti::UnifiedRtti(const nlohmann::json& id, const nlohmann::json& args) {
         // 1. Explicit refresh RTTI cache
-        if (args.contains("refresh") && args["refresh"].is_boolean() && args["refresh"].get<bool>() && !args.contains("name") && !args.contains("pattern") && !args.contains("class") && !args.contains("addr")) {
+        if (args.contains("refresh") && args["refresh"].is_boolean() && args["refresh"].get<bool>() && !args.contains("name") && !args.contains("pattern") && !args.contains("addr")) {
             return RttiRefresh(id, args);
         }
 
@@ -639,20 +699,15 @@ namespace tools::rtti {
         if (args.contains("create_struct") || args.contains("struct_name") || args.contains("apply_to_vtable")) {
             nlohmann::json create_args = args;
             if (!create_args.contains("name")) {
-                if (create_args.contains("class")) create_args["name"] = create_args["class"];
-                else if (create_args.contains("addr")) create_args["name"] = create_args["addr"];
+                if (create_args.contains("addr")) create_args["name"] = create_args["addr"];
             }
             return RttiCreateStruct(id, create_args);
         }
 
-        // 3. Inspect specific class (by name, class, addr, vtable)
-        if (args.contains("name") || args.contains("class") || args.contains("addr") || args.contains("vtable")) {
+        // 3. Inspect a specific class by name or address
+        if (args.contains("name") || args.contains("addr")) {
             nlohmann::json class_args = args;
-            if (!class_args.contains("name")) {
-                if (class_args.contains("class")) class_args["name"] = class_args["class"];
-                else if (class_args.contains("addr")) class_args["name"] = class_args["addr"];
-                else if (class_args.contains("vtable")) class_args["name"] = class_args["vtable"];
-            }
+            if (!class_args.contains("name")) class_args["name"] = class_args["addr"];
             return RttiGetClass(id, class_args);
         }
 
@@ -663,32 +718,38 @@ namespace tools::rtti {
     nlohmann::json ApiRtti::RttiListClasses(const nlohmann::json& id, const nlohmann::json& args) {
         std::string pattern = tools::utils::GetStringArg(args, "pattern");
         std::string base_class = tools::utils::GetStringArg(args, "base_class");
-        int min_methods = static_cast<int>(tools::utils::GetIntArg(args, "min_methods", -1));
-        int max_methods = static_cast<int>(tools::utils::GetIntArg(args, "max_methods", -1));
-        bool has_vtable_only = tools::utils::GetBoolArg(args, "has_vtable", false);
+        int64_t min_methods = tools::utils::GetIntArg(args, "min_methods", -1);
         std::string sort_by = tools::utils::GetStringArg(args, "sort", "name");
-        std::string sort_order = tools::utils::GetStringArg(args, "sort_order", (sort_by == "methods" ? "desc" : "asc"));
+        if (min_methods < -1 || min_methods > 1000000)
+            return tools::utils::MakeToolErrorJson(id, "min_methods must be between 0 and 1000000", "invalid_min_methods");
+        if (sort_by != "name" && sort_by != "methods")
+            return tools::utils::MakeToolErrorJson(id, "sort must be 'name' or 'methods'", "invalid_sort");
 
-        size_t offset = static_cast<size_t>(tools::utils::GetIntArg(args, "offset", 0));
-        std::string cursor_str = tools::utils::GetStringArg(args, "cursor");
-        if (!cursor_str.empty()) {
-            try { offset = static_cast<size_t>(std::stoul(cursor_str)); } catch (const sync::OperationStopped&) { throw; } catch (...) {}
-        }
-        size_t count = static_cast<size_t>(tools::utils::GetIntArg(args, "count", 50));
-        if (count <= 0) count = 50;
-        if (count > 500) count = 500;
+        const int64_t offset_arg = tools::utils::GetIntArg(args, "offset", 0);
+        const int64_t count_arg = tools::utils::GetIntArg(args, "count", 50);
+        if (offset_arg < 0 || count_arg < 0)
+            return tools::utils::MakeToolErrorJson(id, "offset and count must be non-negative", "invalid_pagination");
+        const size_t offset = static_cast<size_t>(offset_arg);
+        size_t count = count_arg == 0 ? 50 : static_cast<size_t>(count_arg);
+        count = std::min<size_t>(count, 500);
 
         bool refresh = tools::utils::GetBoolArg(args, "refresh", false);
         std::vector<RttiClassEntry> all_classes;
+        std::string index_error;
         sync::SyncRead([&]() {
             try {
                 if (refresh) {
                     RttiIndex::Instance().Invalidate();
                 }
                 all_classes = CollectRttiClasses();
-            } catch (const sync::OperationStopped&) { throw; } catch (...) {
+            } catch (const sync::OperationStopped&) { throw; } catch (const std::exception& e) {
+                index_error = e.what();
+            } catch (...) {
+                index_error = "Unknown error while collecting RTTI classes";
             }
         });
+        if (!index_error.empty())
+            return tools::utils::MakeToolErrorJson(id, index_error, "rtti_index_failed");
 
         std::vector<const RttiClassEntry*> filtered;
         filtered.reserve(all_classes.size());
@@ -714,31 +775,17 @@ namespace tools::rtti {
                 if (!base_matched) continue;
             }
 
-            if (min_methods >= 0 && static_cast<int>(c.methods_count) < min_methods) {
-                continue;
-            }
-            if (max_methods >= 0 && static_cast<int>(c.methods_count) > max_methods) {
-                continue;
-            }
-            if (has_vtable_only && (c.vtable_ea == BADADDR || c.vtable_ea == 0)) {
+            if (min_methods >= 0 && c.methods_count < static_cast<size_t>(min_methods)) {
                 continue;
             }
 
             filtered.push_back(&c);
         }
 
-        bool is_desc = (sort_order == "desc");
+        const bool is_desc = (sort_by == "methods");
         if (sort_by == "methods") {
             std::stable_sort(filtered.begin(), filtered.end(), [is_desc](const RttiClassEntry* a, const RttiClassEntry* b) {
                 return is_desc ? (a->methods_count > b->methods_count) : (a->methods_count < b->methods_count);
-            });
-        } else if (sort_by == "vtable") {
-            std::stable_sort(filtered.begin(), filtered.end(), [is_desc](const RttiClassEntry* a, const RttiClassEntry* b) {
-                return is_desc ? (a->vtable_ea > b->vtable_ea) : (a->vtable_ea < b->vtable_ea);
-            });
-        } else if (sort_by == "offset") {
-            std::stable_sort(filtered.begin(), filtered.end(), [is_desc](const RttiClassEntry* a, const RttiClassEntry* b) {
-                return is_desc ? (a->offset > b->offset) : (a->offset < b->offset);
             });
         } else {
             std::stable_sort(filtered.begin(), filtered.end(), [is_desc](const RttiClassEntry* a, const RttiClassEntry* b) {
@@ -748,9 +795,10 @@ namespace tools::rtti {
 
         nlohmann::json classes_arr = nlohmann::json::array();
         size_t total_matched = filtered.size();
-        size_t end_idx = std::min(offset + count, total_matched);
+        const size_t start_idx = std::min(offset, total_matched);
+        const size_t end_idx = start_idx + std::min(count, total_matched - start_idx);
 
-        for (size_t i = offset; i < end_idx; ++i) {
+        for (size_t i = start_idx; i < end_idx; ++i) {
             sync::Checkpoint();
             const auto* c = filtered[i];
             nlohmann::ordered_json item;
@@ -768,36 +816,28 @@ namespace tools::rtti {
             classes_arr.push_back(std::move(item));
         }
 
-        int next_offset = -1;
-        if (end_idx < total_matched) {
-            next_offset = static_cast<int>(end_idx);
-        }
-
         nlohmann::ordered_json res;
         res["status"] = "success";
         res["total"] = total_matched;
-
-        res["offset"] = offset;
         res["classes"] = classes_arr;
-        if (next_offset != -1) {
-
-            res["next_cursor"] = std::to_string(next_offset);
-        }
+        if (end_idx < total_matched) res["next_offset"] = end_idx;
         return tools::utils::MakeToolSuccessJson(id, res);
     }
 
     namespace {
-        nlohmann::json ExtractVtableMethods(ea_t vtable_ea, size_t methods_count, bool is64, ea_t query_ea) {
+        nlohmann::json ExtractVtableMethods(ea_t vtable_ea, size_t methods_count, bool is64, ea_t query_ea, bool& truncated, size_t& remaining) {
             nlohmann::json methods_arr = nlohmann::json::array();
             if (vtable_ea == BADADDR || !is_mapped(vtable_ea)) return methods_arr;
             size_t ptr_size = is64 ? 8 : 4;
+            const size_t capped_count = std::min(methods_count, remaining);
+            if (methods_count > capped_count) truncated = true;
 
-            for (size_t i = 0; i < methods_count; ++i) {
+            for (size_t i = 0; i < capped_count; ++i) {
                 sync::Checkpoint();
+                if (i > (BADADDR - vtable_ea) / ptr_size) { truncated = true; break; }
                 ea_t entry_ea = vtable_ea + i * ptr_size;
-                if (!is_mapped(entry_ea) || !is_loaded(entry_ea)) break;
-
-                ea_t fn_ea = is64 ? get_qword(entry_ea) : get_dword(entry_ea);
+                ea_t fn_ea = BADADDR;
+                if (!ReadPointer(entry_ea, is64, fn_ea)) break;
                 nlohmann::ordered_json m;
                 m["index"] = i;
                 m["address"] = tools::utils::FormatAddress(fn_ea);
@@ -853,13 +893,14 @@ namespace tools::rtti {
                 }
 
                 methods_arr.push_back(std::move(m));
+                --remaining;
             }
             return methods_arr;
         }
     }
 
     nlohmann::json ApiRtti::RttiGetClass(const nlohmann::json& id, const nlohmann::json& args) {
-        std::string query = tools::utils::GetStringArg(args, "name", tools::utils::GetStringArg(args, "addr", tools::utils::GetStringArg(args, "query")));
+        std::string query = tools::utils::GetStringArg(args, "name", tools::utils::GetStringArg(args, "addr"));
         ea_t query_ea = tools::utils::ParseAddress(query);
         bool refresh = tools::utils::GetBoolArg(args, "refresh", false);
 
@@ -872,6 +913,7 @@ namespace tools::rtti {
         std::vector<std::string> candidate_classes;
         bool found = false;
         bool is64 = false;
+        std::string index_error;
 
         sync::SyncRead([&]() {
             try {
@@ -900,15 +942,27 @@ namespace tools::rtti {
                         return a.offset < b.offset;
                     });
                 }
-            } catch (const sync::OperationStopped&) { throw; } catch (...) {
+            } catch (const sync::OperationStopped&) { throw; } catch (const std::exception& e) {
+                index_error = e.what();
+            } catch (...) {
+                index_error = "Unknown error while looking up RTTI class";
             }
         });
+
+        if (!index_error.empty())
+            return tools::utils::MakeToolErrorJson(id, index_error, "rtti_index_failed");
 
         if (!found) {
             return tools::utils::MakeToolErrorJson(id, "No RTTI class matching query '" + query + "' was found in binary", "class_not_found");
         }
 
         nlohmann::ordered_json res;
+        bool methods_truncated = false;
+        bool constructors_truncated = false;
+        constexpr size_t MAX_VTABLES_RETURNED = 64;
+        constexpr size_t MAX_CONSTRUCTORS_RETURNED = 256;
+        size_t remaining_methods = 1024;
+        sync::SyncRead([&]() {
         res["status"] = "success";
         res["class"] = target_copy.clean_name;
         res["raw_name"] = target_copy.raw_name;
@@ -945,13 +999,15 @@ namespace tools::rtti {
 
         // Primary methods
         res["methods_count"] = target_copy.methods_count;
-        res["methods"] = ExtractVtableMethods(target_copy.vtable_ea, target_copy.methods_count, is64, query_ea);
+        res["methods"] = ExtractVtableMethods(target_copy.vtable_ea, target_copy.methods_count, is64, query_ea, methods_truncated, remaining_methods);
 
         // Constructors & initializers (if detected)
         if (!target_copy.constructors.empty()) {
             nlohmann::json ctors_arr = nlohmann::json::array();
+            size_t ctor_count = 0;
             for (ea_t c_ea : target_copy.constructors) {
                 sync::Checkpoint();
+                if (ctor_count++ >= MAX_CONSTRUCTORS_RETURNED) { constructors_truncated = true; break; }
                 nlohmann::ordered_json c_obj;
                 c_obj["address"] = tools::utils::FormatAddress(c_ea);
                 qstring cname;
@@ -981,13 +1037,15 @@ namespace tools::rtti {
         // Multiple vtables list (only if more than one vtable exists for this class)
         if (all_matching_entries.size() > 1) {
             nlohmann::json vtables_arr = nlohmann::json::array();
+            size_t vtable_count = 0;
             for (const auto& e : all_matching_entries) {
                 sync::Checkpoint();
+                if (vtable_count++ >= MAX_VTABLES_RETURNED) { methods_truncated = true; break; }
                 nlohmann::ordered_json vt_obj;
                 vt_obj["offset"] = e.offset;
                 vt_obj["vtable"] = tools::utils::FormatAddress(e.vtable_ea);
                 vt_obj["methods_count"] = e.methods_count;
-                vt_obj["methods"] = ExtractVtableMethods(e.vtable_ea, e.methods_count, is64, query_ea);
+                vt_obj["methods"] = ExtractVtableMethods(e.vtable_ea, e.methods_count, is64, query_ea, methods_truncated, remaining_methods);
                 vtables_arr.push_back(std::move(vt_obj));
             }
             res["vtables"] = vtables_arr;
@@ -996,6 +1054,9 @@ namespace tools::rtti {
         if (!candidate_classes.empty()) {
             res["candidate_classes"] = candidate_classes;
         }
+        if (methods_truncated) res["methods_truncated"] = true;
+        if (constructors_truncated) res["constructors_truncated"] = true;
+        });
 
         return tools::utils::MakeToolSuccessJson(id, res);
     }
@@ -1032,15 +1093,19 @@ namespace tools::rtti {
     }
 
     nlohmann::json ApiRtti::RttiCreateStruct(const nlohmann::json& id, const nlohmann::json& args) {
-        std::string query = tools::utils::GetStringArg(args, "name", tools::utils::GetStringArg(args, "query", tools::utils::GetStringArg(args, "addr")));
-        std::string custom_name = tools::utils::GetStringArg(args, "struct_name", tools::utils::GetStringArg(args, "struct_prefix"));
+        std::string query = tools::utils::GetStringArg(args, "name", tools::utils::GetStringArg(args, "addr"));
+        std::string custom_name = tools::utils::GetStringArg(args, "struct_name");
         bool apply_to_vtable = tools::utils::GetBoolArg(args, "apply_to_vtable", false);
+        if (query.empty()) return tools::utils::MakeToolErrorJson(id, "Parameter 'name' or 'addr' is required", "missing_argument");
+        if (custom_name.size() > 128) return tools::utils::MakeToolErrorJson(id, "struct_name must be at most 128 bytes", "invalid_struct_name");
         ea_t query_ea = tools::utils::ParseAddress(query);
 
         RttiClassEntry target_copy;
         std::vector<RttiClassEntry> all_matching_entries;
         bool found = false;
         bool is64 = false;
+        std::string index_error;
+        bool entries_truncated = false;
 
         sync::SyncRead([&]() {
             try {
@@ -1054,6 +1119,7 @@ namespace tools::rtti {
                     for (const auto& c : clist) {
                         sync::Checkpoint();
                         if (c.type_desc_ea != BADADDR && c.type_desc_ea == target->type_desc_ea) {
+                            if (all_matching_entries.size() >= 64) { entries_truncated = true; break; }
                             all_matching_entries.push_back(c);
                         }
                     }
@@ -1062,9 +1128,15 @@ namespace tools::rtti {
                         return a.offset < b.offset;
                     });
                 }
-            } catch (const sync::OperationStopped&) { throw; } catch (...) {
+            } catch (const sync::OperationStopped&) { throw; } catch (const std::exception& e) {
+                index_error = e.what();
+            } catch (...) {
+                index_error = "Unknown error while looking up RTTI class";
             }
         });
+
+        if (!index_error.empty())
+            return tools::utils::MakeToolErrorJson(id, index_error, "rtti_index_failed");
 
         if (!found) {
             return tools::utils::MakeToolErrorJson(id, "No RTTI class matching query '" + query + "' was found in binary", "class_not_found");
@@ -1074,6 +1146,8 @@ namespace tools::rtti {
         std::string vtable_struct_name = base_struct_name + "_vftable";
         std::string class_struct_name = base_struct_name;
         size_t ptr_size = is64 ? 8 : 4;
+        size_t remaining_slots = 1024;
+        bool methods_truncated = entries_truncated;
 
         std::ostringstream ss;
         ss << "// Forward declarations\n";
@@ -1090,13 +1164,17 @@ namespace tools::rtti {
 
         ss << "struct " << vtable_struct_name << " {\n";
         sync::SyncRead([&]() {
+            const size_t method_limit = std::min(target_copy.methods_count, remaining_slots);
+            if (target_copy.methods_count > method_limit) methods_truncated = true;
             if (target_copy.vtable_ea != BADADDR && is_mapped(target_copy.vtable_ea)) {
-                for (size_t i = 0; i < target_copy.methods_count; ++i) {
+                for (size_t i = 0; i < method_limit; ++i) {
                     sync::Checkpoint();
+                    if (i > (BADADDR - target_copy.vtable_ea) / ptr_size) { methods_truncated = true; break; }
                     ea_t entry_ea = target_copy.vtable_ea + i * ptr_size;
                     if (!is_mapped(entry_ea) || !is_loaded(entry_ea)) break;
 
-                    ea_t fn_ea = is64 ? get_qword(entry_ea) : get_dword(entry_ea);
+                    ea_t fn_ea = BADADDR;
+                    if (!ReadPointer(entry_ea, is64, fn_ea)) break;
                     qstring fname;
                     if (is_mapped(fn_ea)) {
                         get_func_name(&fname, fn_ea);
@@ -1120,11 +1198,13 @@ namespace tools::rtti {
                     mj["address"] = tools::utils::FormatAddress(fn_ea);
                     if (!dem_str.empty()) mj["demangled"] = dem_str;
                     methods_arr.push_back(std::move(mj));
+                    --remaining_slots;
                 }
             } else {
-                for (size_t i = 0; i < target_copy.methods_count; ++i) {
+                for (size_t i = 0; i < method_limit; ++i) {
                     sync::Checkpoint();
                     ss << "    void* vfunc_" << i << ";\n";
+                    --remaining_slots;
                 }
             }
         });
@@ -1139,13 +1219,17 @@ namespace tools::rtti {
 
             ss << "struct " << sec_vtable_name << " {\n";
             sync::SyncRead([&]() {
+                const size_t method_limit = std::min(sec_entry.methods_count, remaining_slots);
+                if (sec_entry.methods_count > method_limit) methods_truncated = true;
                 if (sec_entry.vtable_ea != BADADDR && is_mapped(sec_entry.vtable_ea)) {
-                    for (size_t i = 0; i < sec_entry.methods_count; ++i) {
+                    for (size_t i = 0; i < method_limit; ++i) {
                         sync::Checkpoint();
+                        if (i > (BADADDR - sec_entry.vtable_ea) / ptr_size) { methods_truncated = true; break; }
                         ea_t entry_ea = sec_entry.vtable_ea + i * ptr_size;
                         if (!is_mapped(entry_ea) || !is_loaded(entry_ea)) break;
 
-                        ea_t fn_ea = is64 ? get_qword(entry_ea) : get_dword(entry_ea);
+                        ea_t fn_ea = BADADDR;
+                        if (!ReadPointer(entry_ea, is64, fn_ea)) break;
                         qstring fname;
                         if (is_mapped(fn_ea)) {
                             get_func_name(&fname, fn_ea);
@@ -1161,6 +1245,13 @@ namespace tools::rtti {
                             sec_seen.insert(m_name);
                         }
                         ss << "    void* " << m_name << ";\n";
+                        --remaining_slots;
+                    }
+                } else {
+                    for (size_t i = 0; i < method_limit; ++i) {
+                        sync::Checkpoint();
+                        ss << "    void* vfunc_" << i << ";\n";
+                        --remaining_slots;
                     }
                 }
             });
@@ -1179,6 +1270,8 @@ namespace tools::rtti {
         ss << "};\n";
 
         std::string c_header = ss.str();
+        if (c_header.size() > mcp::limits::result_bytes)
+            return tools::utils::MakeToolErrorJson(id, "Generated C declaration exceeds the output limit", "output_too_large");
         int parse_errs = 0;
         g_rtti_decl_errors.clear();
 
@@ -1210,11 +1303,12 @@ namespace tools::rtti {
         });
 
         // Optionally apply vtable struct type to IDB vtable address
+        bool applied_to_vtable = false;
         if (apply_to_vtable && target_copy.vtable_ea != BADADDR) {
             sync::SyncWrite([&]() {
                 tinfo_t vt_tif;
                 if (vt_tif.get_named_type(get_idati(), vtable_struct_name.c_str())) {
-                    apply_tinfo(target_copy.vtable_ea, vt_tif, TINFO_DEFINITE);
+                    applied_to_vtable = apply_tinfo(target_copy.vtable_ea, vt_tif, TINFO_DEFINITE);
                 }
             });
         }
@@ -1228,26 +1322,37 @@ namespace tools::rtti {
         res["methods_count"] = methods_arr.size();
         res["c_declaration"] = c_header;
         res["methods"] = methods_arr;
-        if (apply_to_vtable && target_copy.vtable_ea != BADADDR) {
+        if (apply_to_vtable && applied_to_vtable) {
             res["applied_to_vtable"] = tools::utils::FormatAddress(target_copy.vtable_ea);
         }
+        if (apply_to_vtable && !applied_to_vtable) res["apply_failed"] = true;
+        if (methods_truncated) res["methods_truncated"] = true;
+        if (entries_truncated) res["vtables_truncated"] = true;
 
         return tools::utils::MakeToolSuccessJson(id, res);
     }
 
     nlohmann::json ApiRtti::ResolveVcall(const nlohmann::json& id, const nlohmann::json& args) {
         ea_t query_ea = tools::utils::GetAddressArg(args, "addr");
-        if (query_ea == BADADDR) query_ea = tools::utils::GetAddressArg(args, "call_addr");
-        if (query_ea == BADADDR) query_ea = tools::utils::GetAddressArg(args, "vtable_addr");
-        if (query_ea == BADADDR) query_ea = tools::utils::GetAddressArg(args, "vtable");
-        if (query_ea == BADADDR) query_ea = tools::utils::GetAddressArg(args, "method_addr");
+        if (args.contains("addr") && query_ea == BADADDR)
+            return tools::utils::MakeToolErrorJson(id, "Address could not be resolved", "invalid_addr");
 
-        std::string class_query = tools::utils::GetStringArg(args, "class", tools::utils::GetStringArg(args, "class_name"));
-        int target_index = static_cast<int>(tools::utils::GetIntArg(args, "index", -1));
+        std::string class_query = tools::utils::GetStringArg(args, "class");
+        const int64_t index_arg = tools::utils::GetIntArg(args, "index", -1);
+        if ((args.contains("index") && index_arg < 0) || index_arg > 511)
+            return tools::utils::MakeToolErrorJson(id, "index must be between 0 and 511", "invalid_index");
+        int target_index = static_cast<int>(index_arg);
         bool all_methods = tools::utils::GetBoolArg(args, "all_methods", false);
-        bool demangle = tools::utils::GetBoolArg(args, "demangle", true);
-        size_t max_methods = static_cast<size_t>(tools::utils::GetIntArg(args, "max_methods", 128));
-        if (max_methods == 0 || max_methods > 512) max_methods = 128;
+        const int64_t max_methods_arg = tools::utils::GetIntArg(args, "max_methods", 128);
+        if (max_methods_arg < 0 || max_methods_arg > 512)
+            return tools::utils::MakeToolErrorJson(id, "max_methods must be between 0 and 512", "invalid_max_methods");
+        size_t max_methods = max_methods_arg == 0 ? 128 : static_cast<size_t>(max_methods_arg);
+        if (target_index >= 0) max_methods = std::max(max_methods, static_cast<size_t>(target_index) + 1);
+        const int64_t offset_arg = tools::utils::GetIntArg(args, "offset", -1);
+        if (args.contains("offset") && offset_arg < 0)
+            return tools::utils::MakeToolErrorJson(id, "offset must be a non-negative byte offset", "invalid_offset");
+        if (args.contains("index") && args.contains("offset"))
+            return tools::utils::MakeToolErrorJson(id, "Provide either index or offset, not both", "conflicting_slot");
 
         if (query_ea == BADADDR && class_query.empty()) {
             return tools::utils::MakeToolErrorJson(id, "Either 'addr' (call site / vtable / method address) or 'class' name must be provided", "addr_or_class_required");
@@ -1264,6 +1369,8 @@ namespace tools::rtti {
         std::string base_reg;
         std::string pfn_name;
         std::string inferred_from;
+        std::string input_error;
+        bool methods_truncated = false;
         int call_disp = -1;
         bool is_code_seg = false;
 
@@ -1271,19 +1378,12 @@ namespace tools::rtti {
             is64 = inf_is_64bit();
             size_t ptr_size = is64 ? 8 : 4;
 
-            if (target_index == -1) {
-                int64_t off_arg = tools::utils::GetIntArg(args, "offset", -1);
-                if (off_arg >= 0) {
-                    target_index = static_cast<int>(off_arg / ptr_size);
-                } else {
-                    std::string offset_str = tools::utils::GetStringArg(args, "offset");
-                    if (!offset_str.empty()) {
-                        ea_t off_val = tools::utils::ParseAddress(offset_str);
-                        if (off_val != BADADDR) {
-                            target_index = static_cast<int>(off_val / ptr_size);
-                        }
-                    }
+            if (args.contains("offset")) {
+                if (static_cast<uint64_t>(offset_arg) % ptr_size != 0 || static_cast<uint64_t>(offset_arg) / ptr_size > 511) {
+                    input_error = "offset must be pointer-aligned and resolve to a vtable index from 0 to 511";
+                    return;
                 }
+                target_index = static_cast<int>(static_cast<uint64_t>(offset_arg) / ptr_size);
             }
 
             if (!class_query.empty() && query_ea == BADADDR) {
@@ -1316,8 +1416,9 @@ namespace tools::rtti {
                     if (decode_insn(&insn, query_ea) > 0) {
                         for (int op_i = 0; op_i < 6; ++op_i) {
                             sync::Checkpoint();
-                            if (insn.ops[op_i].type == o_displ) {
-                                call_disp = static_cast<int>(insn.ops[op_i].addr);
+                    if (insn.ops[op_i].type == o_displ) {
+                                if (insn.ops[op_i].addr <= static_cast<ea_t>(std::numeric_limits<int>::max()))
+                                    call_disp = static_cast<int>(insn.ops[op_i].addr);
                                 base_reg = GetRegisterName(insn.ops[op_i].reg, ptr_size);
                                 mode = "call_site";
                                 break;
@@ -1342,7 +1443,8 @@ namespace tools::rtti {
                                         if (decode_insn(&prev_b_insn, b_ea) > 0) {
                                             if (prev_b_insn.ops[0].type == o_reg && prev_b_insn.ops[0].reg == insn.ops[op_i].reg) {
                                                 if (prev_b_insn.ops[1].type == o_displ) {
-                                                    call_disp = static_cast<int>(prev_b_insn.ops[1].addr);
+                                                    if (prev_b_insn.ops[1].addr <= static_cast<ea_t>(std::numeric_limits<int>::max()))
+                                                        call_disp = static_cast<int>(prev_b_insn.ops[1].addr);
                                                     base_reg = GetRegisterName(prev_b_insn.ops[1].reg, ptr_size);
                                                     break;
                                                 } else if (prev_b_insn.ops[1].type == o_phrase) {
@@ -1360,6 +1462,10 @@ namespace tools::rtti {
 
                         if (call_disp >= 0 && target_index == -1) {
                             target_index = call_disp / static_cast<int>(ptr_size);
+                            if (target_index > 511) {
+                                input_error = "Decoded virtual slot exceeds the supported index limit of 511";
+                                return;
+                            }
                         }
                     }
 
@@ -1418,8 +1524,8 @@ namespace tools::rtti {
                                         if (is_mapped(cand_ea)) {
                                             segment_t* cs = getseg(cand_ea);
                                             if (cs && (cs->perm & SEGPERM_EXEC) == 0) {
-                                                ea_t first_fn = is64 ? get_qword(cand_ea) : get_dword(cand_ea);
-                                                if (is_mapped(first_fn)) {
+                                                ea_t first_fn = BADADDR;
+                                                if (ReadPointer(cand_ea, is64, first_fn) && is_mapped(first_fn)) {
                                                     segment_t* fns = getseg(first_fn);
                                                     if (fns && (fns->perm & SEGPERM_EXEC) != 0) {
                                                         resolved_vtable_ea = cand_ea;
@@ -1461,11 +1567,13 @@ namespace tools::rtti {
                     resolved_vtable_ea = query_ea;
 
                     // Check if query_ea is an object pointing to vtable
-                    ea_t deref1 = is64 ? get_qword(query_ea) : get_dword(query_ea);
+                    ea_t deref1 = BADADDR;
+                    if (!ReadPointer(query_ea, is64, deref1)) deref1 = BADADDR;
                     if (is_mapped(deref1)) {
                         segment_t* deref_seg = getseg(deref1);
                         if (deref_seg && (deref_seg->perm & SEGPERM_EXEC) == 0) {
-                            ea_t deref2 = is64 ? get_qword(deref1) : get_dword(deref1);
+                            ea_t deref2 = BADADDR;
+                            if (!ReadPointer(deref1, is64, deref2)) deref2 = BADADDR;
                             if (is_mapped(deref2)) {
                                 segment_t* deref2_seg = getseg(deref2);
                                 if (deref2_seg && (deref2_seg->perm & SEGPERM_EXEC) != 0) {
@@ -1488,9 +1596,10 @@ namespace tools::rtti {
                 }
 
                 if (resolved_class_name.empty()) {
+                    if (resolved_vtable_ea >= ptr_size) {
                     ea_t col_ptr = resolved_vtable_ea - ptr_size;
-                    if (is_mapped(col_ptr)) {
-                        ea_t col_ea = is64 ? get_qword(col_ptr) : get_dword(col_ptr);
+                    ea_t col_ea = BADADDR;
+                    if (ReadPointer(col_ptr, is64, col_ea)) {
                         if (is_mapped(col_ea)) {
                             RttiClassEntry c;
                             if (ParseColAndClass(col_ea, resolved_vtable_ea, is64, get_imagebase(), c)) {
@@ -1498,6 +1607,7 @@ namespace tools::rtti {
                                 class_hierarchy = c.hierarchy;
                             }
                         }
+                    }
                     }
                 }
 
@@ -1519,10 +1629,10 @@ namespace tools::rtti {
 
                 for (size_t i = 0; i < max_methods; ++i) {
                     sync::Checkpoint();
+                    if (i > (BADADDR - resolved_vtable_ea) / ptr_size) { methods_truncated = true; break; }
                     ea_t slot_ea = resolved_vtable_ea + i * ptr_size;
-                    if (!is_mapped(slot_ea) || !is_loaded(slot_ea)) break;
-
-                    ea_t fn_ea = is64 ? get_qword(slot_ea) : get_dword(slot_ea);
+                    ea_t fn_ea = BADADDR;
+                    if (!ReadPointer(slot_ea, is64, fn_ea)) break;
                     if (fn_ea == 0 || fn_ea == BADADDR || !is_mapped(fn_ea)) break;
 
                     segment_t* fn_seg = getseg(fn_ea);
@@ -1537,7 +1647,7 @@ namespace tools::rtti {
 
                     qstring dem;
                     std::string demangled_sig;
-                    if (demangle && demangle_name(&dem, fname.c_str(), 0, DQT_FULL) > 0) {
+                    if (demangle_name(&dem, fname.c_str(), 0, DQT_FULL) > 0) {
                         demangled_sig = dem.c_str();
                     }
 
@@ -1585,8 +1695,19 @@ namespace tools::rtti {
 
                     methods_arr.push_back(std::move(method_info));
                 }
+                if (methods_arr.size() == max_methods && max_methods <= (BADADDR - resolved_vtable_ea) / ptr_size) {
+                    ea_t next_fn = BADADDR;
+                    const ea_t next_slot = resolved_vtable_ea + max_methods * ptr_size;
+                    if (ReadPointer(next_slot, is64, next_fn) && next_fn != 0 && is_mapped(next_fn)) {
+                        segment_t* next_seg = getseg(next_fn);
+                        methods_truncated = next_seg && (next_seg->perm & SEGPERM_EXEC) != 0;
+                    }
+                }
             }
         });
+
+        if (!input_error.empty())
+            return tools::utils::MakeToolErrorJson(id, input_error, "invalid_offset");
 
         nlohmann::ordered_json res;
         res["status"] = "success";
@@ -1630,16 +1751,17 @@ namespace tools::rtti {
             res["methods_count"] = methods_arr.size();
             res["methods"] = methods_arr;
         }
+        if (methods_truncated) res["methods_truncated"] = true;
 
         if (resolved_vtable_ea == BADADDR && resolved_method_json.is_null()) {
             if (target_index >= 0) {
                 res["resolved"] = false;
-                res["message"] = "Virtual call decoded at slot " + std::to_string(target_index) + " (displacement " + tools::utils::FormatAddress(call_disp) + "). Specify 'class' or 'vtable' to resolve the target function.";
+                res["message"] = "Virtual call decoded at slot " + std::to_string(target_index) + " (displacement " + tools::utils::FormatAddress(call_disp) + "). Specify 'class' or 'addr' to resolve the target function.";
             } else {
                 return tools::utils::MakeToolErrorJson(id, "Could not resolve virtual table or target method", "resolve_failed");
             }
         }
 
-        return tools::utils::MakeToolSuccessJson(id, res);
+            return tools::utils::MakeToolSuccessJson(id, res);
     }
 }

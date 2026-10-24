@@ -24,29 +24,39 @@
 
 namespace tools::modify {
     namespace {
-        std::pair<std::string, bool> AppendCommentText(const std::string& current, const std::string& addition, bool dedupe) {
-            if (addition.empty()) return {current, true};
-            if (dedupe && !current.empty() && current.find(addition) != std::string::npos) {
-                return {current, true};
-            }
-            if (current.empty()) return {addition, false};
-            return {current + "\n" + addition, false};
-        }
+        constexpr size_t MAX_INCLUDED_CODE_BYTES = 512 * 1024;
 
-        std::string DecompileFunctionCode(func_t* fn) {
-            if (!fn || !init_hexrays_plugin()) return "";
+        std::pair<std::string, bool> DecompileFunctionCode(func_t* fn) {
+            if (!fn || !init_hexrays_plugin()) return {"", false};
             hexrays_failure_t hf;
             cfuncptr_t cfunc = decompile(fn, &hf, DECOMP_WARNINGS | DECOMP_NO_WAIT);
-            if (!cfunc) return "";
+            if (!cfunc) return {"", false};
             std::string code;
+            code.reserve((std::min)(MAX_INCLUDED_CODE_BYTES, size_t(64 * 1024)));
+            bool truncated = false;
             const strvec_t& sv = cfunc->get_pseudocode();
             for (size_t i = 0; i < sv.size(); ++i) {
                 sync::Checkpoint();
                 qstring clean_line;
                 tag_remove(&clean_line, sv[i].line.c_str());
-                code += tools::utils::SanitizeUtf8(clean_line.c_str()) + "\n";
+                const char* line = clean_line.c_str();
+                size_t line_size = clean_line.length();
+                size_t remaining = MAX_INCLUDED_CODE_BYTES - code.size();
+                if (remaining == 0) {
+                    truncated = true;
+                    break;
+                }
+                size_t take = (std::min)(line_size, remaining);
+                code += tools::utils::SanitizeUtf8(std::string(line, take));
+                if (take == line_size && code.size() < MAX_INCLUDED_CODE_BYTES) {
+                    code.push_back('\n');
+                }
+                if (take < line_size || code.size() >= MAX_INCLUDED_CODE_BYTES) {
+                    truncated = i + 1 < sv.size() || take < line_size;
+                    break;
+                }
             }
-            return code;
+            return {std::move(code), truncated};
         }
     }
 
@@ -96,6 +106,7 @@ namespace tools::modify {
         nlohmann::json results = nlohmann::json::array();
         size_t succeeded_count = 0;
         size_t failed_count = 0;
+        size_t partial_count = 0;
 
         sync::SyncWrite([&]() {
             for (const auto& item : items) {
@@ -119,7 +130,8 @@ namespace tools::modify {
                 std::string sym_type = is_func_entry ? "function" : (fn != nullptr ? "instruction" : "data");
 
                 nlohmann::ordered_json item_res;
-                item_res["status"] = "success";
+                bool item_succeeded = false;
+                bool item_failed = false;
                 item_res["address"] = tools::utils::FormatAddress(ea);
                 item_res["symbol_type"] = sym_type;
 
@@ -142,9 +154,14 @@ namespace tools::modify {
                                 item_res["demangled"] = dem.c_str();
                             }
                             if (fn) affected_funcs.insert(fn->start_ea);
+                            item_succeeded = true;
                         } else {
                             item_res["name_error"] = "set_name failed (already exists or invalid characters)";
+                            item_failed = true;
                         }
+                    } else {
+                        item_res["name_error"] = "A non-empty name or reset_name=true is required";
+                        item_failed = true;
                     }
                 }
 
@@ -181,9 +198,14 @@ namespace tools::modify {
                             tif.print(&new_str, nullptr, PRTYPE_1LINE | PRTYPE_SEMI);
                             item_res["new_type"] = new_str.c_str();
                             if (fn) affected_funcs.insert(fn->start_ea);
+                            item_succeeded = true;
                         } else {
                             item_res["type_error"] = "Failed to parse or apply type";
+                            item_failed = true;
                         }
+                    } else {
+                        item_res["type_error"] = "Type declaration must not be empty";
+                        item_failed = true;
                     }
                 }
 
@@ -198,25 +220,36 @@ namespace tools::modify {
                     get_cmt(&cur_cmt, ea, repeatable);
                     item_res["old_comment"] = cur_cmt.c_str();
 
-                    set_cmt(ea, cmt.c_str(), repeatable);
+                    bool comment_ok = std::string(cur_cmt.c_str()) == cmt || set_cmt(ea, cmt.c_str(), repeatable);
+                    if (func_cmt && !fn) comment_ok = false;
                     if (fn) {
                         if (func_cmt || fn->start_ea == ea) {
-                            set_func_cmt(fn, cmt.c_str(), repeatable);
+                            qstring old_func_cmt;
+                            get_func_cmt(&old_func_cmt, fn, repeatable);
+                            if (std::string(old_func_cmt.c_str()) != cmt && !set_func_cmt(fn, cmt.c_str(), repeatable))
+                                comment_ok = false;
                         }
                         if (init_hexrays_plugin()) {
                             user_cmts_t* ucmts = restore_user_cmts(fn->start_ea);
                             if (!ucmts) ucmts = user_cmts_new();
-                            treeloc_t tl;
-                            tl.ea = ea;
-                            tl.itp = ITP_SEMI;
-                            if (cmt.empty()) ucmts->erase(tl);
-                            else (*ucmts)[tl] = citem_cmt_t(cmt.c_str());
-                            save_user_cmts(fn->start_ea, ucmts);
-                            user_cmts_free(ucmts);
+                            if (ucmts) {
+                                treeloc_t tl;
+                                tl.ea = ea;
+                                tl.itp = ITP_SEMI;
+                                if (cmt.empty()) ucmts->erase(tl);
+                                else (*ucmts)[tl] = citem_cmt_t(cmt.c_str());
+                                save_user_cmts(fn->start_ea, ucmts);
+                                user_cmts_free(ucmts);
+                            } else comment_ok = false;
                         }
                         affected_funcs.insert(fn->start_ea);
                     }
                     item_res["new_comment"] = cmt;
+                    if (comment_ok) item_succeeded = true;
+                    else {
+                        item_res["comment_error"] = "IDA failed to apply the requested comment";
+                        item_failed = true;
+                    }
                 }
 
                 // 4. Local variables
@@ -229,22 +262,52 @@ namespace tools::modify {
                             for (const auto& lv_item : item["lvars"]) {
                                 sync::Checkpoint();
                                 if (!lv_item.is_object()) continue;
-                                std::string cur_lv_name = tools::utils::GetStringArg(lv_item, "name", tools::utils::GetStringArg(lv_item, "old_name"));
+                                std::string cur_lv_name = tools::utils::GetStringArg(lv_item, "name");
                                 std::string new_lv_name = tools::utils::GetStringArg(lv_item, "new_name");
                                 std::string lv_type_str = tools::utils::GetStringArg(lv_item, "type");
-                                if (cur_lv_name.empty()) continue;
-
                                 lvar_saved_info_t lv_info;
-                                if (locate_lvar(&lv_info.ll, fn->start_ea, cur_lv_name.c_str())) {
-                                    bool lv_changed = false;
-                                    nlohmann::ordered_json lv_r;
-                                    lv_r["name"] = cur_lv_name;
+                                bool found_lvar = false;
+                                if (lv_item.contains("index")) {
+                                    const auto index = lv_item["index"].get<size_t>();
+                                    const auto* lvars = cfunc->get_lvars();
+                                    if (lvars && index < lvars->size()) {
+                                        const lvar_t& selected = (*lvars)[index];
+                                        lv_info.ll = static_cast<const lvar_locator_t&>(selected);
+                                        cur_lv_name = selected.name.c_str();
+                                        found_lvar = true;
+                                    }
+                                } else if (!cur_lv_name.empty()) {
+                                    found_lvar = locate_lvar(&lv_info.ll, fn->start_ea, cur_lv_name.c_str());
+                                }
 
-                                    if (!new_lv_name.empty() && new_lv_name != cur_lv_name) {
-                                        if (rename_lvar(fn->start_ea, cur_lv_name.c_str(), new_lv_name.c_str())) {
-                                            lv_r["new_name"] = new_lv_name;
-                                            lv_changed = true;
-                                            cur_lv_name = new_lv_name;
+                                nlohmann::ordered_json lv_r;
+                                if (lv_item.contains("index")) lv_r["index"] = lv_item["index"];
+                                if (!cur_lv_name.empty()) lv_r["name"] = cur_lv_name;
+                                bool lv_succeeded = false;
+                                bool lv_failed = false;
+                                std::vector<std::string> lv_errors;
+                                if (!found_lvar) {
+                                    lv_errors.push_back(lv_item.contains("index") ?
+                                        "Local variable index is out of range" : "Local variable name was not found");
+                                    lv_failed = true;
+                                } else if (new_lv_name.empty() && lv_type_str.empty()) {
+                                    lv_errors.push_back("At least one of new_name or type is required");
+                                    lv_failed = true;
+                                } else {
+                                    if (!new_lv_name.empty()) {
+                                        if (new_lv_name == cur_lv_name) {
+                                            lv_succeeded = true;
+                                        } else {
+                                            lvar_saved_info_t rename_info;
+                                            rename_info.ll = lv_info.ll;
+                                            rename_info.name = new_lv_name.c_str();
+                                            if (modify_user_lvar_info(fn->start_ea, MLI_NAME, rename_info)) {
+                                                lv_r["new_name"] = new_lv_name;
+                                                lv_succeeded = true;
+                                            } else {
+                                                lv_errors.push_back("IDA failed to rename the local variable");
+                                                lv_failed = true;
+                                            }
                                         }
                                     }
 
@@ -253,32 +316,53 @@ namespace tools::modify {
                                         qstring lv_nbuf;
                                         std::string decl_s = lv_type_str;
                                         if (decl_s.find(';') == std::string::npos) decl_s += ";";
-                                        if (!parse_decl(&lv_tif, &lv_nbuf, get_idati(), decl_s.c_str(), PT_SIL | PT_TYP)) {
+                                        bool parsed = parse_decl(&lv_tif, &lv_nbuf, get_idati(), decl_s.c_str(), PT_SIL | PT_TYP);
+                                        if (!parsed) {
                                             std::string with_dummy = lv_type_str + " dummy_var;";
-                                            parse_decl(&lv_tif, &lv_nbuf, get_idati(), with_dummy.c_str(), PT_SIL | PT_TYP);
+                                            parsed = parse_decl(&lv_tif, &lv_nbuf, get_idati(), with_dummy.c_str(), PT_SIL | PT_TYP);
                                         }
-                                        if (locate_lvar(&lv_info.ll, fn->start_ea, cur_lv_name.c_str())) {
-                                            lv_info.type = lv_tif;
-                                            if (modify_user_lvar_info(fn->start_ea, MLI_TYPE, lv_info)) {
+                                        if (!parsed) {
+                                            lv_errors.push_back("Failed to parse local variable type");
+                                            lv_failed = true;
+                                        } else {
+                                            lvar_saved_info_t type_info;
+                                            type_info.ll = lv_info.ll;
+                                            type_info.type = lv_tif;
+                                            if (modify_user_lvar_info(fn->start_ea, MLI_TYPE, type_info)) {
                                                 qstring app_t;
                                                 lv_tif.print(&app_t, nullptr, PRTYPE_1LINE | PRTYPE_SEMI);
                                                 lv_r["new_type"] = app_t.c_str();
-                                                lv_changed = true;
+                                                lv_succeeded = true;
+                                            } else {
+                                                lv_errors.push_back("IDA failed to apply local variable type");
+                                                lv_failed = true;
                                             }
                                         }
                                     }
-
-                                    if (lv_changed) {
-                                        lvar_results.push_back(std::move(lv_r));
-                                        affected_funcs.insert(fn->start_ea);
-                                    }
                                 }
+                                lv_r["status"] = lv_failed ? (lv_succeeded ? "partial" : "error") : "success";
+                                if (!lv_errors.empty()) lv_r["errors"] = lv_errors;
+                                lvar_results.push_back(std::move(lv_r));
+                                if (lv_succeeded) {
+                                    item_succeeded = true;
+                                    affected_funcs.insert(fn->start_ea);
+                                }
+                                if (lv_failed) item_failed = true;
                             }
                             if (!lvar_results.empty()) {
                                 item_res["lvars"] = lvar_results;
                             }
+                        } else {
+                            item_res["lvar_error"] = "Hex-Rays could not decompile the target function";
+                            item_failed = true;
                         }
+                    } else {
+                        item_res["lvar_error"] = "Hex-Rays is unavailable";
+                        item_failed = true;
                     }
+                } else if (item.contains("lvars")) {
+                    item_res["lvar_error"] = "Local variable edits require a function target";
+                    item_failed = true;
                 }
 
                 // 5. Instruction comments array
@@ -286,30 +370,54 @@ namespace tools::modify {
                     nlohmann::json cmt_results = nlohmann::json::array();
                     for (const auto& ci : item["comments"]) {
                         sync::Checkpoint();
-                        if (!ci.is_object()) continue;
+                        nlohmann::ordered_json cmt_result;
+                        if (!ci.is_object()) {
+                            cmt_result["status"] = "error";
+                            cmt_result["message"] = "Comment entry must be an object";
+                            cmt_results.push_back(std::move(cmt_result));
+                            item_failed = true;
+                            continue;
+                        }
                         ea_t c_ea = tools::utils::GetAddressArg(ci, "addr");
                         if (c_ea == BADADDR) c_ea = tools::utils::GetAddressArg(ci, "target");
                         std::string c_text = tools::utils::GetStringArg(ci, "text", tools::utils::GetStringArg(ci, "comment"));
                         bool c_rep = tools::utils::GetBoolArg(ci, "repeatable", false);
-                        if (c_ea != BADADDR && !c_text.empty()) {
-                            set_cmt(c_ea, c_text.c_str(), c_rep);
-                            func_t* c_fn = get_func(c_ea);
-                            if (c_fn && init_hexrays_plugin()) {
+                        func_t* c_fn = c_ea == BADADDR ? nullptr : get_func(c_ea);
+                        if (!fn || !c_fn || c_fn->start_ea != fn->start_ea) {
+                            cmt_result["status"] = "error";
+                            cmt_result["message"] = "Instruction comment address must belong to the target function";
+                            if (c_ea != BADADDR) cmt_result["address"] = tools::utils::FormatAddress(c_ea);
+                            item_failed = true;
+                        } else {
+                            qstring current_comment;
+                            get_cmt(&current_comment, c_ea, c_rep);
+                            bool comment_ok = std::string(current_comment.c_str()) == c_text || set_cmt(c_ea, c_text.c_str(), c_rep);
+                            if (comment_ok && init_hexrays_plugin()) {
                                 user_cmts_t* ucmts = restore_user_cmts(c_fn->start_ea);
                                 if (!ucmts) ucmts = user_cmts_new();
-                                treeloc_t tl;
-                                tl.ea = c_ea;
-                                tl.itp = ITP_SEMI;
-                                (*ucmts)[tl] = citem_cmt_t(c_text.c_str());
-                                save_user_cmts(c_fn->start_ea, ucmts);
-                                user_cmts_free(ucmts);
-                                affected_funcs.insert(c_fn->start_ea);
+                                if (ucmts) {
+                                    treeloc_t tl;
+                                    tl.ea = c_ea;
+                                    tl.itp = ITP_SEMI;
+                                    if (c_text.empty()) ucmts->erase(tl);
+                                    else (*ucmts)[tl] = citem_cmt_t(c_text.c_str());
+                                    save_user_cmts(c_fn->start_ea, ucmts);
+                                    user_cmts_free(ucmts);
+                                } else comment_ok = false;
                             }
-                            cmt_results.push_back({
-                                {"address", tools::utils::FormatAddress(c_ea)},
-                                {"comment", c_text}
-                            });
+                            cmt_result["address"] = tools::utils::FormatAddress(c_ea);
+                            if (comment_ok) {
+                                cmt_result["status"] = "success";
+                                cmt_result["comment"] = c_text;
+                                item_succeeded = true;
+                                affected_funcs.insert(c_fn->start_ea);
+                            } else {
+                                cmt_result["status"] = "error";
+                                cmt_result["message"] = "IDA failed to apply the instruction comment";
+                                item_failed = true;
+                            }
                         }
+                        cmt_results.push_back(std::move(cmt_result));
                     }
                     if (!cmt_results.empty()) {
                         item_res["comments"] = cmt_results;
@@ -319,11 +427,20 @@ namespace tools::modify {
                 // 6. Explicit Recompile / Cache refresh
                 if (item.contains("recompile") || item.contains("refresh") || item.value("action", "") == "recompile" ||
                     (!item.contains("name") && !item.contains("type") && !item.contains("comment") && !item.contains("lvars") && !item.contains("comments"))) {
-                    if (fn) affected_funcs.insert(fn->start_ea);
-                    item_res["recompiled"] = true;
+                    if (fn) {
+                        affected_funcs.insert(fn->start_ea);
+                        item_res["recompiled"] = true;
+                        item_succeeded = true;
+                    } else {
+                        item_res["recompile_error"] = "Target is not inside a function";
+                        item_failed = true;
+                    }
                 }
 
-                succeeded_count++;
+                item_res["status"] = item_failed ? (item_succeeded ? "partial" : "error") : "success";
+                if (item_succeeded && item_failed) partial_count++;
+                else if (item_succeeded) succeeded_count++;
+                else if (item_failed) failed_count++;
                 results.push_back(std::move(item_res));
             }
 
@@ -342,9 +459,10 @@ namespace tools::modify {
             ea_t target_fn_ea = *affected_funcs.begin();
             func_t* rfn = get_func(target_fn_ea);
             if (rfn) {
-                std::string code = DecompileFunctionCode(rfn);
+                auto [code, code_truncated] = DecompileFunctionCode(rfn);
                 if (!code.empty()) {
                     results[0]["code"] = code;
+                    if (code_truncated) results[0]["code_truncated"] = true;
                 }
             }
         }
@@ -354,10 +472,12 @@ namespace tools::modify {
         }
 
         nlohmann::ordered_json resp;
-        resp["status"] = "success";
+        resp["status"] = failed_count > 0 && succeeded_count == 0 && partial_count == 0 ? "error" :
+            (failed_count > 0 || partial_count > 0 ? "partial" : "success");
         resp["total"] = items.size();
         resp["succeeded"] = succeeded_count;
         resp["failed"] = failed_count;
+        if (partial_count) resp["partial"] = partial_count;
         resp["results"] = results;
         return tools::utils::MakeToolSuccessJson(id, resp);
     }

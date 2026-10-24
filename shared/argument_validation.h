@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include "json.h"
+#include "utf8.h"
 
 namespace mcp {
     inline std::string ValidateArguments(const nlohmann::json& schema, const nlohmann::json& value,
@@ -23,7 +24,7 @@ namespace mcp {
             if (schema.contains("maximum") && value.get<double>() > schema["maximum"].get<double>())
                 return path + ": above maximum " + schema["maximum"].dump();
         }
-        if (value.is_string() && schema.contains("maxLength") && value.get_ref<const std::string&>().size() > schema["maxLength"].get<size_t>())
+        if (value.is_string() && schema.contains("maxLength") && UnicodeLength(value.get_ref<const std::string&>()) > schema["maxLength"].get<size_t>())
             return path + ": string too long";
         if (value.is_object()) {
             if (schema.contains("required")) for (const auto& key : schema["required"])

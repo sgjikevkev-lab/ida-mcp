@@ -2,6 +2,21 @@
 #include <string>
 
 namespace mcp {
+    inline std::string LowerAscii(std::string value) {
+        for (char& ch : value) {
+            const auto c = static_cast<unsigned char>(ch);
+            if (c >= 'A' && c <= 'Z') ch = static_cast<char>(c + ('a' - 'A'));
+        }
+        return value;
+    }
+
+    inline size_t UnicodeLength(const std::string& input) {
+        size_t count = 0;
+        for (unsigned char c : input)
+            if ((c & 0xC0) != 0x80) ++count;
+        return count;
+    }
+
     inline std::string SanitizeUnicode(const std::string& input) {
         std::string out;
         out.reserve(input.size());

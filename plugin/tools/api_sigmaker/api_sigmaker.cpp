@@ -59,17 +59,6 @@ namespace tools::sigmaker {
                 }
             }
 
-            void add_bytes(ea_t addr, size_t count, uint32_t wildcard_bits) {
-                bytes.reserve(bytes.size() + count);
-                mask.reserve(mask.size() + count);
-                for (size_t i = 0; i < count; ++i) {
-                    sync::Checkpoint();
-                    bool is_wildcard = GET_BIT(wildcard_bits, i);
-                    uint8_t b = get_byte(addr + i);
-                    add_byte(b, is_wildcard);
-                }
-            }
-
             void add_raw_bytes(const uint8_t* raw_bytes, size_t count, uint32_t wildcard_bits) {
                 bytes.reserve(bytes.size() + count);
                 mask.reserve(mask.size() + count);
@@ -145,6 +134,7 @@ namespace tools::sigmaker {
             size_t size = 0;
             std::vector<uint8_t> data;
         };
+        constexpr size_t MAX_SIGNATURE_SNAPSHOT_BYTES = 256 * 1024 * 1024;
 
         class SegmentSnapshotCache {
         public:
@@ -188,12 +178,12 @@ namespace tools::sigmaker {
             std::vector<DecodedInsn> insns;
         };
 
-        inline const uint8_t* GetSegmentPtr(const std::vector<ScanSegment>& segments, ea_t addr) {
+        inline const uint8_t* GetSegmentPtr(const std::vector<ScanSegment>& segments, ea_t addr, size_t required = 1) {
             for (const auto& seg : segments) {
                 sync::Checkpoint();
                 if (addr >= seg.start_ea && addr < seg.end_ea) {
                     size_t off = static_cast<size_t>(addr - seg.start_ea);
-                    if (off < seg.size) return seg.data.data() + off;
+                    if (off <= seg.size && required <= seg.size - off) return seg.data.data() + off;
                 }
             }
             return nullptr;
@@ -204,13 +194,15 @@ namespace tools::sigmaker {
             ea_t first_ea = BADADDR;
             ea_t second_ea = BADADDR;
             std::vector<ea_t> matches;
+            bool matches_truncated = false;
         };
 
         inline ScanResult ScanPattern(
             const std::vector<ScanSegment>& segments,
             const FastPattern& pat,
             size_t max_matches = 2,
-            bool collect_matches = false
+            bool collect_matches = false,
+            bool stop_when_matches_truncated = false
         ) {
             ScanResult res;
             if (pat.empty() || pat.fixed_count < 4) return res;
@@ -233,7 +225,8 @@ namespace tools::sigmaker {
                     sync::Checkpoint();
                     // Vectorized hardware search for the first non-wildcard byte
                     const uint8_t* cand = static_cast<const uint8_t*>(
-                        std::memchr(ptr + first_off, first_byte, (max_start - ptr) + 1)
+                        std::memchr(ptr + first_off, first_byte,
+                            static_cast<size_t>(max_start - ptr) + first_off + 1)
                     );
                     if (!cand) break;
 
@@ -256,8 +249,11 @@ namespace tools::sigmaker {
                             if (res.first_ea == BADADDR) res.first_ea = match_ea;
                             else if (res.second_ea == BADADDR) res.second_ea = match_ea;
 
-                            if (collect_matches) {
+                            if (collect_matches && res.matches.size() < max_matches) {
                                 res.matches.push_back(match_ea);
+                            } else if (collect_matches) {
+                                res.matches_truncated = true;
+                                if (stop_when_matches_truncated) return res;
                             }
 
                             if (!collect_matches && res.count >= max_matches) {
@@ -324,7 +320,9 @@ namespace tools::sigmaker {
                 if (res.pat.size() >= max_len || res.pat.size() >= prune_len) break;
 
                 size_t prev_size = res.pat.size();
-                const uint8_t* raw = GetSegmentPtr(segments, di.ea);
+                if (di.len <= 0 || static_cast<size_t>(di.len) > max_len - res.pat.size()) break;
+                const uint8_t* raw = GetSegmentPtr(segments, di.ea, static_cast<size_t>(di.len));
+                if (!raw) break;
                 res.pat.add_raw_bytes(raw, di.len, di.wildcard_bits);
 
                 if (res.pat.size() >= prune_len) break;
@@ -338,6 +336,7 @@ namespace tools::sigmaker {
                             sync::Checkpoint();
                             size_t pat_idx = prev_size + i;
                             if (res.pat.mask[pat_idx] == 0) continue;
+                            if (pat_idx > BADADDR - coll_ea) return true;
                             const uint8_t* b = GetSegmentPtr(segments, coll_ea + pat_idx);
                             if (!b || *b != res.pat.bytes[pat_idx]) return true;
                         }
@@ -359,13 +358,13 @@ namespace tools::sigmaker {
                     FastPattern trimmed = res.pat;
                     trimmed.trim();
                     if (trimmed.size() < prune_len) {
-                        ScanResult sr = ScanPattern(segments, trimmed, 2, true);
+                        ScanResult sr = ScanPattern(segments, trimmed, 64, true, true);
                         if (sr.count == 1) {
                             res.pat = std::move(trimmed);
                             res.length = res.pat.size();
                             res.unique = true;
                             return res;
-                        } else if (sr.count > 1 && sr.matches.size() <= 64) {
+                        } else if (sr.count > 1 && !sr.matches_truncated && sr.matches.size() <= 64) {
                             active_collisions.clear();
                             for (ea_t m : sr.matches) {
                                 sync::Checkpoint();
@@ -409,19 +408,23 @@ namespace tools::sigmaker {
     }
 
     nlohmann::json ApiSigmaker::MakeSignature(const nlohmann::json& id, const nlohmann::json& args) {
-        ea_t eaStart = tools::utils::GetAddressArg(args, "start", tools::utils::GetAddressArg(args, "start_addr"));
-        ea_t eaEnd = tools::utils::GetAddressArg(args, "end", tools::utils::GetAddressArg(args, "end_addr"));
+        ea_t eaStart = tools::utils::GetAddressArg(args, "start");
+        ea_t eaEnd = tools::utils::GetAddressArg(args, "end");
         ea_t ea = tools::utils::GetAddressArg(args, "addr");
+        const bool has_start = args.contains("start");
+        const bool has_end = args.contains("end");
+        if (has_start != has_end || (has_start && args.contains("addr")))
+            return tools::utils::MakeToolErrorJson(id, "Provide either addr or both start and end", "invalid_signature_target");
+        if (!has_start && ea == BADADDR)
+            return tools::utils::MakeToolErrorJson(id, "Parameter 'addr' could not be resolved", "invalid_addr");
         size_t max_len = static_cast<size_t>(tools::utils::GetIntArg(args, "max_length", 250));
-        if (max_len == 0) max_len = 250;
+        if (max_len == 0)
+            return tools::utils::MakeToolErrorJson(id, "max_length must be positive", "invalid_max_length");
         bool wildcard_ops = tools::utils::GetBoolArg(args, "wildcard_operands", true);
         bool continue_outside = tools::utils::GetBoolArg(args, "continue_outside_function", false);
-        bool refresh_cache = tools::utils::GetBoolArg(args, "refresh", false);
 
         bool shortest = tools::utils::GetBoolArg(args, "shortest", false);
-        size_t candidate_limit = static_cast<size_t>(tools::utils::GetIntArg(args, "candidate_limit", 64));
-        if (candidate_limit == 0) candidate_limit = 64;
-        if (candidate_limit > 256) candidate_limit = 256;
+        constexpr size_t MAX_SIGNATURE_CANDIDATES = 64;
 
         std::string err_code;
         std::string err_msg;
@@ -437,14 +440,19 @@ namespace tools::sigmaker {
 
         // --- STEP 1: Main Thread Phase (Fast Snapshot & Candidate Metadata Gathering) ---
         sync::SyncRead([&]() {
-            if (refresh_cache) {
-                SegmentSnapshotCache::Instance().Invalidate();
+            if (eaStart != BADADDR && eaEnd != BADADDR) {
+                segment_t* range_seg = getseg(eaStart);
+                if (eaStart >= eaEnd || !range_seg || eaEnd > range_seg->end_ea) {
+                    err_code = "invalid_range";
+                    err_msg = "Signature range must be non-empty and remain within one mapped segment";
+                    return;
+                }
             }
-
             segments_ptr = SegmentSnapshotCache::Instance().GetSegments();
             if (!segments_ptr) {
                 auto segs = std::make_shared<std::vector<ScanSegment>>();
                 segs->reserve(get_segm_qty());
+                size_t snapshot_bytes = 0;
                 for (int i = 0; i < get_segm_qty(); ++i) {
                     sync::Checkpoint();
                     segment_t* seg = getnseg(i);
@@ -452,15 +460,35 @@ namespace tools::sigmaker {
                     if (seg->type == SEG_XTRN || seg->type == SEG_NULL || seg->type == SEG_BSS) continue;
                     if (seg->size() == 0) continue;
 
+                    const auto segment_size = seg->size();
+                    if (segment_size > MAX_SIGNATURE_SNAPSHOT_BYTES - snapshot_bytes) {
+                        err_code = "binary_too_large";
+                        err_msg = "Signature scanning is limited to a 256 MiB readable-segment snapshot";
+                        return;
+                    }
+
                     ScanSegment ss;
                     ss.start_ea = seg->start_ea;
                     ss.end_ea = seg->end_ea;
-                    ss.size = static_cast<size_t>(seg->size());
+                    ss.size = static_cast<size_t>(segment_size);
                     ss.data.resize(ss.size, 0);
-
-                    get_bytes(ss.data.data(), ss.size, ss.start_ea, GMB_READALL);
+                    constexpr size_t READ_CHUNK_BYTES = 1024 * 1024;
+                    for (size_t offset = 0; offset < ss.size; ) {
+                        sync::Checkpoint();
+                        const size_t chunk = std::min(READ_CHUNK_BYTES, ss.size - offset);
+                        const ssize_t got = get_bytes(ss.data.data() + offset, chunk,
+                            ss.start_ea + static_cast<ea_t>(offset), GMB_READALL);
+                        if (got != static_cast<ssize_t>(chunk)) {
+                            err_code = "incomplete_snapshot";
+                            err_msg = "IDA could not read every byte in the signature scan range";
+                            return;
+                        }
+                        offset += chunk;
+                    }
+                    snapshot_bytes += ss.size;
                     segs->push_back(std::move(ss));
                 }
+                if (!err_code.empty()) return;
                 SegmentSnapshotCache::Instance().SetSegments(segs);
                 segments_ptr = segs;
             }
@@ -474,19 +502,26 @@ namespace tools::sigmaker {
                 }
                 is_range_mode = true;
                 ea_t cur = eaStart;
-                while (cur < eaEnd && range_insns.size() < max_len) {
+                size_t range_bytes = 0;
+                while (cur < eaEnd && range_bytes < max_len) {
                     sync::Checkpoint();
                     insn_t instruction;
                     int len = decode_insn(&instruction, cur);
-                    if (len <= 0) {
-                        range_insns.push_back({cur, 1, 0});
-                        cur++;
-                    } else {
+                    const bool decoded = len > 0;
+                    if (!decoded) len = 1;
+                    if (static_cast<ea_t>(len) > eaEnd - cur) {
+                        err_code = "range_ends_mid_instruction";
+                        err_msg = "Signature range ends in the middle of an instruction";
+                        return;
+                    }
+                    if (static_cast<size_t>(len) > max_len - range_bytes) break;
+                    if (decoded) {
                         uint32_t wildcardBits = 0;
                         if (wildcard_ops) GetOperandWildcardBits(instruction, &wildcardBits);
                         range_insns.push_back({cur, len, wildcardBits});
-                        cur += len;
-                    }
+                    } else range_insns.push_back({cur, 1, 0});
+                    range_bytes += static_cast<size_t>(len);
+                    cur += static_cast<ea_t>(len);
                 }
                 return;
             }
@@ -509,6 +544,7 @@ namespace tools::sigmaker {
                     insn_t insn;
                     int len = decode_insn(&insn, cur);
                     if (len <= 0) break;
+                    if (static_cast<size_t>(len) > max_len - acc_len) break;
                     uint32_t wildcardBits = 0;
                     if (wildcard_ops) GetOperandWildcardBits(insn, &wildcardBits);
                     res.push_back({cur, len, wildcardBits});
@@ -551,7 +587,7 @@ namespace tools::sigmaker {
                 for (bool ok = fii.set(currentFunction, currentFunction->start_ea); ok; ok = fii.next_code()) {
                     sync::Checkpoint();
                     func_cands.push_back(fii.current());
-                    if (func_cands.size() >= candidate_limit) break;
+                    if (func_cands.size() >= MAX_SIGNATURE_CANDIDATES) break;
                 }
 
                 for (ea_t cand : func_cands) {
@@ -672,8 +708,12 @@ namespace tools::sigmaker {
         if (is_range_mode) {
             for (const auto& di : range_insns) {
                 sync::Checkpoint();
-                if (final_pat.size() >= max_len) break;
-                const uint8_t* raw = GetSegmentPtr(segments, di.ea);
+                if (di.len <= 0 || static_cast<size_t>(di.len) > max_len - final_pat.size()) break;
+                const uint8_t* raw = GetSegmentPtr(segments, di.ea, static_cast<size_t>(di.len));
+                if (!raw) {
+                    return tools::utils::MakeToolErrorJson(id,
+                        "Signature range contains unreadable bytes", "unreadable_range");
+                }
                 final_pat.add_raw_bytes(raw, di.len, di.wildcard_bits);
             }
             final_pat.trim();
@@ -780,7 +820,8 @@ namespace tools::sigmaker {
                 matches_arr.push_back(tools::utils::FormatAddress(m));
             }
             res["matches"] = std::move(matches_arr);
-            res["hint"] = "Signature has duplicate occurrences in binary. Try setting 'shortest': true or 'candidate_limit': 128.";
+            if (sr.matches_truncated) res["matches_truncated"] = true;
+            res["hint"] = "Signature has duplicate occurrences in binary. Try shortest=true to search alternate code windows.";
         }
 
         if (shortest) {

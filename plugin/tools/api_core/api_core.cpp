@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <limits>
 
 #pragma warning(push, 0)
 #include "json.h"
@@ -60,7 +61,7 @@ namespace tools::core {
             if (ok) {
                 const char* p = get_path(PATH_TYPE_IDB);
                 if (p) idb_path = p;
-                char root_buf[QMAXPATH];
+                char root_buf[QMAXPATH]{};
                 if (get_root_filename(root_buf, sizeof(root_buf)) > 0) {
                     file_name = root_buf;
                 }
@@ -91,27 +92,23 @@ namespace tools::core {
     }
 
     nlohmann::json ApiCore::ListFuncs(const nlohmann::json& id, const nlohmann::json& args) {
-        int offset = static_cast<int>(tools::utils::GetIntArg(args, "offset", 0));
         int count = static_cast<int>(tools::utils::GetIntArg(args, "count", 100));
         if (count <= 0) count = 100;
         if (count > 2000) count = 2000;
 
         std::string pattern = tools::utils::GetStringArg(args, "pattern", "");
         ea_t cursor_ea = tools::utils::GetAddressArg(args, "cursor", BADADDR);
-        size_t min_size = static_cast<size_t>(tools::utils::GetIntArg(args, "min_size", 0));
-        size_t max_size = static_cast<size_t>(tools::utils::GetIntArg(args, "max_size", static_cast<int64_t>(-1)));
+        if (!tools::utils::GetStringArg(args, "cursor").empty() && cursor_ea == BADADDR)
+            return tools::utils::MakeToolErrorJson(id, "Cursor is not a valid function address", "invalid_cursor");
+        const int64_t min_size_arg = tools::utils::GetIntArg(args, "min_size", 0);
+        const int64_t max_size_arg = tools::utils::GetIntArg(args, "max_size", -1);
+        if (min_size_arg < 0 || max_size_arg < -1 || (max_size_arg >= 0 && min_size_arg > max_size_arg))
+            return tools::utils::MakeToolErrorJson(id, "Function size range is invalid", "invalid_size_range");
+        size_t min_size = static_cast<size_t>(min_size_arg);
+        size_t max_size = max_size_arg < 0 ? std::numeric_limits<size_t>::max() : static_cast<size_t>(max_size_arg);
 
-        bool do_demangle = tools::utils::GetBoolArg(args, "demangle", true);
-        bool named_only = tools::utils::GetBoolArg(args, "named_only", tools::utils::GetBoolArg(args, "user_only", false));
+        bool named_only = tools::utils::GetBoolArg(args, "named_only", false);
         bool no_thunks = tools::utils::GetBoolArg(args, "no_thunks", false);
-
-        // Flatten fallback for legacy queries object if passed
-        if (args.contains("queries") && args["queries"].is_object()) {
-            const auto& q = args["queries"];
-            if (q.contains("offset")) offset = static_cast<int>(tools::utils::GetIntArg(q, "offset", offset));
-            if (q.contains("count")) count = static_cast<int>(tools::utils::GetIntArg(q, "count", count));
-            if (q.contains("pattern")) pattern = tools::utils::GetStringArg(q, "pattern", pattern);
-        }
 
         nlohmann::ordered_json funcs_arr = nlohmann::ordered_json::array();
         size_t total = 0;
@@ -120,7 +117,7 @@ namespace tools::core {
 
         sync::SyncRead([&]() {
             total = get_func_qty();
-            size_t start_idx = static_cast<size_t>(std::max(0, offset));
+            size_t start_idx = 0;
 
             if (cursor_ea != BADADDR) {
                 int fn_num = get_func_num(cursor_ea);
@@ -131,7 +128,8 @@ namespace tools::core {
                     if (nxt) {
                         int nxt_num = get_func_num(nxt->start_ea);
                         if (nxt_num >= 0) start_idx = static_cast<size_t>(nxt_num);
-                    }
+                        else start_idx = total;
+                    } else start_idx = total;
                 }
             }
 
@@ -158,11 +156,9 @@ namespace tools::core {
                 }
 
                 std::string demangled_str;
-                if (do_demangle) {
-                    qstring dem_buf;
-                    if (demangle_name(&dem_buf, fn_name.c_str(), 0, DQT_FULL) > 0) {
-                        demangled_str = tools::utils::SanitizeUtf8(dem_buf.c_str());
-                    }
+                qstring dem_buf;
+                if (demangle_name(&dem_buf, fn_name.c_str(), 0, DQT_FULL) > 0) {
+                    demangled_str = tools::utils::SanitizeUtf8(dem_buf.c_str());
                 }
 
                 if (!pattern.empty()) {
@@ -216,18 +212,18 @@ namespace tools::core {
     }
 
     nlohmann::json ApiCore::ListGlobals(const nlohmann::json& id, const nlohmann::json& args) {
-        int offset = static_cast<int>(tools::utils::GetIntArg(args, "offset", 0));
         int count = static_cast<int>(tools::utils::GetIntArg(args, "count", 100));
         if (count <= 0) count = 100;
         if (count > 2000) count = 2000;
 
         std::string pattern = tools::utils::GetStringArg(args, "pattern", "");
         ea_t cursor_ea = tools::utils::GetAddressArg(args, "cursor", BADADDR);
+        if (!tools::utils::GetStringArg(args, "cursor").empty() && cursor_ea == BADADDR)
+            return tools::utils::MakeToolErrorJson(id, "Cursor is not a valid symbol address", "invalid_cursor");
 
-        std::string seg_name_arg = tools::utils::GetStringArg(args, "segment", tools::utils::GetStringArg(args, "seg"));
+        std::string seg_name_arg = tools::utils::GetStringArg(args, "segment", "");
         bool data_only = tools::utils::GetBoolArg(args, "data_only", false);
         bool writable_only = tools::utils::GetBoolArg(args, "writable_only", false);
-        bool do_demangle = tools::utils::GetBoolArg(args, "demangle", true);
         bool include_code_labels = tools::utils::GetBoolArg(args, "include_code_labels", false);
 
         nlohmann::ordered_json globals_arr = nlohmann::ordered_json::array();
@@ -237,7 +233,7 @@ namespace tools::core {
 
         sync::SyncRead([&]() {
             total = get_nlist_size();
-            size_t start_idx = static_cast<size_t>(std::max(0, offset));
+            size_t start_idx = 0;
 
             // Fast binary search to find cursor index instead of linear O(N) scan
             if (cursor_ea != BADADDR && total > 0) {
@@ -292,11 +288,9 @@ namespace tools::core {
                 }
 
                 std::string demangled_str;
-                if (do_demangle) {
-                    qstring dem_buf;
-                    if (demangle_name(&dem_buf, sym_name.c_str(), 0, DQT_FULL) > 0) {
-                        demangled_str = tools::utils::SanitizeUtf8(dem_buf.c_str());
-                    }
+                qstring dem_buf;
+                if (demangle_name(&dem_buf, sym_name.c_str(), 0, DQT_FULL) > 0) {
+                    demangled_str = tools::utils::SanitizeUtf8(dem_buf.c_str());
                 }
 
                 if (!pattern.empty()) {
@@ -375,24 +369,23 @@ namespace tools::core {
             return tools::utils::MakeToolSuccessJson(id, res);
         }
 
-        int offset = static_cast<int>(tools::utils::GetIntArg(args, "offset", 0));
-        std::string cursor_str = tools::utils::GetStringArg(args, "cursor");
-        if (!cursor_str.empty()) {
-            try { offset = std::stoi(cursor_str); } catch (const sync::OperationStopped&) { throw; } catch (...) {}
-        }
-        if (offset < 0) offset = 0;
+        const int64_t offset = tools::utils::GetIntArg(args, "offset", 0);
+        if (offset < 0 || offset > std::numeric_limits<int>::max())
+            return tools::utils::MakeToolErrorJson(id, "Offset must be between 0 and 2147483647", "invalid_offset");
 
         int count = static_cast<int>(tools::utils::GetIntArg(args, "count", 50));
         if (count <= 0) count = 50;
         if (count > 1000) count = 1000;
 
-        std::string mod_filter = tools::utils::GetStringArg(args, "module", tools::utils::GetStringArg(args, "module_pattern", ""));
+        std::string mod_filter = tools::utils::GetStringArg(args, "module", "");
         std::string pat_filter = tools::utils::GetStringArg(args, "pattern", "");
         ea_t target_ea = tools::utils::GetAddressArg(args, "addr", BADADDR);
+        if (!tools::utils::GetStringArg(args, "addr").empty() && target_ea == BADADDR)
+            return tools::utils::MakeToolErrorJson(id, "Import address could not be resolved", "invalid_addr");
 
         nlohmann::ordered_json imports_arr = nlohmann::ordered_json::array();
         size_t total_matched = 0;
-        int next_offset = -1;
+        int64_t next_offset = -1;
 
         sync::SyncRead([&]() {
             int mod_qty = get_import_module_qty();
@@ -449,7 +442,7 @@ namespace tools::core {
 
             total_matched = match_idx;
             if (static_cast<size_t>(offset) + imports_arr.size() < total_matched) {
-                next_offset = offset + static_cast<int>(imports_arr.size());
+                    next_offset = offset + static_cast<int64_t>(imports_arr.size());
             }
         });
 
@@ -458,28 +451,29 @@ namespace tools::core {
         res["total"] = total_matched;
         res["count"] = imports_arr.size();
         res["imports"] = imports_arr;
-        if (next_offset != -1) {
-
-        }
+        if (next_offset != -1) res["next_offset"] = next_offset;
 
         return tools::utils::MakeToolSuccessJson(id, res);
     }
 
     nlohmann::json ApiCore::GetExports(const nlohmann::json& id, const nlohmann::json& args) {
-        int offset = static_cast<int>(tools::utils::GetIntArg(args, "offset", 0));
-        if (offset < 0) offset = 0;
+        const int64_t offset = tools::utils::GetIntArg(args, "offset", 0);
+        if (offset < 0 || offset > std::numeric_limits<int>::max())
+            return tools::utils::MakeToolErrorJson(id, "Offset must be between 0 and 2147483647", "invalid_offset");
         int count = static_cast<int>(tools::utils::GetIntArg(args, "count", 100));
         if (count <= 0) count = 100;
         if (count > 2000) count = 2000;
 
         std::string pattern = tools::utils::GetStringArg(args, "pattern", "");
         ea_t target_ea = tools::utils::GetAddressArg(args, "addr", BADADDR);
+        if (!tools::utils::GetStringArg(args, "addr").empty() && target_ea == BADADDR)
+            return tools::utils::MakeToolErrorJson(id, "Export address could not be resolved", "invalid_addr");
         int64_t target_ord = tools::utils::GetIntArg(args, "ordinal", -1);
-        bool do_demangle = tools::utils::GetBoolArg(args, "demangle", true);
+        bool do_demangle = true;
 
         nlohmann::ordered_json exports_arr = nlohmann::ordered_json::array();
         size_t total_matched = 0;
-        int next_offset = -1;
+        int64_t next_offset = -1;
 
         sync::SyncRead([&]() {
             size_t qty = get_entry_qty();
@@ -533,7 +527,7 @@ namespace tools::core {
 
             total_matched = match_idx;
             if (static_cast<size_t>(offset) + exports_arr.size() < total_matched) {
-                next_offset = offset + static_cast<int>(exports_arr.size());
+                    next_offset = offset + static_cast<int64_t>(exports_arr.size());
             }
         });
 
@@ -542,15 +536,15 @@ namespace tools::core {
         res["total"] = total_matched;
         res["count"] = exports_arr.size();
         res["exports"] = exports_arr;
-        if (next_offset != -1) {
-
-        }
+        if (next_offset != -1) res["next_offset"] = next_offset;
 
         return tools::utils::MakeToolSuccessJson(id, res);
     }
 
     nlohmann::json ApiCore::GetSegments(const nlohmann::json& id, const nlohmann::json& args) {
         ea_t target_ea = tools::utils::GetAddressArg(args, "addr", BADADDR);
+        if (!tools::utils::GetStringArg(args, "addr").empty() && target_ea == BADADDR)
+            return tools::utils::MakeToolErrorJson(id, "Segment address could not be resolved", "invalid_addr");
         std::string name_filter = tools::utils::GetStringArg(args, "name", "");
 
         nlohmann::ordered_json segs_arr = nlohmann::ordered_json::array();
@@ -560,6 +554,7 @@ namespace tools::core {
                 if (s) {
                     qstring name_buf;
                     get_segm_name(&name_buf, s);
+                    if (!name_filter.empty() && !tools::utils::PatternMatch(name_buf.c_str(), name_filter, false)) return;
                     std::string perm = "";
                     perm += (s->perm & SEGPERM_READ) ? 'R' : '-';
                     perm += (s->perm & SEGPERM_WRITE) ? 'W' : '-';
@@ -612,25 +607,52 @@ namespace tools::core {
         return tools::utils::MakeToolSuccessJson(id, res);
     }
 
+    namespace {
+        constexpr size_t MAX_SEARCH_STRING_BYTES = 8192;
+        constexpr size_t MAX_RETURNED_STRING_BYTES = 4096;
+        constexpr int MAX_STRING_PAGE_COUNT = 64;
+
+        bool IsSupportedStringType(const std::string& input) {
+            const std::string type = mcp::LowerAscii(input);
+            return type.empty() || type == "auto" || type == "all" || type == "any"
+                || type == "utf16" || type == "utf-16" || type == "wide" || type == "wchar"
+                || type == "ascii" || type == "utf8" || type == "utf-8" || type == "c"
+                || type == "utf32" || type == "utf-32" || type == "pascal";
+        }
+
+        void TruncateUtf8(std::string& text, size_t max_bytes) {
+            if (text.size() <= max_bytes) return;
+            size_t end = max_bytes;
+            while (end > 0 && (static_cast<unsigned char>(text[end]) & 0xC0) == 0x80) --end;
+            text.resize(end);
+        }
+    }
+
     nlohmann::json ApiCore::SearchStrings(const nlohmann::json& id, const nlohmann::json& args) {
         std::string pattern = tools::utils::GetStringArg(args, "pattern", "*");
         if (pattern.empty()) pattern = "*";
 
         bool rebuild = tools::utils::GetBoolArg(args, "rebuild", false);
         int offset = static_cast<int>(tools::utils::GetIntArg(args, "offset", 0));
-        int count = static_cast<int>(tools::utils::GetIntArg(args, "count", 100));
-        if (count <= 0) count = 100;
-        if (count > 2000) count = 2000;
+        int count = static_cast<int>(tools::utils::GetIntArg(args, "count", MAX_STRING_PAGE_COUNT));
+        if (count <= 0) count = MAX_STRING_PAGE_COUNT;
+        if (count > MAX_STRING_PAGE_COUNT) count = MAX_STRING_PAGE_COUNT;
 
         std::string req_type = tools::utils::GetStringArg(args, "type", "");
-        std::transform(req_type.begin(), req_type.end(), req_type.begin(), ::tolower);
+        req_type = mcp::LowerAscii(std::move(req_type));
 
         ea_t cursor_ea = tools::utils::GetAddressArg(args, "cursor", BADADDR);
+        if (!tools::utils::GetStringArg(args, "cursor").empty() && cursor_ea == BADADDR)
+            return tools::utils::MakeToolErrorJson(id, "Cursor is not a valid string address", "invalid_cursor");
+
+        if (!IsSupportedStringType(req_type))
+            return tools::utils::MakeToolErrorJson(id, "Unsupported string type: " + req_type, "invalid_string_type");
 
         nlohmann::ordered_json matches = nlohmann::ordered_json::array();
         size_t total_strings = 0;
         int next_offset = -1;
         ea_t next_cursor_ea = BADADDR;
+        bool search_truncated = false;
 
         sync::SyncRead([&]() {
             // Rebuild string list only if explicitly requested or if string list is empty
@@ -669,6 +691,9 @@ namespace tools::core {
                 string_info_t si;
                 if (!get_strlist_item(&si, i)) continue;
 
+                const bool source_truncated = si.length > MAX_SEARCH_STRING_BYTES;
+                const size_t read_length = (std::min)(static_cast<size_t>(si.length), MAX_SEARCH_STRING_BYTES);
+
                 uchar code = get_str_type_code(si.type);
                 if (!req_type.empty() && req_type != "all" && req_type != "any") {
                     if ((req_type == "utf16" || req_type == "utf-16" || req_type == "wide") && code != 1) continue;
@@ -678,10 +703,13 @@ namespace tools::core {
                 }
 
                 qstring qstr;
-                get_strlit_contents(&qstr, si.ea, si.length, si.type);
+                get_strlit_contents(&qstr, si.ea, read_length, si.type);
                 std::string s = tools::utils::SanitizeUtf8(qstr.c_str());
 
-                if (pattern != "*" && !tools::utils::PatternMatch(s, pattern)) continue;
+                if (pattern != "*" && !tools::utils::PatternMatch(s, pattern)) {
+                    if (source_truncated) search_truncated = true;
+                    continue;
+                }
 
                 std::string type_name = "ascii/utf-8";
                 if (code == 1) type_name = "utf-16";
@@ -692,9 +720,15 @@ namespace tools::core {
 
                 nlohmann::ordered_json item;
                 item["address"] = tools::utils::FormatAddress(si.ea);
+                const size_t full_prefix_length = s.size();
+                TruncateUtf8(s, MAX_RETURNED_STRING_BYTES);
                 item["string"] = s;
                 item["length"] = s.size();
                 item["type"] = type_name;
+                if (source_truncated || s.size() < full_prefix_length) {
+                    item["string_truncated"] = true;
+                    search_truncated = search_truncated || source_truncated;
+                }
                 matches.push_back(std::move(item));
 
                 fetched++;
@@ -718,6 +752,7 @@ namespace tools::core {
         res["total_in_idb"] = total_strings;
         res["matches_found"] = matches.size();
         res["results"] = matches;
+        if (search_truncated) res["truncated"] = true;
 
         if (next_offset != -1) {
 
@@ -730,14 +765,18 @@ namespace tools::core {
 
     namespace {
         bool ReadSingleString(ea_t ea, const std::string& req_type, nlohmann::ordered_json& out_obj, std::string& err_msg) {
-            segment_t* seg = nullptr;
+            if (!IsSupportedStringType(req_type)) {
+                err_msg = "Unsupported string type: " + req_type;
+                return false;
+            }
+            bool mapped = false;
             bool loaded = false;
             sync::SyncRead([&]() {
-                seg = getseg(ea);
+                mapped = getseg(ea) != nullptr;
                 loaded = is_loaded(ea);
             });
 
-            if (!seg && !loaded) {
+            if (!mapped && !loaded) {
                 err_msg = "Address " + tools::utils::FormatAddress(ea) + " is outside mapped binary segments";
                 return false;
             }
@@ -747,7 +786,7 @@ namespace tools::core {
             }
 
             std::string lower_type = req_type;
-            std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(), ::tolower);
+            lower_type = mcp::LowerAscii(std::move(lower_type));
 
             std::string str_val;
             int32 effective_st = -1;
@@ -769,7 +808,7 @@ namespace tools::core {
                     } else {
                         size_t l_16 = get_max_strlit_length(ea, STRTYPE_C_16, ALOPT_ONLYTERM);
                         size_t l_c = get_max_strlit_length(ea, STRTYPE_C, ALOPT_ONLYTERM);
-                        if (l_16 > 2 && (l_c <= 2 || l_16 > l_c * 2)) {
+                        if (l_16 > 2 && (l_c <= 2 || l_c <= (l_16 - 1) / 2)) {
                             effective_st = STRTYPE_C_16;
                         } else if (l_c > 0) {
                             effective_st = STRTYPE_C;
@@ -825,14 +864,16 @@ namespace tools::core {
     nlohmann::json ApiCore::Strings(const nlohmann::json& id, const nlohmann::json& args) {
         // 1. Batch read strings at addresses
         if (args.contains("addrs") && args["addrs"].is_array()) {
-            std::string req_type = tools::utils::GetStringArg(args, "type", tools::utils::GetStringArg(args, "encoding", "auto"));
+            std::string req_type = tools::utils::GetStringArg(args, "type", "auto");
             nlohmann::json strings_arr = nlohmann::json::array();
             for (const auto& a : args["addrs"]) {
                 sync::Checkpoint();
                 ea_t ea = BADADDR;
                 if (a.is_string()) ea = tools::utils::ParseAddress(a.get<std::string>());
-                else if (a.is_number_integer()) ea = static_cast<ea_t>(a.get<uint64_t>());
-                if (ea == BADADDR) continue;
+                if (ea == BADADDR) {
+                    strings_arr.push_back({{"status", "error"}, {"message", "Address could not be resolved"}});
+                    continue;
+                }
 
                 nlohmann::ordered_json item;
                 std::string err;
@@ -856,14 +897,13 @@ namespace tools::core {
         }
 
         // 2. Single address read
-        if (args.contains("addr") || args.contains("address")) {
+        if (args.contains("addr")) {
             ea_t ea = tools::utils::GetAddressArg(args, "addr");
-            if (ea == BADADDR) ea = tools::utils::GetAddressArg(args, "address");
             if (ea == BADADDR) {
                 return tools::utils::MakeToolErrorJson(id, "Parameter 'addr' could not be resolved", "invalid_addr");
             }
 
-            std::string req_type = tools::utils::GetStringArg(args, "type", tools::utils::GetStringArg(args, "encoding", "auto"));
+            std::string req_type = tools::utils::GetStringArg(args, "type", "auto");
             nlohmann::ordered_json item;
             std::string err;
             if (!ReadSingleString(ea, req_type, item, err)) {

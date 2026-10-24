@@ -80,18 +80,20 @@ namespace mcp {
         "ordinal": {
           "type": "integer",
           "description": "Optional export ordinal number",
-          "minimum": 0
+          "minimum": 0,
+          "maximum": 4294967295
         },
         "offset": {
           "type": "integer",
           "description": "Pagination offset (default 0)",
-          "minimum": 0
+          "minimum": 0,
+          "maximum": 2147483647
         },
         "count": {
           "type": "integer",
           "description": "Maximum number of exports to return (default 100, max 2000)",
           "minimum": 0,
-          "maximum": 4096
+          "maximum": 2000
         }
       },
       "additionalProperties": false
@@ -125,13 +127,14 @@ namespace mcp {
         "offset": {
           "type": "integer",
           "description": "Pagination offset (default 0)",
-          "minimum": 0
+          "minimum": 0,
+          "maximum": 2147483647
         },
         "count": {
           "type": "integer",
           "description": "Max entries to return (default 50, max 1000)",
-          "minimum": 0,
-          "maximum": 4096
+          "minimum": 1,
+          "maximum": 1000
         }
       },
       "additionalProperties": false
@@ -151,7 +154,8 @@ namespace mcp {
         "size": {
           "type": "integer",
           "description": "Number of bytes to read (default 32, max 4096)",
-          "minimum": 0
+          "minimum": 1,
+          "maximum": 4096
         }
       },
       "required": [
@@ -202,9 +206,9 @@ namespace mcp {
         },
         "count": {
           "type": "integer",
-          "description": "Maximum strings to return (default 100, max 2000)",
+          "description": "Maximum strings to return in one page (default 64, max 64)",
           "minimum": 0,
-          "maximum": 4096
+          "maximum": 64
         }
       },
       "additionalProperties": false
@@ -249,8 +253,8 @@ namespace mcp {
         "count": {
           "type": "integer",
           "description": "Max matches to return (default 50, max 1000)",
-          "minimum": 0,
-          "maximum": 4096
+          "minimum": 1,
+          "maximum": 1000
         }
       },
       "required": [
@@ -304,7 +308,7 @@ namespace mcp {
           "type": "integer",
           "description": "Max instructions to return (default 50, max 1000)",
           "minimum": 0,
-          "maximum": 4096
+          "maximum": 1000
         },
         "max_scan": {
           "type": "integer",
@@ -412,13 +416,13 @@ namespace mcp {
         "addr": {
           "type": "string",
           "description": "Single function address (hex '0x140001000' or symbol name like 'PreRender')",
-          "maxLength": 2097152
+          "maxLength": 4096
         },
         "addrs": {
           "type": "array",
           "items": {
             "type": "string",
-            "maxLength": 2097152
+            "maxLength": 4096
           },
           "description": "Batch of function addresses or symbol names to decompile in a single call",
           "minItems": 1,
@@ -459,7 +463,7 @@ namespace mcp {
           "type": "array",
           "items": {
             "type": "string",
-            "maxLength": 2097152
+            "maxLength": 4096
           },
           "description": "Batch of target addresses to disassemble around (e.g. call sites from xrefs)",
           "minItems": 1,
@@ -474,7 +478,7 @@ namespace mcp {
           "type": "integer",
           "description": "Number of instructions to disassemble (default 50 for single, default 5 per batch target, max 1000)",
           "minimum": 0,
-          "maximum": 4096
+          "maximum": 1000
         },
         "bytes": {
           "type": "boolean",
@@ -506,7 +510,7 @@ namespace mcp {
   },
   {
     "name": "basic_blocks",
-    "description": "Extract Control Flow Graph (CFG) basic blocks for a function, including address ranges, block types, successor/predecessor edges, loop detection ('is_loop_header', 'is_back_edge'), conditional branch resolution ('branch' with true/false targets and condition), cyclomatic complexity, and optional disassembly.",
+    "description": "Extract a bounded Control Flow Graph (CFG) for a function, including address ranges, block types, successor/predecessor edges, loop detection ('is_loop_header', 'is_back_edge'), conditional branch resolution ('branch' with true/false targets and condition), cyclomatic complexity, and optional disassembly. At most 512 blocks, 2,048 instructions, and 512 KiB of instruction text are returned; truncation is reported.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -567,9 +571,9 @@ namespace mcp {
         },
         "count": {
           "type": "integer",
-          "description": "Max XREFs to return (default 100, max 2000)",
-          "minimum": 0,
-          "maximum": 4096
+          "description": "Max XREFs to return (default 100, range 1 to 2000)",
+          "minimum": 1,
+          "maximum": 2000
         },
         "context": {
           "type": "boolean",
@@ -606,13 +610,14 @@ namespace mcp {
         "depth": {
           "type": "integer",
           "description": "Maximum call tree traversal depth (1..10, default 3)",
-          "minimum": 0
+          "minimum": 1,
+          "maximum": 10
         },
         "max_nodes": {
           "type": "integer",
           "description": "Maximum nodes to traverse in graph (default 500, max 2000)",
-          "minimum": 0,
-          "maximum": 4096
+          "minimum": 1,
+          "maximum": 2000
         },
         "include_nodes": {
           "type": "boolean",
@@ -691,8 +696,17 @@ namespace mcp {
                 "type": "string",
                 "description": "New C type for local variable",
                 "maxLength": 2097152
-              }
-            }
+                }
+              },
+              "oneOf": [
+                {"required": ["name"]},
+                {"required": ["index"]}
+              ],
+              "anyOf": [
+                {"required": ["new_name"]},
+                {"required": ["type"]}
+              ],
+              "additionalProperties": false
           },
           "description": "List of local variable modifications (renaming and retyping) for target function",
           "minItems": 1,
@@ -721,7 +735,8 @@ namespace mcp {
             "required": [
               "addr",
               "comment"
-            ]
+            ],
+            "additionalProperties": false
           },
           "description": "Batch of instruction comments within target function",
           "minItems": 1,
@@ -793,7 +808,16 @@ namespace mcp {
                       "description": "New C type for local variable",
                       "maxLength": 2097152
                     }
-                  }
+                  },
+                  "oneOf": [
+                    {"required": ["name"]},
+                    {"required": ["index"]}
+                  ],
+                  "anyOf": [
+                    {"required": ["new_name"]},
+                    {"required": ["type"]}
+                  ],
+                  "additionalProperties": false
                 },
                 "description": "List of local variable modifications (renaming and retyping) for target function",
                 "minItems": 1,
@@ -822,7 +846,8 @@ namespace mcp {
                   "required": [
                     "addr",
                     "comment"
-                  ]
+                  ],
+                  "additionalProperties": false
                 },
                 "description": "Batch of instruction comments within target function",
                 "minItems": 1,
@@ -1036,13 +1061,13 @@ namespace mcp {
           "type": "integer",
           "description": "Maximum number of caller functions to return in callers array (default 50, max 500)",
           "minimum": 0,
-          "maximum": 4096
+          "maximum": 500
         },
         "max_callees": {
           "type": "integer",
           "description": "Maximum number of callee functions to return in callees array (default 100, max 500)",
           "minimum": 0,
-          "maximum": 4096
+          "maximum": 500
         }
       },
       "required": [
@@ -1120,7 +1145,7 @@ namespace mcp {
         "max_length": {
           "type": "integer",
           "description": "Max pattern length in bytes (default 250)",
-          "minimum": 0,
+          "minimum": 1,
           "maximum": 4096
         },
         "wildcard_operands": {
@@ -1163,7 +1188,7 @@ namespace mcp {
         },
         "limit": {
           "type": "integer",
-          "description": "Max functions to decompile when searching across binary (default 200)",
+          "description": "Max functions to inspect when searching across binary, including functions filtered by func_pattern (default 200)",
           "minimum": 0,
           "maximum": 4096
         },
@@ -1238,7 +1263,26 @@ namespace mcp {
           "type": "array",
           "description": "Optional batch list of predicates to simplify: [{\"predicate_addr\": \"0x...\", \"force_branch\": \"always_true\"}]",
           "items": {
-            "type": "object"
+            "type": "object",
+            "properties": {
+              "predicate_addr": {
+                "type": "string",
+                "maxLength": 2097152
+              },
+              "force_branch": {
+                "type": "string",
+                "enum": [
+                  "always_true",
+                  "always_false"
+                ],
+                "maxLength": 2097152
+              }
+            },
+            "required": [
+              "predicate_addr",
+              "force_branch"
+            ],
+            "additionalProperties": false
           },
           "minItems": 1,
           "maxItems": 64
@@ -1319,22 +1363,26 @@ namespace mcp {
         "max_depth": {
           "type": "integer",
           "description": "Maximum call chain depth to explore (default 100, max 2000)",
-          "minimum": 0
+          "minimum": 1,
+          "maximum": 2000
         },
         "max_paths": {
           "type": "integer",
           "description": "Maximum number of alternative paths to return (default 1, max 10)",
-          "minimum": 0
+          "minimum": 1,
+          "maximum": 10
         },
         "budget": {
           "type": "integer",
-          "description": "Maximum number of graph nodes to explore before stopping (default 100000)",
-          "minimum": 0
+          "description": "Maximum graph scan steps and explored nodes (default 100000, max 1000000)",
+          "minimum": 1,
+          "maximum": 1000000
         },
         "max_vtable_methods": {
           "type": "integer",
           "description": "Maximum virtual methods to inspect per vtable (default 64, max 256)",
-          "minimum": 0
+          "minimum": 1,
+          "maximum": 256
         }
       },
       "required": [
@@ -1362,8 +1410,8 @@ namespace mcp {
         },
         "struct_name": {
           "type": "string",
-          "description": "Optional custom name for the reconstructed structure (e.g. 'PlayerData')",
-          "maxLength": 2097152
+          "description": "Optional C identifier for the reconstructed structure (e.g. 'PlayerData')",
+          "maxLength": 128
         },
         "scan_depth": {
           "type": "integer",
@@ -1403,19 +1451,20 @@ namespace mcp {
         },
         "index": {
           "type": "integer",
-          "description": "Optional specific method slot index (0-based) to resolve to a concrete function",
-          "minimum": 0
+          "description": "Optional specific method slot index (0-based, maximum 511) to resolve to a concrete function",
+          "minimum": 0,
+          "maximum": 511
         },
         "offset": {
           "type": "string",
-          "description": "Optional byte offset in vtable (hex '0x28' or integer 40) as alternative to slot index",
+          "description": "Optional pointer-aligned byte offset in vtable (hex '0x28' or integer 40) as alternative to slot index; resolved index must be at most 511",
           "maxLength": 2097152
         },
         "max_methods": {
           "type": "integer",
           "description": "Maximum number of virtual methods to dump from vtable (default 128, max 512)",
           "minimum": 0,
-          "maximum": 4096
+          "maximum": 512
         },
         "all_methods": {
           "type": "boolean",

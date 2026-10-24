@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <set>
 #include <queue>
+#include <charconv>
 
 #pragma warning(push, 0)
 #include "json.h"
@@ -31,6 +32,7 @@
 #include "tools/api_hexrays/ctree_serializer.h"
 
 namespace tools::composite {
+    namespace { constexpr size_t kMaxTraceCollectedItems = 50000; }
     nlohmann::json ApiComposite::Dispatch(const nlohmann::json& id, const std::string& name, const nlohmann::json& args) {
         if (name == "survey_binary") return SurveyBinary(id, args);
         if (name == "analyze_function") return AnalyzeFunction(id, args);
@@ -43,15 +45,16 @@ namespace tools::composite {
         nlohmann::json res;
 
         sync::SyncRead([&]() {
-            char path_buf[QMAXPATH];
+            char path_buf[QMAXPATH]{};
             get_input_file_path(path_buf, sizeof(path_buf));
             std::string file_path = path_buf;
 
             std::string file_name = file_path;
             size_t sep = file_name.find_last_of("\\/");
             if (sep != std::string::npos) file_name = file_name.substr(sep + 1);
+            file_name = tools::utils::SanitizeUtf8(file_name);
 
-            char proc_buf[32];
+            char proc_buf[32]{};
             inf_get_procname(proc_buf, sizeof(proc_buf));
             std::string proc = proc_buf;
             std::string arch = proc;
@@ -94,9 +97,6 @@ namespace tools::composite {
     nlohmann::json ApiComposite::AnalyzeFunction(const nlohmann::json& id, const nlohmann::json& args) {
         ea_t target_ea = tools::utils::GetAddressArg(args, "addr");
         if (target_ea == BADADDR) {
-            target_ea = tools::utils::GetAddressArg(args, "function");
-        }
-        if (target_ea == BADADDR) {
             return tools::utils::MakeToolErrorJson(id, "Parameter 'addr' could not be resolved", "invalid_addr");
         }
 
@@ -122,7 +122,7 @@ namespace tools::composite {
             qstring seg_name_buf;
             segment_t* seg = getseg(fn->start_ea);
             if (seg) get_segm_name(&seg_name_buf, seg);
-            std::string seg_name = seg_name_buf.c_str();
+            std::string seg_name = tools::utils::SanitizeUtf8(seg_name_buf.c_str());
 
             // Function characteristics / flags
             nlohmann::ordered_json flags_obj;
@@ -184,7 +184,7 @@ namespace tools::composite {
                             ftd[a].type.print(&arg_type_buf);
                             nlohmann::ordered_json arg_item;
                             arg_item["index"] = a;
-                            arg_item["name"] = ftd[a].name.c_str();
+                            arg_item["name"] = tools::utils::SanitizeUtf8(ftd[a].name.c_str());
                             arg_item["type"] = tools::utils::SanitizeUtf8(arg_type_buf.c_str());
                             args_arr.push_back(std::move(arg_item));
                         }
@@ -194,23 +194,35 @@ namespace tools::composite {
 
             // Callers (incoming references)
             xrefblk_t xb_to;
+            struct CallerInfo { size_t call_sites_count = 0; std::vector<ea_t> call_sites; };
+            constexpr size_t MAX_REFERENCE_VISITS = 200000;
+            constexpr size_t MAX_REFERENCE_FUNCTIONS = 5000;
+            size_t reference_visits = 0;
+            bool references_truncated = false;
             size_t total_callers_count = 0;
-            std::map<ea_t, std::vector<ea_t>> caller_map;
-            for (bool ok = xb_to.first_to(fn->start_ea, XREF_ALL); ok; ok = xb_to.next_to()) {
+            std::map<ea_t, CallerInfo> caller_map;
+            for (bool ok = xb_to.first_to(fn->start_ea, XREF_ALL); ok && !references_truncated; ok = xb_to.next_to()) {
                 sync::Checkpoint();
+                if (++reference_visits > MAX_REFERENCE_VISITS) { references_truncated = true; break; }
                 if (!xb_to.iscode) continue;
-                total_callers_count++;
                 uint8_t base_type = xb_to.type & XREF_MASK;
                 if (base_type == fl_CN || base_type == fl_CF || base_type == fl_JN || base_type == fl_JF) {
+                    total_callers_count++;
                     func_t* caller_fn = get_func(xb_to.from);
                     ea_t c_start = caller_fn ? caller_fn->start_ea : xb_to.from;
-                    caller_map[c_start].push_back(xb_to.from);
+                    if (caller_map.find(c_start) == caller_map.end() && caller_map.size() >= MAX_REFERENCE_FUNCTIONS) {
+                        references_truncated = true;
+                        break;
+                    }
+                    auto& info = caller_map[c_start];
+                    ++info.call_sites_count;
+                    if (info.call_sites.size() < 5) info.call_sites.push_back(xb_to.from);
                 }
             }
 
             nlohmann::json callers_arr = nlohmann::json::array();
             size_t caller_idx = 0;
-            for (const auto& [c_ea, sites] : caller_map) {
+            for (const auto& [c_ea, info] : caller_map) {
                 sync::Checkpoint();
                 if (caller_idx++ >= max_callers) break;
                 qstring c_name;
@@ -222,13 +234,14 @@ namespace tools::composite {
                 c_item["address"] = tools::utils::FormatAddress(c_ea);
                 c_item["name"] = c_name_str;
                 if (!c_dem.empty() && c_dem != c_name_str) c_item["demangled"] = c_dem;
-                c_item["call_sites_count"] = sites.size();
+                c_item["call_sites_count"] = info.call_sites_count;
                 nlohmann::json sites_json = nlohmann::json::array();
-                for (size_t s = 0; s < std::min<size_t>(sites.size(), 5); ++s) {
+                for (size_t s = 0; s < info.call_sites.size(); ++s) {
                     sync::Checkpoint();
-                    sites_json.push_back(tools::utils::FormatAddress(sites[s]));
+                    sites_json.push_back(tools::utils::FormatAddress(info.call_sites[s]));
                 }
                 c_item["call_sites"] = std::move(sites_json);
+                if (info.call_sites_count > info.call_sites.size()) c_item["call_sites_truncated"] = true;
                 callers_arr.push_back(std::move(c_item));
             }
 
@@ -236,27 +249,34 @@ namespace tools::composite {
             struct CalleeInfo {
                 ea_t target_ea;
                 std::string type;
+                size_t call_sites_count = 0;
                 std::vector<ea_t> call_sites;
             };
             std::map<ea_t, CalleeInfo> callee_map;
 
             func_item_iterator_t fii;
-            for (bool ok = fii.set(fn, fn->start_ea); ok; ok = fii.next_head()) {
+            for (bool ok = fii.set(fn, fn->start_ea); ok && !references_truncated; ok = fii.next_head()) {
                 sync::Checkpoint();
                 ea_t cur = fii.current();
                 xrefblk_t xb_from;
-                for (bool xok = xb_from.first_from(cur, XREF_ALL); xok; xok = xb_from.next_from()) {
+                for (bool xok = xb_from.first_from(cur, XREF_ALL); xok && !references_truncated; xok = xb_from.next_from()) {
                     sync::Checkpoint();
+                    if (++reference_visits > MAX_REFERENCE_VISITS) { references_truncated = true; break; }
                     if (!xb_from.iscode) continue;
                     uint8_t base_type = xb_from.type & XREF_MASK;
                     if (base_type == fl_CN || base_type == fl_CF || base_type == fl_JN || base_type == fl_JF) {
                         if (xb_from.to >= fn->start_ea && xb_from.to < fn->end_ea) continue;
 
                         std::string call_type = (base_type == fl_CN || base_type == fl_CF) ? "call" : "tailcall";
+                        if (callee_map.find(xb_from.to) == callee_map.end() && callee_map.size() >= MAX_REFERENCE_FUNCTIONS) {
+                            references_truncated = true;
+                            break;
+                        }
                         auto& ci = callee_map[xb_from.to];
                         ci.target_ea = xb_from.to;
                         if (ci.type.empty()) ci.type = call_type;
-                        ci.call_sites.push_back(cur);
+                        ++ci.call_sites_count;
+                        if (ci.call_sites.size() < 5) ci.call_sites.push_back(cur);
                     }
                 }
             }
@@ -276,13 +296,14 @@ namespace tools::composite {
                 ci_item["name"] = c_name_str.empty() ? tools::utils::FormatAddress(callee_ea) : c_name_str;
                 if (!c_dem.empty() && c_dem != c_name_str) ci_item["demangled"] = c_dem;
                 ci_item["type"] = ci.type;
-                ci_item["call_sites_count"] = ci.call_sites.size();
+                ci_item["call_sites_count"] = ci.call_sites_count;
                 nlohmann::json sites_json = nlohmann::json::array();
-                for (size_t s = 0; s < std::min<size_t>(ci.call_sites.size(), 5); ++s) {
+                for (size_t s = 0; s < ci.call_sites.size(); ++s) {
                     sync::Checkpoint();
                     sites_json.push_back(tools::utils::FormatAddress(ci.call_sites[s]));
                 }
                 ci_item["call_sites"] = std::move(sites_json);
+                if (ci.call_sites_count > ci.call_sites.size()) ci_item["call_sites_truncated"] = true;
                 callees_arr.push_back(std::move(ci_item));
             }
 
@@ -310,9 +331,12 @@ namespace tools::composite {
             res["callers_count"] = total_callers_count;
             res["unique_callers"] = caller_map.size();
             res["callers"] = std::move(callers_arr);
+            if (caller_map.size() > max_callers) res["callers_truncated"] = true;
 
             res["callees_count"] = callee_map.size();
             res["callees"] = std::move(callees_arr);
+            if (callee_map.size() > max_callees) res["callees_truncated"] = true;
+            if (references_truncated) res["references_truncated"] = true;
         });
 
         if (!found) {
@@ -334,7 +358,8 @@ namespace tools::composite {
 
         std::string target_var = tools::utils::GetStringArg(args, "var");
         std::string direction = tools::utils::GetStringArg(args, "direction", "forward");
-        if (direction != "forward" && direction != "backward") direction = "forward";
+        if (direction != "forward" && direction != "backward")
+            return tools::utils::MakeToolErrorJson(id, "Direction must be 'forward' or 'backward'", "invalid_direction");
 
         int max_depth = static_cast<int>(tools::utils::GetIntArg(args, "depth", 2));
         if (max_depth <= 0) max_depth = 2;
@@ -347,6 +372,7 @@ namespace tools::composite {
         bool used_hexrays = false;
         std::string error_code;
         std::string error_msg;
+        bool flow_truncated = false;
 
         sync::SyncToMainThread([&]() {
             func_t* pfn = get_func(start_ea);
@@ -388,10 +414,12 @@ namespace tools::composite {
                             }
                             if (!var_found) {
                                 int arg_idx = -1;
-                                if (target_var.rfind("arg", 0) == 0) {
-                                    try { arg_idx = std::stoi(target_var.substr(3)); } catch (const sync::OperationStopped&) { throw; } catch (...) {}
-                                } else if (std::all_of(target_var.begin(), target_var.end(), ::isdigit)) {
-                                    try { arg_idx = std::stoi(target_var); } catch (const sync::OperationStopped&) { throw; } catch (...) {}
+                                std::string index_text = target_var.rfind("arg", 0) == 0 ? target_var.substr(3) : target_var;
+                                if (!index_text.empty() && index_text.find_first_not_of("0123456789") == std::string::npos) {
+                                    int parsed_index = -1;
+                                    const auto parsed = std::from_chars(index_text.data(), index_text.data() + index_text.size(), parsed_index);
+                                    if (parsed.ec == std::errc{} && parsed.ptr == index_text.data() + index_text.size())
+                                        arg_idx = parsed_index;
                                 }
                                 if (arg_idx >= 0) {
                                     if (arg_idx < static_cast<int>(cf->argidx.size())) {
@@ -418,7 +446,7 @@ namespace tools::composite {
                                 }
                             }
                         }
-                        if (root_var.lvar_idx < 0) {
+                        if (root_var.lvar_idx < 0 && target_var.empty()) {
                             if (!cf->argidx.empty()) {
                                 root_var.lvar_idx = cf->argidx[0];
                                 if (root_var.lvar_idx >= 0 && root_var.lvar_idx < static_cast<int>(lvars->size())) {
@@ -440,9 +468,26 @@ namespace tools::composite {
                             }
                         }
                     }
+                    if (!target_var.empty() && root_var.lvar_idx < 0) {
+                        error_code = "variable_not_found";
+                        error_msg = "Variable '" + target_var + "' was not found in the decompiled function";
+                        return;
+                    }
                     root_var_name = root_var.name;
 
-                    auto ResolveCallTarget = [](const cexpr_t* call_expr, const cfunc_t* cf_ptr) -> ea_t {
+                    auto ReadLoadedPointer = [](ea_t address) -> ea_t {
+                        const size_t pointer_size = inf_is_64bit() ? 8 : 4;
+                        segment_t* seg = getseg(address);
+                        if (!seg || address > BADADDR - pointer_size || address + pointer_size > seg->end_ea)
+                            return BADADDR;
+                        for (size_t i = 0; i < pointer_size; ++i) {
+                            sync::Checkpoint();
+                            if (!is_loaded(address + i)) return BADADDR;
+                        }
+                        return inf_is_64bit() ? get_qword(address) : static_cast<ea_t>(get_dword(address));
+                    };
+
+                    auto ResolveCallTarget = [&](const cexpr_t* call_expr, const cfunc_t* cf_ptr) -> ea_t {
                         if (!call_expr || call_expr->op != cot_call || !call_expr->x) return BADADDR;
                         if (call_expr->x->op == cot_obj) {
                             if (is_mapped(call_expr->x->obj_ea)) {
@@ -450,9 +495,10 @@ namespace tools::composite {
                                 if (f && f->start_ea == call_expr->x->obj_ea) return f->start_ea;
                                 segment_t* seg = getseg(call_expr->x->obj_ea);
                                 if (seg && !(seg->perm & SEGPERM_EXEC)) {
-                                    ea_t target = inf_is_64bit() ? get_qword(call_expr->x->obj_ea) : get_dword(call_expr->x->obj_ea);
-                                    if (target != BADADDR && is_mapped(target) && get_func(target)) {
-                                        return get_func(target)->start_ea;
+                                    ea_t target = ReadLoadedPointer(call_expr->x->obj_ea);
+                                    if (target != BADADDR && is_mapped(target)) {
+                                        func_t* target_fn = get_func(target);
+                                        if (target_fn) return target_fn->start_ea;
                                     }
                                 }
                             }
@@ -515,6 +561,7 @@ namespace tools::composite {
                     trace_fn = [&](func_t* fn, const VarRef& cur_var, int current_depth) {
                         sync::Checkpoint();
                         sync::RecursionGuard recursion;
+                        if (flow_arr.size() >= 200) { flow_truncated = true; return; }
                         if (!fn || current_depth > max_depth) return;
                         auto visit_key = std::make_pair(fn->start_ea, cur_var.lvar_idx);
                         if (visited_func_vars.count(visit_key)) return;
@@ -536,6 +583,7 @@ namespace tools::composite {
                                 std::map<int, int>& pointer_aliases;
                                 std::set<std::string>& active_mem_locs;
                                 nlohmann::json& flow;
+                                bool& truncated;
                                 int depth;
                                 bool inc_calls;
                                 int max_d;
@@ -549,15 +597,24 @@ namespace tools::composite {
                                                std::map<int, int>& pa,
                                                std::set<std::string>& am,
                                                nlohmann::json& fl,
+                                               bool& tr,
                                                int d, bool ic, int md,
                                                std::function<void(func_t*, const VarRef&, int)> rf,
                                                std::function<ea_t(const cexpr_t*, const cfunc_t*)> rcf,
                                                std::function<int(const cfunc_t*, size_t)> gaf,
                                                std::function<std::string(const cexpr_t*, const cfunc_t*)> gmf)
                                     : ctree_visitor_t(CV_FAST | CV_PARENTS), cf(f), active_lvars(al),
-                                      pointer_aliases(pa), active_mem_locs(am), flow(fl),
+                                      pointer_aliases(pa), active_mem_locs(am), flow(fl), truncated(tr),
                                       depth(d), inc_calls(ic), max_d(md), recurse_fn(rf),
                                       resolve_call_fn(rcf), get_arg_fn(gaf), get_mem_loc_fn(gmf) {}
+
+                                void BoundedPush(nlohmann::ordered_json item) {
+                                    if (flow.size() >= 200) {
+                                        truncated = true;
+                                        return;
+                                    }
+                                    flow.push_back(std::move(item));
+                                }
 
                                 std::string GetCondition() const {
                                     for (int k = static_cast<int>(parents.size()) - 1; k >= 0; --k) {
@@ -617,7 +674,7 @@ namespace tools::composite {
                                 int idaapi visit_expr(cexpr_t* e) override {
                                     try {
                                         sync::Checkpoint();
-                                        if (flow.size() >= 200) return 1;
+                                        if (flow.size() >= 200) { truncated = true; return 1; }
 
                                         if (e->op == cot_asg || e->op == cot_asgbor || e->op == cot_asgband ||
                                             e->op == cot_asgadd || e->op == cot_asgsub || e->op == cot_asgmul) {
@@ -642,7 +699,7 @@ namespace tools::composite {
                                                         };
                                                         std::string cond = GetCondition();
                                                         if (!cond.empty()) item["path_condition"] = cond;
-                                                        flow.push_back(std::move(item));
+                                                        BoundedPush(std::move(item));
                                                     }
                                                 }
                                             }
@@ -664,7 +721,7 @@ namespace tools::composite {
                                                     };
                                                     std::string cond = GetCondition();
                                                     if (!cond.empty()) item["path_condition"] = cond;
-                                                    flow.push_back(std::move(item));
+                                                    BoundedPush(std::move(item));
                                                 }
                                             }
 
@@ -685,7 +742,7 @@ namespace tools::composite {
                                                     };
                                                     std::string cond = GetCondition();
                                                     if (!cond.empty()) item["path_condition"] = cond;
-                                                    flow.push_back(std::move(item));
+                                                    BoundedPush(std::move(item));
                                                 } else if (e->x && (e->x->op == cot_ptr || e->x->op == cot_memptr || e->x->op == cot_memref || e->x->op == cot_obj)) {
                                                     nlohmann::ordered_json item = {
                                                         {"depth", depth},
@@ -697,7 +754,7 @@ namespace tools::composite {
                                                     };
                                                     std::string cond = GetCondition();
                                                     if (!cond.empty()) item["path_condition"] = cond;
-                                                    flow.push_back(std::move(item));
+                                                    BoundedPush(std::move(item));
                                                 }
                                             }
 
@@ -718,7 +775,7 @@ namespace tools::composite {
                                                         };
                                                         std::string cond = GetCondition();
                                                         if (!cond.empty()) item["path_condition"] = cond;
-                                                        flow.push_back(std::move(item));
+                                                        BoundedPush(std::move(item));
                                                     }
                                                 }
                                             }
@@ -740,7 +797,7 @@ namespace tools::composite {
                                                         };
                                                         std::string cond = GetCondition();
                                                         if (!cond.empty()) item["path_condition"] = cond;
-                                                        flow.push_back(std::move(item));
+                                                        BoundedPush(std::move(item));
                                                     }
                                                 }
                                             }
@@ -753,6 +810,7 @@ namespace tools::composite {
 
                                             for (size_t i = 0; i < e->a->size(); ++i) {
                                                 sync::Checkpoint();
+                                                if (flow.size() >= 200) { truncated = true; return 1; }
                                                 const cexpr_t* arg_expr = &(*e->a)[i];
                                                 VarRef used_var;
                                                 bool is_out_param = false;
@@ -782,7 +840,7 @@ namespace tools::composite {
                                                     };
                                                     std::string cond = GetCondition();
                                                     if (!cond.empty()) item["path_condition"] = cond;
-                                                    flow.push_back(std::move(item));
+                                                    BoundedPush(std::move(item));
 
                                                     if (inc_calls && depth < max_d && callee_ea != BADADDR) {
                                                         func_t* callee_fn = get_func(callee_ea);
@@ -794,7 +852,7 @@ namespace tools::composite {
                                                                 const lvars_t* callee_lvars = callee_cf->get_lvars();
                                                                 if (callee_lvars && param_lvar_idx >= 0 && param_lvar_idx < static_cast<int>(callee_lvars->size())) {
                                                                     VarRef callee_ref{ callee_fn->start_ea, param_lvar_idx, (*callee_lvars)[param_lvar_idx].name.c_str() };
-                                                                    flow.push_back({
+                                                                    BoundedPush({
                                                                         {"depth", depth + 1},
                                                                         {"address", tools::utils::FormatAddress(callee_fn->start_ea)},
                                                                         {"type", "param_use"},
@@ -825,7 +883,7 @@ namespace tools::composite {
                                                 };
                                                 std::string cond = GetCondition();
                                                 if (!cond.empty()) item["path_condition"] = cond;
-                                                flow.push_back(std::move(item));
+                                                BoundedPush(std::move(item));
                                             }
                                             if (UsesActiveVar(e->x, used_var)) {
                                                 nlohmann::ordered_json item = {
@@ -838,7 +896,7 @@ namespace tools::composite {
                                                 };
                                                 std::string cond = GetCondition();
                                                 if (!cond.empty()) item["path_condition"] = cond;
-                                                flow.push_back(std::move(item));
+                                                BoundedPush(std::move(item));
                                             }
                                         }
 
@@ -855,7 +913,7 @@ namespace tools::composite {
                                                 };
                                                 std::string cond = GetCondition();
                                                 if (!cond.empty()) item["path_condition"] = cond;
-                                                flow.push_back(std::move(item));
+                                                BoundedPush(std::move(item));
                                             }
                                         }
 
@@ -869,11 +927,11 @@ namespace tools::composite {
                                 int idaapi visit_insn(cinsn_t* insn) override {
                                     try {
                                         sync::Checkpoint();
-                                        if (flow.size() >= 200) return 1;
+                                        if (flow.size() >= 200) { truncated = true; return 1; }
                                         if (insn->op == cit_if && insn->cif) {
                                             VarRef used_var;
                                             if (UsesActiveVar(&insn->cif->expr, used_var)) {
-                                                flow.push_back({
+                                                BoundedPush({
                                                     {"depth", depth},
                                                     {"address", tools::utils::FormatAddress(insn->ea)},
                                                     {"type", "condition"},
@@ -894,7 +952,7 @@ namespace tools::composite {
                                                 };
                                                 std::string cond = GetCondition();
                                                 if (!cond.empty()) item["path_condition"] = cond;
-                                                flow.push_back(std::move(item));
+                                                BoundedPush(std::move(item));
                                             }
                                         }
                                         return 0;
@@ -905,7 +963,7 @@ namespace tools::composite {
                                 }
                             };
 
-                            ForwardVisitor visitor(local_cf, active_lvars, pointer_aliases, active_mem_locs, flow_arr, current_depth, include_calls, max_depth, trace_fn, ResolveCallTarget, GetArgLvarIdx, GetAbstractMemLoc);
+                            ForwardVisitor visitor(local_cf, active_lvars, pointer_aliases, active_mem_locs, flow_arr, flow_truncated, current_depth, include_calls, max_depth, trace_fn, ResolveCallTarget, GetArgLvarIdx, GetAbstractMemLoc);
                             visitor.apply_to(&local_cf->body, nullptr);
                             sync::Checkpoint();
                         } else {
@@ -976,10 +1034,12 @@ namespace tools::composite {
 
                             struct citem_collector_t : public ctree_visitor_t {
                                 std::vector<citem_t*> items;
-                                citem_collector_t() : ctree_visitor_t(CV_FAST) {}
+                                bool& truncated;
+                                explicit citem_collector_t(bool& tr) : ctree_visitor_t(CV_FAST), truncated(tr) {}
                                 int idaapi visit_insn(cinsn_t* in) override {
                                     try {
                                         sync::Checkpoint();
+                                        if (items.size() >= kMaxTraceCollectedItems) { truncated = true; return 1; }
                                         items.push_back(in);
                                         return 0;
                                     } catch (...) {
@@ -990,6 +1050,7 @@ namespace tools::composite {
                                 int idaapi visit_expr(cexpr_t* ex) override {
                                     try {
                                         sync::Checkpoint();
+                                        if (items.size() >= kMaxTraceCollectedItems) { truncated = true; return 1; }
                                         items.push_back(ex);
                                         return 0;
                                     } catch (...) {
@@ -997,14 +1058,14 @@ namespace tools::composite {
                                         return 1;
                                     }
                                 }
-                            } collector;
+                            } collector(flow_truncated);
                             collector.apply_to(&local_cf->body, nullptr);
                             sync::Checkpoint();
 
                             // Traverse collected items in reverse execution order
                             for (auto it = collector.items.rbegin(); it != collector.items.rend(); ++it) {
                                 sync::Checkpoint();
-                                if (flow_arr.size() >= 200) break;
+                                if (flow_arr.size() >= 200) { flow_truncated = true; break; }
                                 citem_t* item = *it;
 
                                 if (item->is_expr()) {
@@ -1097,11 +1158,15 @@ namespace tools::composite {
                                                             struct ret_finder_t : public ctree_visitor_t {
                                                                 const cfunc_t* c_cf;
                                                                 std::vector<std::pair<ea_t, const cexpr_t*>> rets;
-                                                                ret_finder_t(const cfunc_t* f) : ctree_visitor_t(CV_FAST), c_cf(f) {}
+                                                                bool& truncated;
+                                                                size_t max_returns;
+                                                                ret_finder_t(const cfunc_t* f, bool& tr, size_t limit)
+                                                                    : ctree_visitor_t(CV_FAST), c_cf(f), truncated(tr), max_returns(limit) {}
                                                                 int idaapi visit_insn(cinsn_t* in) override {
                                                                     try {
                                                                         sync::Checkpoint();
                                                                         if (in->op == cit_return && in->creturn && in->creturn->expr.op != cot_empty) {
+                                                                            if (rets.size() >= max_returns) { truncated = true; return 1; }
                                                                             rets.push_back({in->ea, &in->creturn->expr});
                                                                         }
                                                                         return 0;
@@ -1110,13 +1175,14 @@ namespace tools::composite {
                                                                         return 1;
                                                                     }
                                                                 }
-                                                            } rf(callee_cf);
+                                                            } rf(callee_cf, flow_truncated, 200 - flow_arr.size());
                                                             rf.apply_to(&callee_cf->body, nullptr);
                                                             sync::Checkpoint();
 
                                                             // Handle ALL returns (no break), decomposing expressions into source vars
                                                             for (const auto& [ret_ea, ret_expr] : rf.rets) {
                                                                 sync::Checkpoint();
+                                                                if (flow_arr.size() >= 200) { flow_truncated = true; break; }
                                                                 std::string ret_str = hexrays_ast::CleanItemText(ret_expr, callee_cf);
                                                                 flow_arr.push_back({
                                                                     {"depth", current_depth + 1},
@@ -1152,6 +1218,7 @@ namespace tools::composite {
 
                                                                 for (const auto& rv : ret_src_vars) {
                                                                     sync::Checkpoint();
+                                                                    if (flow_arr.size() >= 200) { flow_truncated = true; break; }
                                                                     trace_fn(callee_fn, rv, current_depth + 1);
                                                                 }
                                                             }
@@ -1188,6 +1255,7 @@ namespace tools::composite {
 
                                         for (size_t ai = 0; ai < e->a->size(); ++ai) {
                                             sync::Checkpoint();
+                                            if (flow_arr.size() >= 200) { flow_truncated = true; break; }
                                             const carg_t& arg = (*e->a)[ai];
                                             const cexpr_t* unwrap_arg = &arg;
                                             if (unwrap_arg->op == cot_cast && unwrap_arg->x) unwrap_arg = unwrap_arg->x;
@@ -1311,13 +1379,15 @@ namespace tools::composite {
                                                         std::string c_name;
                                                         int d;
                                                         nlohmann::json& fl;
+                                                        bool& truncated;
                                                         std::function<void(func_t*, const VarRef&, int)> r_fn;
-                                                        caller_call_finder_t(const cfunc_t* f, ea_t tea, int pi, const std::string& pn, const std::string& cn, int cd, nlohmann::json& flow_arr, std::function<void(func_t*, const VarRef&, int)> rf)
-                                                            : ctree_visitor_t(CV_FAST), c_cf(f), target_fn_ea(tea), p_idx(pi), p_name(pn), c_name(cn), d(cd), fl(flow_arr), r_fn(rf) {}
+                                                        caller_call_finder_t(const cfunc_t* f, ea_t tea, int pi, const std::string& pn, const std::string& cn, int cd, nlohmann::json& flow_arr, bool& tr, std::function<void(func_t*, const VarRef&, int)> rf)
+                                                            : ctree_visitor_t(CV_FAST), c_cf(f), target_fn_ea(tea), p_idx(pi), p_name(pn), c_name(cn), d(cd), fl(flow_arr), truncated(tr), r_fn(rf) {}
 
                                                         int idaapi visit_expr(cexpr_t* ce) override {
                                                             try {
                                                                 sync::Checkpoint();
+                                                                if (fl.size() >= 200) { truncated = true; return 1; }
                                                                 if (ce->op == cot_call && ce->a) {
                                                                     ea_t resolved_target = BADADDR;
                                                                     if (ce->x && ce->x->op == cot_obj) resolved_target = ce->x->obj_ea;
@@ -1348,7 +1418,7 @@ namespace tools::composite {
                                                                 return 1;
                                                             }
                                                         }
-                                                    } ccf(caller_cf, fn->start_ea, param_idx, lv.name.c_str(), caller_name, current_depth, flow_arr, trace_fn);
+                                                    } ccf(caller_cf, fn->start_ea, param_idx, lv.name.c_str(), caller_name, current_depth, flow_arr, flow_truncated, trace_fn);
                                                     ccf.apply_to(&caller_cf->body, nullptr);
                                                     sync::Checkpoint();
                                                 }
@@ -1374,11 +1444,18 @@ namespace tools::composite {
 
                 std::set<ea_t> visited;
                 std::queue<std::pair<ea_t, int>> q;
+                constexpr size_t MAX_FALLBACK_NODES = 100;
+                constexpr size_t MAX_FALLBACK_XREF_VISITS = 50000;
+                size_t fallback_xref_visits = 0;
                 q.push({start_ea, 0});
                 visited.insert(start_ea);
 
-                while (!q.empty() && visited.size() < 100) {
+                while (!q.empty()) {
                     sync::Checkpoint();
+                    if (flow_arr.size() >= MAX_FALLBACK_NODES) {
+                        flow_truncated = true;
+                        break;
+                    }
                     auto [cur_ea, depth] = q.front();
                     q.pop();
 
@@ -1394,16 +1471,41 @@ namespace tools::composite {
                     if (depth >= max_depth) continue;
 
                     xrefblk_t xb;
-                    for (bool ok = xb.first_from(cur_ea, XREF_DATA); ok && visited.size() < 100; ok = xb.next_from()) {
+                    for (bool ok = xb.first_from(cur_ea, XREF_DATA); ok; ok = xb.next_from()) {
                         sync::Checkpoint();
+                        if (++fallback_xref_visits > MAX_FALLBACK_XREF_VISITS) {
+                            flow_truncated = true;
+                            break;
+                        }
                         if (xb.to != BADADDR && is_mapped(xb.to) && visited.find(xb.to) == visited.end()) {
+                            if (visited.size() >= MAX_FALLBACK_NODES) {
+                                flow_truncated = true;
+                                break;
+                            }
                             visited.insert(xb.to);
                             q.push({xb.to, depth + 1});
                         }
                     }
+                    if (flow_truncated) break;
 
-                    ea_t deref = inf_is_64bit() ? get_qword(cur_ea) : get_dword(cur_ea);
-                    if (deref != BADADDR && is_mapped(deref) && visited.find(deref) == visited.end() && visited.size() < 100) {
+                    ea_t deref = BADADDR;
+                    const size_t ptr_size = inf_is_64bit() ? 8 : 4;
+                    segment_t* memory_segment = getseg(cur_ea);
+                    if (memory_segment && cur_ea <= BADADDR - ptr_size &&
+                        cur_ea + ptr_size <= memory_segment->end_ea) {
+                        bool pointer_loaded = true;
+                        for (size_t i = 0; i < ptr_size; ++i) {
+                            sync::Checkpoint();
+                            if (!is_loaded(cur_ea + i)) { pointer_loaded = false; break; }
+                        }
+                        if (pointer_loaded)
+                            deref = inf_is_64bit() ? get_qword(cur_ea) : get_dword(cur_ea);
+                    }
+                    if (deref != BADADDR && is_mapped(deref) && visited.find(deref) == visited.end()) {
+                        if (visited.size() >= MAX_FALLBACK_NODES) {
+                            flow_truncated = true;
+                            break;
+                        }
                         visited.insert(deref);
                         q.push({deref, depth + 1});
                     }
@@ -1425,6 +1527,7 @@ namespace tools::composite {
             {"flow_count", flow_arr.size()},
             {"flow", flow_arr}
         };
+        if (flow_truncated) res["truncated"] = true;
         return tools::utils::MakeToolSuccessJson(id, res);
     }
 }

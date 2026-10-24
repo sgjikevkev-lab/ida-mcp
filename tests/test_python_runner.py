@@ -11,6 +11,8 @@ ROOT = Path(__file__).resolve().parents[1]
 class PythonRunnerTests(unittest.TestCase):
     def setUp(self):
         self.old_idc = sys.modules.get('idc')
+        self.old_sys_path = sys.path
+        self.old_sys_path_contents = list(sys.path)
         self.idc = types.ModuleType('idc')
         self.idc.eval_idc = lambda expression: 0
         sys.modules['idc'] = self.idc
@@ -22,6 +24,8 @@ class PythonRunnerTests(unittest.TestCase):
         self.runner = namespace['__ida_mcp_execute']
 
     def tearDown(self):
+        sys.path = self.old_sys_path
+        sys.path[:] = self.old_sys_path_contents
         if self.old_idc is None:
             sys.modules.pop('idc', None)
         else:
@@ -48,6 +52,13 @@ class PythonRunnerTests(unittest.TestCase):
         self.assertNotIn('__file__', scope)
         self.assertNotIn('runtime', scope)
 
+    def test_failure_restores_replaced_sys_path_and_reserved_runtime_module(self):
+        original_path = sys.path
+        result = self.run_code("import sys\nsys.path = None\nsys.modules['_ida_mcp_runtime'] = 'broken'\nraise ValueError('broken state')")
+        self.assertEqual(result['error_code'], 'py_exec_error')
+        self.assertIs(sys.path, original_path)
+        self.assertIsInstance(sys.modules['_ida_mcp_runtime'], types.ModuleType)
+
     def test_system_exit_is_contained(self):
         self.assertEqual(self.run_code('raise SystemExit(2)')['error_code'], 'py_exec_error')
 
@@ -56,8 +67,22 @@ class PythonRunnerTests(unittest.TestCase):
 
     def test_capture_is_bounded(self):
         result = self.run_code("print('a' * 400000)")
-        self.assertEqual(len(result['stdout']), 262144)
+        self.assertEqual(len(result['stdout']), 65536)
         self.assertTrue(result['output_truncated'])
+
+    def test_large_result_is_bounded_before_serialization(self):
+        result = self.run_code("'x' * 10000000")
+        self.assertLessEqual(len(sys.modules['_ida_mcp_runtime'].response), 1800000)
+        self.assertEqual(len(result['result']), 524288 // 6)
+        self.assertTrue(result['output_truncated'])
+
+    def test_recursive_result_is_contained(self):
+        result = self.run_code('value = []\nvalue.append(value)\nvalue')
+        self.assertEqual(result['result'], ['<recursive reference>'])
+        self.assertTrue(result['output_truncated'])
+
+    def test_non_finite_float_is_valid_json(self):
+        self.assertEqual(self.run_code("float('nan')")['result'], 'nan')
 
     def test_cooperative_cancellation(self):
         self.idc.eval_idc = lambda expression: 1

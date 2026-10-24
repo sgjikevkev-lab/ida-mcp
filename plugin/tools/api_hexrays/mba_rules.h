@@ -4,6 +4,7 @@
 #include <functional>
 #include <optional>
 #include <cstdint>
+#include <cstring>
 #include <set>
 #include <sstream>
 #include "ctree_serializer.h"
@@ -22,9 +23,9 @@ namespace tools::hexrays_ast {
     inline std::string ExtractBindingName(const nlohmann::json& val) {
         if (val.is_string()) return val.get<std::string>();
         if (val.is_object()) {
-            if (val.contains("var_name")) return val["var_name"].get<std::string>();
-            if (val.contains("obj_name")) return val["obj_name"].get<std::string>();
-            if (val.contains("value")) return std::to_string(val["value"].get<uint64_t>());
+            if (val.contains("var_name") && val["var_name"].is_string()) return val["var_name"].get<std::string>();
+            if (val.contains("obj_name") && val["obj_name"].is_string()) return val["obj_name"].get<std::string>();
+            if (val.contains("value") && val["value"].is_number_integer()) return val["value"].dump();
         }
         return val.dump();
     }
@@ -297,10 +298,30 @@ namespace tools::hexrays_ast {
         return kRules;
     }
 
+    inline uint64_t IntegerMask(int byte_size) {
+        return byte_size <= 0 || byte_size >= 8 ? ~uint64_t(0) : ((uint64_t(1) << (byte_size * 8)) - 1);
+    }
+
     inline int64_t SignExtend(uint64_t val, int byte_size) {
-        if (byte_size <= 0 || byte_size >= 8) return static_cast<int64_t>(val);
-        int shift = 64 - (byte_size * 8);
-        return (static_cast<int64_t>(val << shift)) >> shift;
+        if (byte_size <= 0 || byte_size >= 8) {
+            int64_t signed_value;
+            std::memcpy(&signed_value, &val, sizeof(signed_value));
+            return signed_value;
+        }
+        const uint64_t mask = IntegerMask(byte_size);
+        val &= mask;
+        const uint64_t sign_bit = uint64_t(1) << (byte_size * 8 - 1);
+        if ((val & sign_bit) == 0) return static_cast<int64_t>(val);
+        return -1 - static_cast<int64_t>((~val) & mask);
+    }
+
+    inline uint64_t ArithmeticShiftRight(uint64_t value, unsigned shift) {
+        shift &= 63;
+        if (shift == 0) return value;
+        const bool negative = (value >> 63) != 0;
+        uint64_t result = value >> shift;
+        if (negative) result |= (~uint64_t(0)) << (64 - shift);
+        return result;
     }
 
     // === Constant Folding Engine ===
@@ -310,23 +331,22 @@ namespace tools::hexrays_ast {
         sync::RecursionGuard recursion;
         if (!expr) return std::nullopt;
 
+        const uint64_t result_mask = IntegerMask(expr->type.get_size());
         if (expr->op == cot_num) {
-            return static_cast<uint64_t>(expr->numval());
+            return static_cast<uint64_t>(expr->numval()) & result_mask;
         }
 
         // Unary: ~x
         if (expr->op == cot_bnot && expr->x) {
             auto v = TryConstFold(expr->x);
-            if (v) return ~(*v);
+            if (v) return (~(*v)) & result_mask;
         }
 
         // Unary: -x
         if (expr->op == cot_neg && expr->x) {
             auto v = TryConstFold(expr->x);
             if (v) {
-                int x_sz = expr->x ? expr->x->type.get_size() : expr->type.get_size();
-                int64_t sv = SignExtend(*v, x_sz);
-                return static_cast<uint64_t>(-sv);
+                return (uint64_t(0) - *v) & result_mask;
             }
         }
 
@@ -339,7 +359,7 @@ namespace tools::hexrays_ast {
         // Cast
         if (expr->op == cot_cast && expr->x) {
             int sz = expr->type.get_size();
-            uint64_t cast_mask = (sz >= 8 || sz <= 0) ? ~0ULL : ((1ULL << (sz * 8)) - 1);
+            uint64_t cast_mask = IntegerMask(sz);
             auto v = TryConstFold(expr->x);
             if (v) return (*v) & cast_mask;
         }
@@ -356,15 +376,15 @@ namespace tools::hexrays_ast {
             int64_t sr = SignExtend(*r, r_sz);
 
             switch (expr->op) {
-                case cot_add:  return *l + *r;
-                case cot_sub:  return *l - *r;
-                case cot_mul:  return *l * *r;
-                case cot_band: return *l & *r;
-                case cot_bor:  return *l | *r;
-                case cot_xor:  return *l ^ *r;
-                case cot_shl:  return *l << (*r & 63);
-                case cot_sshr: return static_cast<uint64_t>(sl >> (*r & 63));
-                case cot_ushr: return *l >> (*r & 63);
+                case cot_add:  return (*l + *r) & result_mask;
+                case cot_sub:  return (*l - *r) & result_mask;
+                case cot_mul:  return (*l * *r) & result_mask;
+                case cot_band: return (*l & *r) & result_mask;
+                case cot_bor:  return (*l | *r) & result_mask;
+                case cot_xor:  return (*l ^ *r) & result_mask;
+                case cot_shl:  return (*l << (*r & 63)) & result_mask;
+                case cot_sshr: return ArithmeticShiftRight(static_cast<uint64_t>(sl), static_cast<unsigned>(*r)) & result_mask;
+                case cot_ushr: return (*l >> (*r & 63)) & result_mask;
                 case cot_eq:   return (*l == *r) ? 1 : 0;
                 case cot_ne:   return (*l != *r) ? 1 : 0;
                 case cot_slt:  return (sl < sr) ? 1 : 0;
@@ -440,11 +460,7 @@ namespace tools::hexrays_ast {
 
         if (expr->op == cot_neg && expr->x) {
             auto v = EvalExprWithVars(expr->x, var_map, mask);
-            if (v) {
-                int x_sz = expr->x ? expr->x->type.get_size() : expr->type.get_size();
-                int64_t sv = SignExtend(*v, x_sz);
-                return static_cast<uint64_t>(-sv) & mask;
-            }
+            if (v) return (uint64_t(0) - *v) & mask;
             return std::nullopt;
         }
 
@@ -480,7 +496,7 @@ namespace tools::hexrays_ast {
                 case cot_bor:  return (*l | *r) & mask;
                 case cot_xor:  return (*l ^ *r) & mask;
                 case cot_shl:  return (*l << (*r & 63)) & mask;
-                case cot_sshr: return static_cast<uint64_t>(sl >> (*r & 63)) & mask;
+                case cot_sshr: return ArithmeticShiftRight(static_cast<uint64_t>(sl), static_cast<unsigned>(*r)) & mask;
                 case cot_ushr: return (*l >> (*r & 63)) & mask;
                 case cot_eq:   return (*l == *r) ? 1 : 0;
                 case cot_ne:   return (*l != *r) ? 1 : 0;
@@ -634,8 +650,7 @@ namespace tools::hexrays_ast {
             uint64_t out = *eval_res & mask;
 
             if (out != val) all_identity = false;
-            int64_t sval = SignExtend(val, sz);
-            if (out != (static_cast<uint64_t>(-sval) & mask)) all_neg = false;
+            if (out != ((uint64_t(0) - val) & mask)) all_neg = false;
             if (out != ((~val) & mask)) all_bnot = false;
             if (out != 0) all_zero = false;
             if (out != mask) all_all_ones = false;

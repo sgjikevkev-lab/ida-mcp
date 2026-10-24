@@ -2,7 +2,7 @@
 
 A native C++ MCP router and IDA Pro plugin for language-model agents. This repository is independent of Hex-Rays IDA Assist.
 
-The local development version is **2.0.0-dev**. It changes input contracts and response defaults from 1.2.1. The plugin targets Windows x64 and the bundled **IDA Pro 9.2 SDK**. Other IDA versions require separate compatibility work.
+The current release is **2.0.0**. It changes input contracts and response defaults from 1.2.1. The plugin targets Windows x64 and the bundled **IDA Pro 9.2 SDK**. Other IDA versions require separate compatibility work.
 
 ## Model interface
 

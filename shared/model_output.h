@@ -20,14 +20,18 @@ namespace mcp::output {
         return true;
     }
 
-    inline bool HasMultilineString(const json& value) {
+    inline bool HasMultilineString(const json& value, size_t depth = 0) {
+        // Render() deliberately stops expanding at the same depth. Keep this
+        // preflight bounded too: Python tool results can be more deeply nested
+        // than requests parsed by the router.
+        if (depth >= 32) return false;
         if (value.is_string()) return value.get_ref<const std::string&>().find('\n') != std::string::npos;
         if (value.is_array()) {
             for (const auto& item : value)
-                if (HasMultilineString(item)) return true;
+                if (HasMultilineString(item, depth + 1)) return true;
         } else if (value.is_object()) {
             for (auto it = value.begin(); it != value.end(); ++it)
-                if (HasMultilineString(it.value())) return true;
+                if (HasMultilineString(it.value(), depth + 1)) return true;
         }
         return false;
     }

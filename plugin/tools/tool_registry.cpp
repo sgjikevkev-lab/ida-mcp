@@ -1,6 +1,5 @@
 #include "sync/operation.h"
 #include <chrono>
-#include "sync/operation.h"
 #include "shared/argument_validation.h"
 #include "shared/json_parse.h"
 
@@ -14,6 +13,16 @@
 #include "utils/utils.h"
 
 namespace tools {
+    namespace {
+        nlohmann::json MakeRpcError(const nlohmann::json& id, int code, const std::string& message) {
+            return nlohmann::json({
+                {"jsonrpc", "2.0"},
+                {"id", id},
+                {"error", {{"code", code}, {"message", message}}}
+            });
+        }
+    }
+
     ToolRegistry::ToolRegistry() {
         api_core_ = std::make_unique<tools::core::ApiCore>();
         api_memory_ = std::make_unique<tools::memory::ApiMemory>();
@@ -166,6 +175,14 @@ namespace tools {
         std::string method = req.value("method", "");
 
         if (method == "initialize") {
+            nlohmann::json params = nlohmann::json::object();
+            if (req.contains("params")) {
+                params = req["params"];
+                if (!params.is_object())
+                    return SafeDumpJson(MakeRpcError(id, -32602, "params must be an object"));
+            }
+            if (params.contains("protocolVersion") && !params["protocolVersion"].is_string())
+                return SafeDumpJson(MakeRpcError(id, -32602, "protocolVersion must be a string"));
             return SafeDumpJson(nlohmann::json({
                 {"jsonrpc", "2.0"},
                 {"id", id},
@@ -173,7 +190,7 @@ namespace tools {
                     {"protocolVersion", "2024-11-05"},
                     {"serverInfo", {
                         {"name", "ida-pro-mcp"},
-                        {"version", "2.0.0-dev"}
+                        {"version", "2.0.0"}
                     }},
                     {"capabilities", {
                         {"tools", nlohmann::json::object()}
@@ -201,9 +218,18 @@ namespace tools {
         }
 
         if (method == "tools/call") {
-            nlohmann::json params = req.value("params", nlohmann::json::object());
-            std::string name = params.value("name", "");
-            nlohmann::json args = params.value("arguments", nlohmann::json::object());
+            if (!req.contains("params") || !req["params"].is_object())
+                return SafeDumpJson(MakeRpcError(id, -32602, "params must be an object"));
+            const auto& params = req["params"];
+            if (!params.contains("name") || !params["name"].is_string() || params["name"].get_ref<const std::string&>().empty())
+                return SafeDumpJson(MakeRpcError(id, -32602, "name must be a non-empty string"));
+            std::string name = params["name"].get<std::string>();
+            nlohmann::json args = nlohmann::json::object();
+            if (params.contains("arguments")) {
+                args = params["arguments"];
+                if (!args.is_object())
+                    return SafeDumpJson(MakeRpcError(id, -32602, "arguments must be an object"));
+            }
             try {
                 nlohmann::json res = DispatchToolCall(id, name, args);
 
@@ -228,13 +254,17 @@ namespace tools {
 
     nlohmann::json ToolRegistry::DispatchToolCall(const nlohmann::json& id, const std::string& name, const nlohmann::json& args) {
         sync::Checkpoint();
+        bool schema_found = false;
         for (const auto& tool : GetToolsSchema()) {
             sync::Checkpoint();
             if (tool["name"] != name) continue;
+            schema_found = true;
             auto error = mcp::ValidateArguments(tool["inputSchema"], args);
             if (!error.empty()) return tools::utils::MakeToolErrorJson(id, error, "invalid_params");
             break;
         }
+        if (!schema_found)
+            return tools::utils::MakeToolErrorJson(id, "Tool not found: " + name, "tool_not_found");
         auto it = handlers_.find(name);
         if (it != handlers_.end()) {
             return it->second(id, args);

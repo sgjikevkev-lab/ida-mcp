@@ -3,6 +3,9 @@
 #include <vector>
 #include <cstdint>
 #include <algorithm>
+#include <charconv>
+#include <cctype>
+#include <limits>
 #include "shared/pattern_match.h"
 
 #pragma warning(push, 0)
@@ -28,11 +31,13 @@ namespace tools::utils {
 
         // 1. If string explicitly starts with 0x / 0X, it is definitely a hexadecimal address
         if (s.size() >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
-            try {
-                return std::stoull(s.substr(2), nullptr, 16);
-            } catch (const sync::OperationStopped&) { throw; } catch (...) {
+            const char* begin = s.data() + 2;
+            const char* end = s.data() + s.size();
+            uint64_t value = 0;
+            const auto parsed = std::from_chars(begin, end, value, 16);
+            if (begin == end || parsed.ec != std::errc{} || parsed.ptr != end || value == BADADDR)
                 return BADADDR;
-            }
+            return static_cast<ea_t>(value);
         }
 
         // 2. Check if it matches an existing symbol or function name in IDB
@@ -59,10 +64,10 @@ namespace tools::utils {
             }
         }
         if (is_hex && !s.empty()) {
-            try {
-                return std::stoull(s, nullptr, 16);
-            } catch (const sync::OperationStopped&) { throw; } catch (...) {
-            }
+            uint64_t value = 0;
+            const auto parsed = std::from_chars(s.data(), s.data() + s.size(), value, 16);
+            if (parsed.ec == std::errc{} && parsed.ptr == s.data() + s.size() && value != BADADDR)
+                return static_cast<ea_t>(value);
         }
 
         return BADADDR;
@@ -107,8 +112,15 @@ namespace tools::utils {
             return default_ea;
         }
 
-        if (it->is_number_unsigned() || it->is_number_integer()) {
-            return static_cast<ea_t>(it->get<uint64_t>());
+        if (it->is_number_unsigned()) {
+            const auto value = it->get<uint64_t>();
+            if (value == BADADDR || value > std::numeric_limits<ea_t>::max()) return default_ea;
+            return static_cast<ea_t>(value);
+        }
+        if (it->is_number_integer()) {
+            const auto value = it->get<int64_t>();
+            if (value < 0) return default_ea;
+            return static_cast<ea_t>(value);
         }
         if (it->is_string()) {
             return ParseAddress(it->get<std::string>());
@@ -120,7 +132,11 @@ namespace tools::utils {
         auto it = args.find(key);
         if (it == args.end() || it->is_null()) return default_val;
 
-        if (it->is_number_integer() || it->is_number_unsigned()) {
+        if (it->is_number_unsigned()) {
+            const auto value = it->get<uint64_t>();
+            return value > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ? default_val : static_cast<int64_t>(value);
+        }
+        if (it->is_number_integer()) {
             return it->get<int64_t>();
         }
         if (it->is_boolean()) {
@@ -128,14 +144,13 @@ namespace tools::utils {
         }
         if (it->is_string()) {
             const std::string& s = it->get<std::string>();
-            try {
-                if (s.size() >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
-                    return std::stoll(s.substr(2), nullptr, 16);
-                }
-                return std::stoll(s);
-            } catch (const sync::OperationStopped&) { throw; } catch (...) {
-                return default_val;
-            }
+            const bool is_hex = s.size() >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X');
+            const char* begin = s.data() + (is_hex ? 2 : 0);
+            const char* end = s.data() + s.size();
+            int64_t value = 0;
+            const auto parsed = std::from_chars(begin, end, value, is_hex ? 16 : 10);
+            if (begin == end || parsed.ec != std::errc{} || parsed.ptr != end) return default_val;
+            return value;
         }
         return default_val;
     }
@@ -152,7 +167,9 @@ namespace tools::utils {
         }
         if (it->is_string()) {
             std::string s = it->get<std::string>();
-            std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+            std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
             return (s == "true" || s == "1" || s == "yes");
         }
         return default_val;
@@ -165,7 +182,10 @@ namespace tools::utils {
         if (it->is_string()) {
             return it->get<std::string>();
         }
-        if (it->is_number_integer() || it->is_number_unsigned()) {
+        if (it->is_number_unsigned()) {
+            return std::to_string(it->get<uint64_t>());
+        }
+        if (it->is_number_integer()) {
             return std::to_string(it->get<int64_t>());
         }
         if (it->is_boolean()) {

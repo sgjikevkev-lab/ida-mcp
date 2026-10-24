@@ -6,6 +6,9 @@
 #include <unordered_set>
 #include <map>
 #include <set>
+#include <limits>
+#include <stdexcept>
+#include <cstring>
 
 #pragma warning(push, 0)
 #include "json.h"
@@ -29,6 +32,7 @@
 
 namespace tools::types {
     namespace {
+        constexpr uint64_t kMaxInferredStructSize = 0x200000;
         static thread_local std::string g_parse_errors;
 
         static int ida_export DeclPrinter(const char *format, ...) {
@@ -92,15 +96,11 @@ namespace tools::types {
             return DeclareType(id, args);
         }
 
-        // 2. Read memory struct instance (addr AND (name OR type OR struct) present)
-        if (args.contains("addr") && (args.contains("name") || args.contains("type") || args.contains("struct"))) {
-            nlohmann::json struct_args = args;
-            if (!struct_args.contains("name") && struct_args.contains("type")) {
-                struct_args["name"] = struct_args["type"];
-            } else if (!struct_args.contains("name") && struct_args.contains("struct")) {
-                struct_args["name"] = struct_args["struct"];
-            }
-            return ReadStruct(id, struct_args);
+        // 2. Read memory struct instance (addr and name)
+        if (args.contains("addr") && !args.contains("name"))
+            return tools::utils::MakeToolErrorJson(id, "Parameter 'name' is required with 'addr'", "struct_name_required");
+        if (args.contains("addr")) {
+            return ReadStruct(id, args);
         }
 
         // 3. Batch type inspection (names array)
@@ -108,15 +108,12 @@ namespace tools::types {
             nlohmann::json results = nlohmann::json::array();
             for (const auto& n : args["names"]) {
                 sync::Checkpoint();
-                if (!n.is_string()) continue;
                 nlohmann::json inspect_args = args;
-                inspect_args["name"] = n.get<std::string>();
+                inspect_args["__ida_mcp_internal_type_payload"] = true;
+                if (n.is_string()) inspect_args["name"] = n.get<std::string>();
+                else inspect_args.erase("name");
                 nlohmann::json res = TypeInspect(id, inspect_args);
-                if (res.contains("result")) {
-                    results.push_back(res["result"]);
-                } else {
-                    results.push_back({{"name", n.get<std::string>()}, {"status", "not_found"}});
-                }
+                results.push_back(std::move(res));
             }
             nlohmann::ordered_json resp;
             resp["status"] = "success";
@@ -126,12 +123,8 @@ namespace tools::types {
         }
 
         // 4. Single type inspection (name or type present)
-        if (args.contains("name") || args.contains("type")) {
-            nlohmann::json inspect_args = args;
-            if (!inspect_args.contains("name") && inspect_args.contains("type")) {
-                inspect_args["name"] = inspect_args["type"];
-            }
-            return TypeInspect(id, inspect_args);
+        if (args.contains("name")) {
+            return TypeInspect(id, args);
         }
 
         // 5. Query / search mode (pattern, query, or fallback)
@@ -139,13 +132,12 @@ namespace tools::types {
     }
 
     nlohmann::json ApiTypes::DeclareType(const nlohmann::json& id, const nlohmann::json& args) {
-        std::string decls = tools::utils::GetStringArg(args, "c_code", tools::utils::GetStringArg(args, "declarations", tools::utils::GetStringArg(args, "code")));
+        std::string decls = tools::utils::GetStringArg(args, "c_code");
         if (decls.empty()) {
             return tools::utils::MakeToolErrorJson(id, "Parameter 'c_code' is required", "c_code_required");
         }
 
         int pack = static_cast<int>(tools::utils::GetIntArg(args, "pack", 0));
-        bool detailed = tools::utils::GetBoolArg(args, "detailed", true);
         std::string explicit_name = tools::utils::GetStringArg(args, "name");
 
         int hti_flags = HTI_DCL | HTI_SEMICOLON | HTI_RELAXED;
@@ -239,7 +231,7 @@ namespace tools::types {
                 if (tif.is_udt()) {
                     int nmembers = tif.get_udt_nmembers();
                     item["fields_count"] = nmembers;
-                    if (detailed) {
+                    {
                         nlohmann::json f_arr = nlohmann::json::array();
                         for (int i = 0; i < nmembers; ++i) {
                             sync::Checkpoint();
@@ -261,7 +253,7 @@ namespace tools::types {
                     enum_type_data_t ei;
                     if (tif.get_enum_details(&ei)) {
                         item["members_count"] = ei.size();
-                        if (detailed) {
+                        {
                             nlohmann::json m_arr = nlohmann::json::array();
                             for (size_t i = 0; i < ei.size(); ++i) {
                                 sync::Checkpoint();
@@ -314,21 +306,24 @@ namespace tools::types {
     }
 
     nlohmann::json ApiTypes::TypeQuery(const nlohmann::json& id, const nlohmann::json& args) {
-        std::string pattern = tools::utils::GetStringArg(args, "pattern", tools::utils::GetStringArg(args, "filter"));
+        std::string pattern = tools::utils::GetStringArg(args, "pattern");
         std::string kind_filter = tools::utils::GetStringArg(args, "kind", "all");
-        std::transform(kind_filter.begin(), kind_filter.end(), kind_filter.begin(), ::tolower);
+        kind_filter = mcp::LowerAscii(std::move(kind_filter));
+        if (kind_filter != "all" && kind_filter != "struct" && kind_filter != "union" && kind_filter != "enum"
+            && kind_filter != "typedef" && kind_filter != "function")
+            return tools::utils::MakeToolErrorJson(id, "Unsupported type kind: " + kind_filter, "invalid_type_kind");
 
-        bool local_only = tools::utils::GetBoolArg(args, "local_only", false);
-        bool detailed = tools::utils::GetBoolArg(args, "detailed", true);
-        std::string til_filter = tools::utils::GetStringArg(args, "til");
-
-        size_t offset = static_cast<size_t>(tools::utils::GetIntArg(args, "offset", 0));
-        if (offset == 0) {
-            std::string cursor_str = tools::utils::GetStringArg(args, "cursor");
-            if (!cursor_str.empty()) {
-                try {
-                    offset = static_cast<size_t>(std::stoull(cursor_str, nullptr, 0));
-                } catch (const sync::OperationStopped&) { throw; } catch (...) {}
+        size_t offset = 0;
+        const std::string cursor_str = tools::utils::GetStringArg(args, "cursor");
+        if (!cursor_str.empty()) {
+            try {
+                if (cursor_str.find_first_not_of("0123456789") != std::string::npos) throw std::invalid_argument("cursor");
+                size_t consumed = 0;
+                const unsigned long long parsed = std::stoull(cursor_str, &consumed, 10);
+                if (consumed != cursor_str.size() || parsed > std::numeric_limits<size_t>::max()) throw std::invalid_argument("cursor");
+                offset = static_cast<size_t>(parsed);
+            } catch (...) {
+                return tools::utils::MakeToolErrorJson(id, "Cursor must be a non-negative integer offset", "invalid_cursor");
             }
         }
 
@@ -338,26 +333,19 @@ namespace tools::types {
 
         nlohmann::json types_arr = nlohmann::json::array();
         size_t total = 0;
-        int next_offset = -1;
+        size_t next_offset = 0;
+        bool has_next_page = false;
         std::unordered_set<std::string> seen;
 
         sync::SyncRead([&]() {
             std::vector<til_t*> tils_to_search;
             til_t* local_ti = get_idati();
             if (local_ti) {
-                if (til_filter.empty() || til_filter == "all" || til_filter == "local" || (local_ti->name && til_filter == local_ti->name)) {
-                    tils_to_search.push_back(local_ti);
-                }
-                if (!local_only && til_filter != "local") {
-                    for (int b = 0; b < local_ti->nbases; ++b) {
-                        sync::Checkpoint();
-                        til_t* base_ti = local_ti->base[b];
-                        if (!base_ti) continue;
-                        if (!til_filter.empty() && til_filter != "all" && (!base_ti->name || til_filter != base_ti->name)) {
-                            continue;
-                        }
-                        tils_to_search.push_back(base_ti);
-                    }
+                tils_to_search.push_back(local_ti);
+                for (int b = 0; b < local_ti->nbases; ++b) {
+                    sync::Checkpoint();
+                    til_t* base_ti = local_ti->base[b];
+                    if (base_ti) tils_to_search.push_back(base_ti);
                 }
             }
 
@@ -396,7 +384,7 @@ namespace tools::types {
                     }
 
                     if (total >= offset && types_arr.size() < count) {
-                        if (detailed) {
+                        {
                             resolve_tif();
                             nlohmann::ordered_json item;
                             item["name"] = t_name;
@@ -428,18 +416,13 @@ namespace tools::types {
                                 item["til"] = cur_til->name;
                             }
                             types_arr.push_back(std::move(item));
-                        } else {
-                            types_arr.push_back(t_name);
                         }
-                        next_offset = static_cast<int>(total + 1);
+                        next_offset = total + 1;
                     }
                     total++;
                 }
             }
-
-            if (next_offset >= static_cast<int>(total)) {
-                next_offset = -1;
-            }
+            has_next_page = !types_arr.empty() && next_offset < total;
         });
 
         nlohmann::ordered_json res;
@@ -447,25 +430,32 @@ namespace tools::types {
         res["total"] = total;
         res["count"] = types_arr.size();
         res["types"] = types_arr;
-        if (next_offset != -1) {
-
-        }
+        if (has_next_page) res["next_cursor"] = std::to_string(next_offset);
         return tools::utils::MakeToolSuccessJson(id, res);
     }
 
     nlohmann::json ApiTypes::TypeInspect(const nlohmann::json& id, const nlohmann::json& args) {
-        std::string name = tools::utils::GetStringArg(args, "name", tools::utils::GetStringArg(args, "type"));
+        constexpr size_t MAX_TYPE_MEMBERS_RETURNED = 512;
+        const bool internal_payload = args.contains("__ida_mcp_internal_type_payload")
+            && args["__ida_mcp_internal_type_payload"].is_boolean()
+            && args["__ida_mcp_internal_type_payload"].get<bool>();
+        std::string name = tools::utils::GetStringArg(args, "name");
         if (name.empty()) {
+            if (internal_payload)
+                return nlohmann::json{{"status", "error"}, {"error_code", "name_required"}, {"message", "Parameter 'name' is required"}};
             return tools::utils::MakeToolErrorJson(id, "Parameter 'name' is required", "name_required");
         }
 
-        bool show_padding = tools::utils::GetBoolArg(args, "show_padding", true);
 
         std::string decl_str;
         std::string kind = "type";
         std::string target_type;
         size_t type_size = 0;
         size_t total_padding = 0;
+        size_t fields_total = 0;
+        size_t members_total = 0;
+        bool fields_truncated = false;
+        bool members_truncated = false;
         nlohmann::json fields = nlohmann::json::array();
         nlohmann::json members = nlohmann::json::array();
         bool found = false;
@@ -503,8 +493,11 @@ namespace tools::types {
                 // If struct or union, enumerate fields
                 if (tif.is_udt()) {
                     int nmembers = tif.get_udt_nmembers();
+                    fields_total = nmembers > 0 ? static_cast<size_t>(nmembers) : 0;
+                    const int fields_to_read = std::min<int>(std::max(nmembers, 0), static_cast<int>(MAX_TYPE_MEMBERS_RETURNED));
+                    fields_truncated = fields_total > static_cast<size_t>(fields_to_read);
                     uint64 cur_bit = 0;
-                    for (int i = 0; i < nmembers; ++i) {
+                    for (int i = 0; i < fields_to_read; ++i) {
                         sync::Checkpoint();
                         udm_t udm;
                         if (tif.get_udm(&udm, static_cast<size_t>(i)) >= 0) {
@@ -554,13 +547,16 @@ namespace tools::types {
                         }
                     }
 
-                    if (type_size != BADSIZE && type_size * 8 > cur_bit && cur_bit != 0) {
+                    if (!fields_truncated && type_size != BADSIZE && type_size <= BADSIZE / 8 && type_size * 8 > cur_bit && cur_bit != 0) {
                         total_padding += (type_size * 8 - cur_bit) / 8;
                     }
                 } else if (tif.is_enum()) {
                     enum_type_data_t ei;
                     if (tif.get_enum_details(&ei)) {
-                        for (size_t i = 0; i < ei.size(); ++i) {
+                        members_total = ei.size();
+                        const size_t members_to_read = std::min(members_total, MAX_TYPE_MEMBERS_RETURNED);
+                        members_truncated = members_total > members_to_read;
+                        for (size_t i = 0; i < members_to_read; ++i) {
                             sync::Checkpoint();
                             nlohmann::ordered_json m;
                             m["name"] = tools::utils::SanitizeUtf8(ei[i].name.c_str());
@@ -579,6 +575,14 @@ namespace tools::types {
         });
 
         if (!found || decl_str.empty()) {
+            if (internal_payload) {
+                return nlohmann::json{
+                    {"status", "error"},
+                    {"name", name},
+                    {"error_code", "type_not_found"},
+                    {"message", "Type '" + name + "' does not exist in local type library or loaded base TILs"}
+                };
+            }
             return tools::utils::MakeToolErrorJson(
                 id,
                 "Type '" + name + "' does not exist in local type library or loaded base TILs",
@@ -602,12 +606,14 @@ namespace tools::types {
         }
 
         if (kind == "struct" || kind == "union") {
-            res["fields_count"] = fields.size();
-            if (show_padding && total_padding > 0) {
+            res["fields_count"] = fields_total;
+            if (fields_truncated) res["fields_truncated"] = true;
+            if (total_padding > 0) {
                 res["padding_bytes"] = total_padding;
             }
         } else if (kind == "enum") {
-            res["members_count"] = members.size();
+            res["members_count"] = members_total;
+            if (members_truncated) res["members_truncated"] = true;
         }
 
         res["declaration"] = decl_str;
@@ -619,20 +625,16 @@ namespace tools::types {
             res["members"] = std::move(members);
         }
 
+        if (internal_payload) return res;
         return tools::utils::MakeToolSuccessJson(id, res);
     }
 
     nlohmann::json ApiTypes::ReadStruct(const nlohmann::json& id, const nlohmann::json& args) {
         ea_t ea = tools::utils::GetAddressArg(args, "addr");
-        if (ea == BADADDR) ea = tools::utils::GetAddressArg(args, "address");
 
-        std::string struct_name = tools::utils::GetStringArg(args, "name", tools::utils::GetStringArg(args, "struct"));
-        int max_depth = static_cast<int>(tools::utils::GetIntArg(args, "max_depth", 2));
-        if (max_depth <= 0) max_depth = 2;
-        if (max_depth > 5) max_depth = 5;
-        int array_limit = static_cast<int>(tools::utils::GetIntArg(args, "array_limit", 16));
-        if (array_limit <= 0) array_limit = 16;
-        if (array_limit > 128) array_limit = 128;
+        std::string struct_name = tools::utils::GetStringArg(args, "name");
+        constexpr int max_depth = 2;
+        constexpr int array_limit = 16;
 
         if (struct_name.empty()) {
             return tools::utils::MakeToolErrorJson(id, "Parameter 'name' or 'struct' is required", "struct_name_required");
@@ -664,10 +666,11 @@ namespace tools::types {
 
         sync::SyncRead([&]() {
             tinfo_t tif = GetTypeByName(struct_name);
-            if (tif.empty()) return;
+            if (tif.empty() || !tif.is_udt()) return;
 
-            found = true;
             struct_size = tif.get_size();
+            if (struct_size == BADSIZE) return;
+            found = true;
 
             if (struct_size > 0 && struct_size <= 0x100000) {
                 bulk_buf.resize(struct_size, 0);
@@ -693,7 +696,8 @@ namespace tools::types {
                 int arr_lim
             ) -> nlohmann::ordered_json {
                 size_t offset_bytes = f_offset_bits / 8;
-                ea_t field_ea = (base_ea != BADADDR) ? (base_ea + offset_bytes) : BADADDR;
+                ea_t field_ea = (base_ea != BADADDR && offset_bytes < BADADDR - base_ea)
+                    ? (base_ea + offset_bytes) : BADADDR;
 
                 qstring type_str;
                 ftype.print(&type_str, nullptr, PRTYPE_1LINE);
@@ -708,13 +712,13 @@ namespace tools::types {
                 field_obj["name"] = tools::utils::SanitizeUtf8(fname.c_str());
                 field_obj["offset"] = offset_bytes;
                 field_obj["offset_hex"] = hex_off;
-                field_obj["size"] = f_size;
+                if (f_size != BADSIZE) field_obj["size"] = f_size;
                 field_obj["type"] = clean_type;
 
                 auto read_val = [&](size_t sz, uint64_t& out_val) -> bool {
                     if (sz == 0 || sz > 8) return false;
                     size_t root_off = (field_ea != BADADDR && ea != BADADDR && field_ea >= ea) ? static_cast<size_t>(field_ea - ea) : 0;
-                    if (has_bulk && root_off + sz <= bulk_buf.size()) {
+                    if (has_bulk && root_off <= bulk_buf.size() && sz <= bulk_buf.size() - root_off) {
                         out_val = 0;
                         memcpy(&out_val, bulk_buf.data() + root_off, sz);
                         return true;
@@ -763,6 +767,7 @@ namespace tools::types {
                         for (const auto& nm : nested) {
                             sync::Checkpoint();
                             size_t nm_size = nm.type.get_size();
+                            if (nm.offset > std::numeric_limits<size_t>::max() - f_offset_bits) continue;
                             size_t nested_off = f_offset_bits + nm.offset;
                             nested_fields.push_back(
                                 ReadFieldRecursive(base_ea, nm.type, nm.name, nested_off, nm_size, depth + 1, max_d, arr_lim)
@@ -774,15 +779,19 @@ namespace tools::types {
                 // 3. Array: read elements and detect strings
                 else if (ftype.is_array() && depth < max_d) {
                     tinfo_t elem_type;
-                    int nelems_total = -1;
+                    size_t nelems_total = 0;
                     array_type_data_t ai;
                     if (ftype.get_array_details(&ai)) {
                         elem_type = ai.elem_type;
-                        nelems_total = static_cast<int>(ai.nelems);
+                        nelems_total = static_cast<size_t>(ai.nelems);
                     }
 
                     if (!elem_type.empty() && nelems_total > 0) {
                         size_t elem_size = elem_type.get_size();
+                        if (elem_size == 0 || elem_size == BADSIZE || elem_size > std::numeric_limits<size_t>::max() / 8) {
+                            field_obj["array_total"] = nelems_total;
+                            return field_obj;
+                        }
                         field_obj["array_total"] = nelems_total;
 
                         // Check if char array / string
@@ -792,10 +801,14 @@ namespace tools::types {
                             for (size_t c = 0; c < max_read; ++c) {
                                 sync::Checkpoint();
                                 uint8_t b = 0;
-                                size_t root_off = (field_ea != BADADDR && ea != BADADDR && field_ea >= ea) ? static_cast<size_t>(field_ea - ea + c) : 0;
+                                size_t root_off = 0;
+                                if (field_ea != BADADDR && ea != BADADDR && field_ea >= ea) {
+                                    const size_t base_offset = static_cast<size_t>(field_ea - ea);
+                                    if (c <= std::numeric_limits<size_t>::max() - base_offset) root_off = base_offset + c;
+                                }
                                 if (has_bulk && root_off < bulk_buf.size()) {
                                     b = bulk_buf[root_off];
-                                } else if (field_ea != BADADDR && is_mapped(field_ea + c)) {
+                                } else if (field_ea != BADADDR && c < BADADDR - field_ea && is_mapped(field_ea + c)) {
                                     b = get_byte(field_ea + c);
                                 } else {
                                     break;
@@ -811,15 +824,17 @@ namespace tools::types {
                             field_obj["string_value"] = str_val;
                         }
 
-                        int show_count = std::min(nelems_total, arr_lim);
+                        size_t show_count = std::min(nelems_total, static_cast<size_t>(arr_lim));
                         field_obj["array_shown"] = show_count;
 
                         nlohmann::json elems = nlohmann::json::array();
-                        for (int i = 0; i < show_count; ++i) {
+                        for (size_t i = 0; i < show_count; ++i) {
                             sync::Checkpoint();
                             qstring idx_name;
-                            idx_name.sprnt("[%d]", i);
-                            size_t elem_offset_bits = f_offset_bits + static_cast<size_t>(i) * elem_size * 8;
+                            idx_name.sprnt("[%llu]", static_cast<unsigned long long>(i));
+                            const size_t stride_bits = elem_size * 8;
+                            if (i > (std::numeric_limits<size_t>::max() - f_offset_bits) / stride_bits) break;
+                            size_t elem_offset_bits = f_offset_bits + i * stride_bits;
                             elems.push_back(
                                 ReadFieldRecursive(base_ea, elem_type, idx_name, elem_offset_bits, elem_size, depth + 1, max_d, arr_lim)
                             );
@@ -849,8 +864,9 @@ namespace tools::types {
                                 }
                             } else if (ptr_sz == 4 && inf_is_64bit()) {
                                 // 32-bit RVA in 64-bit binary
-                                ea_t rva_target = get_imagebase() + pointed;
-                                if (is_mapped(rva_target)) {
+                                ea_t imagebase = get_imagebase();
+                                ea_t rva_target = pointed < BADADDR - imagebase ? imagebase + pointed : BADADDR;
+                                if (rva_target != BADADDR && is_mapped(rva_target)) {
                                     field_obj["rva_target"] = tools::utils::FormatAddress(rva_target);
                                     qstring rva_name;
                                     get_ea_name(&rva_name, rva_target);
@@ -963,8 +979,6 @@ namespace tools::types {
 
     nlohmann::json ApiTypes::StackFrame(const nlohmann::json& id, const nlohmann::json& args) {
         ea_t ea = tools::utils::GetAddressArg(args, "addr");
-        if (ea == BADADDR) ea = tools::utils::GetAddressArg(args, "func");
-        if (ea == BADADDR) ea = tools::utils::GetAddressArg(args, "function");
 
         if (ea == BADADDR) {
             return tools::utils::MakeToolErrorJson(id, "Parameter 'addr' could not be resolved", "invalid_addr");
@@ -985,12 +999,20 @@ namespace tools::types {
         asize_t argsize = 0;
         asize_t fpd = 0;
 
+        auto to_i64 = [](uint64_t value, int64_t& out) -> bool {
+            if (value > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) return false;
+            out = static_cast<int64_t>(value);
+            return true;
+        };
+        auto subtract_i64 = [](int64_t a, int64_t b, int64_t& out) -> bool {
+            if ((b > 0 && a < std::numeric_limits<int64_t>::min() + b) ||
+                (b < 0 && a > std::numeric_limits<int64_t>::max() + b)) return false;
+            out = a - b;
+            return true;
+        };
+
         sync::SyncRead([&]() {
             func_t* fn = get_func(ea);
-            if (!fn && is_code(get_flags(ea))) {
-                add_func(ea);
-                fn = get_func(ea);
-            }
             if (!fn) return;
 
             found_fn = true;
@@ -1045,17 +1067,20 @@ namespace tools::types {
                             }
                         }
 
-                        // Calculate BP displacement relative to real frame pointer:
-                        int64_t bp_base = static_cast<int64_t>(frsize - fpd);
-                        int64_t bp_disp = static_cast<int64_t>(offset_bytes) - bp_base;
-
                         char hex_off[32];
                         qsnprintf(hex_off, sizeof(hex_off), "0x%llX", (unsigned long long)offset_bytes);
 
                         char bp_hex[32];
-                        if (bp_disp < 0) {
-                            qsnprintf(bp_hex, sizeof(bp_hex), "-0x%llX", (unsigned long long)(-bp_disp));
-                        } else {
+                        int64_t signed_frsize = 0, signed_fpd = 0, bp_base = 0, signed_offset = 0, bp_disp = 0;
+                        bool bp_offset_available = to_i64(static_cast<uint64_t>(frsize), signed_frsize) &&
+                            to_i64(static_cast<uint64_t>(fpd), signed_fpd) &&
+                            to_i64(static_cast<uint64_t>(offset_bytes), signed_offset) &&
+                            subtract_i64(signed_frsize, signed_fpd, bp_base) &&
+                            subtract_i64(signed_offset, bp_base, bp_disp);
+                        if (bp_offset_available && bp_disp < 0) {
+                            const uint64_t magnitude = static_cast<uint64_t>(-(bp_disp + 1)) + 1;
+                            qsnprintf(bp_hex, sizeof(bp_hex), "-0x%llX", (unsigned long long)magnitude);
+                        } else if (bp_offset_available) {
                             qsnprintf(bp_hex, sizeof(bp_hex), "+0x%llX", (unsigned long long)bp_disp);
                         }
 
@@ -1066,9 +1091,13 @@ namespace tools::types {
                         item["offset_hex"] = hex_off;
                         item["sp_offset"] = offset_bytes;
                         item["sp_offset_hex"] = hex_off;
-                        item["bp_offset"] = bp_disp;
-                        item["bp_offset_hex"] = bp_hex;
-                        item["size"] = m_size;
+                        if (bp_offset_available) {
+                            item["bp_offset"] = bp_disp;
+                            item["bp_offset_hex"] = bp_hex;
+                        } else {
+                            item["bp_offset_unavailable"] = true;
+                        }
+                        if (m_size != BADSIZE) item["size"] = m_size;
                         item["type"] = clean_type;
 
                         if (!m.cmt.empty()) {
@@ -1117,11 +1146,18 @@ namespace tools::types {
                                 qsnprintf(stk_hex, sizeof(stk_hex), "0x%llX", (unsigned long long)stkoff);
                                 v_obj["stack_offset_hex"] = stk_hex;
                                 sval_t delta = cfunc->get_stkoff_delta();
+                            const bool offset_overflow =
+                                (delta > 0 && stkoff < std::numeric_limits<sval_t>::min() + delta) ||
+                                (delta < 0 && stkoff > std::numeric_limits<sval_t>::max() + delta);
+                            if (offset_overflow) {
+                                v_obj["ida_stack_offset_unavailable"] = true;
+                            } else {
                                 sval_t ida_stk = stkoff - delta;
                                 v_obj["ida_stack_offset"] = ida_stk;
                                 char ida_hex[32];
                                 qsnprintf(ida_hex, sizeof(ida_hex), "0x%llX", (unsigned long long)ida_stk);
                                 v_obj["ida_stack_offset_hex"] = ida_hex;
+                            }
                                 v_obj["location_detail"] = "stkoff: " + std::string(stk_hex);
                             } else {
                                 v_obj["location"] = "other";
@@ -1177,6 +1213,27 @@ namespace tools::types {
 
         std::string target_var_name = tools::utils::GetStringArg(args, "var");
         std::string struct_name = tools::utils::GetStringArg(args, "struct_name");
+        auto is_identifier = [](const std::string& name) {
+            if (name.empty() || name.size() > 128) return false;
+            auto is_start = [](unsigned char c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_'; };
+            auto is_continue = [&](unsigned char c) { return is_start(c) || (c >= '0' && c <= '9'); };
+            if (!is_start(static_cast<unsigned char>(name.front()))) return false;
+            for (unsigned char c : name) if (!is_continue(c)) return false;
+            static const std::set<std::string> keywords = {
+                "alignas", "alignof", "and", "asm", "auto", "bool", "break", "case", "catch", "char",
+                "class", "const", "constexpr", "continue", "default", "delete", "do", "double", "else",
+                "enum", "explicit", "export", "extern", "false", "float", "for", "friend", "goto", "if",
+                "inline", "int", "long", "namespace", "new", "noexcept", "not", "nullptr", "operator",
+                "or", "private", "protected", "public", "register", "return", "short", "signed", "sizeof",
+                "static", "struct", "switch", "template", "this", "throw", "true", "try", "typedef",
+                "typename", "union", "unsigned", "using", "virtual", "void", "volatile", "while", "xor"
+            };
+            if (keywords.count(name)) return false;
+            return true;
+        };
+        if (!struct_name.empty() && !is_identifier(struct_name)) {
+            return tools::utils::MakeToolErrorJson(id, "struct_name must be a C identifier of at most 128 characters", "invalid_struct_name");
+        }
         int max_depth = static_cast<int>(tools::utils::GetIntArg(args, "scan_depth", 2));
         if (max_depth < 0) max_depth = 0;
         if (max_depth > 5) max_depth = 5;
@@ -1203,16 +1260,92 @@ namespace tools::types {
         bool found_fn = false;
         bool decompiled_ok = false;
         bool applied_ok = false;
+        bool scan_truncated = false;
         std::string apply_error;
+        std::string target_selection_error;
         uint64_t inferred_total_size = 0;
         std::string inferred_size_source;
         nlohmann::json candidate_vars = nlohmann::json::array();
         std::string updated_decompiled_code;
 
+        auto add_i64 = [](int64_t a, int64_t b, int64_t& out) -> bool {
+            if ((b > 0 && a > std::numeric_limits<int64_t>::max() - b) ||
+                (b < 0 && a < std::numeric_limits<int64_t>::min() - b)) return false;
+            out = a + b;
+            return true;
+        };
+        auto sub_i64 = [&](int64_t a, int64_t b, int64_t& out) -> bool {
+            if (b == std::numeric_limits<int64_t>::min()) {
+                if (a >= 0) return false;
+                out = a - b;
+                return true;
+            }
+            return add_i64(a, -b, out);
+        };
+        auto mul_i64_size = [](int64_t value, size_t scale, int64_t& out) -> bool {
+            if (scale == 0) { out = 0; return true; }
+            if (scale > static_cast<size_t>(std::numeric_limits<int64_t>::max())) return false;
+            const int64_t signed_scale = static_cast<int64_t>(scale);
+            if ((value > 0 && value > std::numeric_limits<int64_t>::max() / signed_scale) ||
+                (value < 0 && value < std::numeric_limits<int64_t>::min() / signed_scale)) return false;
+            out = value * signed_scale;
+            return true;
+        };
+        auto get_signed_number = [](const cexpr_t* expr, int64_t& out) -> bool {
+            if (!expr || expr->op != cot_num) return false;
+            uint64_t raw = expr->numval();
+            const int size = expr->type.get_size();
+            if (size > 0 && size < 8) {
+                const uint64_t mask = (uint64_t(1) << (size * 8)) - 1;
+                raw &= mask;
+                const uint64_t sign_bit = uint64_t(1) << (size * 8 - 1);
+                if (!expr->type.is_unsigned() && (raw & sign_bit) != 0) {
+                    out = -1 - static_cast<int64_t>((~raw) & mask);
+                } else {
+                    if (raw > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) return false;
+                    out = static_cast<int64_t>(raw);
+                }
+            } else {
+                if (expr->type.is_unsigned() && raw > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) return false;
+                std::memcpy(&out, &raw, sizeof(out));
+            }
+            return true;
+        };
+        auto apply_relative_offset = [](uint64_t base, int64_t relative, uint64_t& out) -> bool {
+            if (relative < 0) {
+                const uint64_t magnitude = static_cast<uint64_t>(-(relative + 1)) + 1;
+                if (magnitude > base) return false;
+                out = base - magnitude;
+            } else {
+                const uint64_t amount = static_cast<uint64_t>(relative);
+                if (base > std::numeric_limits<uint64_t>::max() - amount) return false;
+                out = base + amount;
+            }
+            return true;
+        };
+        auto add_bounded_size = [&](uint64_t base, uint64_t amount, uint64_t& out) -> bool {
+            if (base > kMaxInferredStructSize || amount > kMaxInferredStructSize - base) return false;
+            out = base + amount;
+            return true;
+        };
+
         auto parse_hexrays_helper = [](const char* helper, size_t& out_offset, size_t& out_size, bool& out_signed) -> bool {
             if (!helper || !*helper) return false;
             std::string h = helper;
             out_signed = false;
+            auto parse_index = [&](size_t start, size_t scale) -> bool {
+                if (start >= h.size()) return false;
+                size_t value = 0;
+                const size_t max_value = std::numeric_limits<size_t>::max() / scale;
+                for (size_t i = start; i < h.size(); ++i) {
+                    if (h[i] < '0' || h[i] > '9') return false;
+                    const size_t digit = static_cast<size_t>(h[i] - '0');
+                    if (value > (max_value - digit) / 10) return false;
+                    value = value * 10 + digit;
+                }
+                out_offset = value * scale;
+                return true;
+            };
             if (h.size() > 1 && h[0] == 'S' && (h[1] == 'L' || h[1] == 'H' || h[1] == 'B' || h[1] == 'W' || h[1] == 'D')) {
                 out_signed = true;
                 h = h.substr(1);
@@ -1220,20 +1353,20 @@ namespace tools::types {
             if (h == "LOBYTE") { out_offset = 0; out_size = 1; return true; }
             if (h == "HIBYTE") { out_offset = 1; out_size = 1; return true; }
             if (h.rfind("BYTE", 0) == 0 && h.size() > 4) {
-                int n = std::atoi(h.c_str() + 4);
-                out_offset = n; out_size = 1; return true;
+                if (!parse_index(4, 1)) return false;
+                out_size = 1; return true;
             }
             if (h == "LOWORD") { out_offset = 0; out_size = 2; return true; }
             if (h == "HIWORD" || h == "WORD1") { out_offset = 2; out_size = 2; return true; }
             if (h.rfind("WORD", 0) == 0 && h.size() > 4) {
-                int n = std::atoi(h.c_str() + 4);
-                out_offset = n * 2; out_size = 2; return true;
+                if (!parse_index(4, 2)) return false;
+                out_size = 2; return true;
             }
             if (h == "LODWORD") { out_offset = 0; out_size = 4; return true; }
             if (h == "HIDWORD" || h == "DWORD1") { out_offset = 4; out_size = 4; return true; }
             if (h.rfind("DWORD", 0) == 0 && h.size() > 5) {
-                int n = std::atoi(h.c_str() + 5);
-                out_offset = n * 4; out_size = 4; return true;
+                if (!parse_index(5, 4)) return false;
+                out_size = 4; return true;
             }
             if (h == "QWORD1") { out_offset = 8; out_size = 8; return true; }
             return false;
@@ -1270,9 +1403,14 @@ namespace tools::types {
             decompiled_ok = true;
 
             const lvars_t* lvars = cf->get_lvars();
-            if (!lvars || lvars->empty()) return;
+            if (!lvars || lvars->empty()) {
+                target_selection_error = "Function has no Hex-Rays variables to reconstruct";
+                return;
+            }
 
-            for (size_t i = 0; i < lvars->size(); ++i) {
+            const size_t candidate_var_limit = std::min<size_t>(lvars->size(), 4096);
+            if (candidate_var_limit < lvars->size()) scan_truncated = true;
+            for (size_t i = 0; i < candidate_var_limit; ++i) {
                 sync::Checkpoint();
                 const auto& lv = (*lvars)[i];
                 qstring tstr;
@@ -1288,7 +1426,7 @@ namespace tools::types {
             int target_idx = -1;
             if (!target_var_name.empty()) {
                 std::string target_lower = target_var_name;
-                for (char& c : target_lower) c = static_cast<char>(std::tolower(c));
+                target_lower = mcp::LowerAscii(std::move(target_lower));
 
                 for (size_t i = 0; i < lvars->size(); ++i) {
                     sync::Checkpoint();
@@ -1301,7 +1439,7 @@ namespace tools::types {
                     for (size_t i = 0; i < lvars->size(); ++i) {
                         sync::Checkpoint();
                         std::string ln = (*lvars)[i].name.c_str();
-                        for (char& c : ln) c = static_cast<char>(std::tolower(c));
+                        ln = mcp::LowerAscii(std::move(ln));
                         if (ln == target_lower) {
                             target_idx = static_cast<int>(i);
                             target_var_name = (*lvars)[i].name.c_str();
@@ -1394,12 +1532,26 @@ namespace tools::types {
                 }
             }
 
-            if (target_idx == -1) return;
+            if (target_idx == -1) {
+                target_selection_error = target_var_name.empty()
+                    ? "No suitable variable was found in the function"
+                    : "Variable '" + target_var_name + "' was not found in the function";
+                return;
+            }
 
             if (struct_name.empty()) {
-                std::string clean_fn = fn_name;
-                while (!clean_fn.empty() && (clean_fn.front() == '.' || clean_fn.front() == '?' || clean_fn.front() == '@')) clean_fn.erase(clean_fn.begin());
-                struct_name = "Struct_" + clean_fn + "_" + target_var_name;
+                auto clean_identifier_part = [](const std::string& input) {
+                    std::string clean;
+                    clean.reserve(input.size());
+                    for (unsigned char c : input) {
+                        const bool valid = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                            (c >= '0' && c <= '9') || c == '_';
+                        clean.push_back(valid ? static_cast<char>(c) : '_');
+                    }
+                    return clean;
+                };
+                struct_name = "Struct_" + clean_identifier_part(fn_name) + "_" + clean_identifier_part(target_var_name);
+                if (struct_name.size() > 128) struct_name.resize(128);
             }
 
             std::unordered_map<ea_t, std::shared_ptr<cfuncptr_t>> cfunc_cache;
@@ -1414,6 +1566,10 @@ namespace tools::types {
                 if (!cur_fn || current_depth > max_depth) return;
                 auto ctx_key = std::make_tuple(cur_fn->start_ea, lvar_idx, base_offset);
                 if (visited_contexts.count(ctx_key)) return;
+                if (visited_contexts.size() >= 128) {
+                    scan_truncated = true;
+                    return;
+                }
                 visited_contexts.insert(ctx_key);
 
                 cfuncptr_t local_cf(nullptr);
@@ -1434,6 +1590,8 @@ namespace tools::types {
                 aliases[lvar_idx] = 0;
 
                 auto is_alias_base = [&](auto& self, const cexpr_t* e, int64_t& out_off) -> bool {
+                    sync::Checkpoint();
+                    sync::RecursionGuard recursion;
                     if (!e) return false;
                     if (e->op == cot_var) {
                         auto ait = aliases.find(e->v.idx);
@@ -1456,12 +1614,13 @@ namespace tools::types {
                                 if (s > 1 && s != BADSIZE) scale = s;
                             }
                         }
-                        if (self(self, e->x, sub_off) && e->y->op == cot_num) {
-                            out_off = sub_off + static_cast<int64_t>(e->y->numval() * scale);
+                        int64_t index = 0, scaled = 0;
+                        if (self(self, e->x, sub_off) && get_signed_number(e->y, index) &&
+                            mul_i64_size(index, scale, scaled) && add_i64(sub_off, scaled, out_off)) {
                             return true;
                         }
-                        if (self(self, e->y, sub_off) && e->x->op == cot_num) {
-                            out_off = sub_off + static_cast<int64_t>(e->x->numval() * scale);
+                        if (self(self, e->y, sub_off) && get_signed_number(e->x, index) &&
+                            mul_i64_size(index, scale, scaled) && add_i64(sub_off, scaled, out_off)) {
                             return true;
                         }
                     }
@@ -1475,8 +1634,9 @@ namespace tools::types {
                                 if (s > 1 && s != BADSIZE) scale = s;
                             }
                         }
-                        if (self(self, e->x, sub_off) && e->y->op == cot_num) {
-                            out_off = sub_off - static_cast<int64_t>(e->y->numval() * scale);
+                        int64_t index = 0, scaled = 0;
+                        if (self(self, e->x, sub_off) && get_signed_number(e->y, index) &&
+                            mul_i64_size(index, scale, scaled) && sub_i64(sub_off, scaled, out_off)) {
                             return true;
                         }
                     }
@@ -1490,8 +1650,9 @@ namespace tools::types {
                         std::map<int, int64_t>& al;
                         decltype(is_alias_base)& is_b;
                         bool& changed;
-                        AliasVisitor(std::map<int, int64_t>& a, decltype(is_alias_base)& b, bool& c)
-                            : ctree_visitor_t(CV_FAST), al(a), is_b(b), changed(c) {}
+                        bool& truncated;
+                        AliasVisitor(std::map<int, int64_t>& a, decltype(is_alias_base)& b, bool& c, bool& tr)
+                            : ctree_visitor_t(CV_FAST), al(a), is_b(b), changed(c), truncated(tr) {}
                         int idaapi visit_expr(cexpr_t* e) override {
                             try {
                                 sync::Checkpoint();
@@ -1500,6 +1661,10 @@ namespace tools::types {
                                         int64_t off = 0;
                                         if (is_b(is_b, e->y, off)) {
                                             if (al.find(e->x->v.idx) == al.end()) {
+                                                if (al.size() >= 4096) {
+                                                    truncated = true;
+                                                    return 1;
+                                                }
                                                 al[e->x->v.idx] = off;
                                                 changed = true;
                                             }
@@ -1513,7 +1678,7 @@ namespace tools::types {
                             }
                         }
                     };
-                    AliasVisitor av(aliases, is_alias_base, new_alias);
+                    AliasVisitor av(aliases, is_alias_base, new_alias, scan_truncated);
                     av.apply_to(&local_cf->body, nullptr);
                     sync::Checkpoint();
                     if (!new_alias) break;
@@ -1525,7 +1690,13 @@ namespace tools::types {
                     decltype(is_alias_base)& is_target;
                     decltype(parse_hexrays_helper)& parse_helper;
                     decltype(get_callee_name)& get_cname;
+                    decltype(add_i64)& add_signed;
+                    decltype(mul_i64_size)& multiply_size;
+                    decltype(get_signed_number)& get_signed;
+                    decltype(apply_relative_offset)& apply_offset;
+                    decltype(add_bounded_size)& add_bounded;
                     std::map<uint64_t, InferredField>& fields;
+                    bool& truncated;
                     int depth;
                     int max_d;
                     uint64_t base_off;
@@ -1535,18 +1706,29 @@ namespace tools::types {
 
                     StructVisitor(const cfunc_t* f, decltype(is_alias_base)& it,
                                   decltype(parse_hexrays_helper)& ph, decltype(get_callee_name)& gc,
-                                  std::map<uint64_t, InferredField>& flds,
+                                  decltype(add_i64)& as, decltype(mul_i64_size)& ms, decltype(get_signed_number)& gs,
+                                  decltype(apply_relative_offset)& ao, decltype(add_bounded_size)& ab,
+                                  std::map<uint64_t, InferredField>& flds, bool& tr,
                                   int d, int md, uint64_t bo, uint64_t& tsz, std::string& tsrc,
                                   std::function<void(func_t*, int, int, uint64_t)> rf)
                         : ctree_visitor_t(CV_FAST), cf(f), is_target(it), parse_helper(ph), get_cname(gc),
-                          fields(flds), depth(d), max_d(md), base_off(bo), total_sz(tsz), total_sz_src(tsrc),
+                          add_signed(as), multiply_size(ms), get_signed(gs), apply_offset(ao), add_bounded(ab),
+                          fields(flds), truncated(tr), depth(d), max_d(md), base_off(bo), total_sz(tsz), total_sz_src(tsrc),
                           recurse_fn(rf) {}
 
                     void record_access(uint64_t f_off, size_t sz, tinfo_t tif, bool is_write,
                                        const std::string& type_override = "", ea_t vtbl_ea = BADADDR) {
                         if (sz == 0 || sz > 128) sz = inf_is_64bit() ? 8 : 4;
+                        if (f_off >= kMaxInferredStructSize || sz > kMaxInferredStructSize - f_off) {
+                            truncated = true;
+                            return;
+                        }
                         auto fit = fields.find(f_off);
                         if (fit == fields.end()) {
+                            if (fields.size() >= 4096) {
+                                truncated = true;
+                                return;
+                            }
                             InferredField f;
                             f.offset = f_off;
                             f.size = sz;
@@ -1612,11 +1794,12 @@ namespace tools::types {
                             if (e->op == cot_ptr && e->x) {
                                 int64_t off = 0;
                                 if (is_target(is_target, e->x, off)) {
-                                    int64_t signed_final = static_cast<int64_t>(base_off) + off;
-                                    if (signed_final >= 0) {
-                                        uint64_t final_off = static_cast<uint64_t>(signed_final);
+                                    uint64_t final_off = 0;
+                                    if (apply_offset(base_off, off, final_off)) {
                                         size_t sz = e->ptrsize > 0 ? static_cast<size_t>(e->ptrsize) : e->type.get_size();
                                         record_access(final_off, sz, e->type, is_write);
+                                    } else {
+                                        truncated = true;
                                     }
                                 }
                             }
@@ -1625,11 +1808,15 @@ namespace tools::types {
                             if ((e->op == cot_memptr || e->op == cot_memref) && e->x) {
                                 int64_t off = 0;
                                 if (is_target(is_target, e->x, off)) {
-                                    int64_t signed_final = static_cast<int64_t>(base_off) + off + static_cast<int64_t>(e->m);
-                                    if (signed_final >= 0) {
-                                        uint64_t final_off = static_cast<uint64_t>(signed_final);
+                                    int64_t relative_off = 0;
+                                    uint64_t final_off = 0;
+                                    if (static_cast<uint64_t>(e->m) <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) &&
+                                        add_signed(off, static_cast<int64_t>(e->m), relative_off) &&
+                                        apply_offset(base_off, relative_off, final_off)) {
                                         size_t sz = e->ptrsize > 0 ? static_cast<size_t>(e->ptrsize) : e->type.get_size();
                                         record_access(final_off, sz, e->type, is_write);
+                                    } else {
+                                        truncated = true;
                                     }
                                 }
                             }
@@ -1640,10 +1827,13 @@ namespace tools::types {
                                 if (is_target(is_target, e->x, off)) {
                                     size_t elem_sz = e->type.get_size();
                                     if (elem_sz <= 0 || elem_sz == BADSIZE) elem_sz = 1;
-                                    int64_t signed_final = static_cast<int64_t>(base_off) + off + static_cast<int64_t>(e->y->numval() * elem_sz);
-                                    if (signed_final >= 0) {
-                                        uint64_t final_off = static_cast<uint64_t>(signed_final);
+                                    int64_t index = 0, scaled = 0, relative_off = 0;
+                                    uint64_t final_off = 0;
+                                    if (get_signed(e->y, index) && multiply_size(index, elem_sz, scaled) &&
+                                        add_signed(off, scaled, relative_off) && apply_offset(base_off, relative_off, final_off)) {
                                         record_access(final_off, elem_sz, e->type, is_write);
+                                    } else {
+                                        truncated = true;
                                     }
                                 }
                             }
@@ -1655,11 +1845,15 @@ namespace tools::types {
                                 if (parse_helper(e->x->helper, h_off, h_sz, h_signed)) {
                                     int64_t off = 0;
                                     if (is_target(is_target, &(*e->a)[0], off)) {
-                                        int64_t signed_final = static_cast<int64_t>(base_off) + off + static_cast<int64_t>(h_off);
-                                        if (signed_final >= 0) {
-                                            uint64_t final_off = static_cast<uint64_t>(signed_final);
+                                        int64_t relative_off = 0;
+                                        uint64_t final_off = 0;
+                                        if (h_off <= static_cast<size_t>(std::numeric_limits<int64_t>::max()) &&
+                                            add_signed(off, static_cast<int64_t>(h_off), relative_off) &&
+                                            apply_offset(base_off, relative_off, final_off)) {
                                             std::string t = h_signed ? ("int" + std::to_string(h_sz * 8) + "_t") : ("uint" + std::to_string(h_sz * 8) + "_t");
                                             record_access(final_off, h_sz, tinfo_t(), is_write, t);
+                                        } else {
+                                            truncated = true;
                                         }
                                     }
                                 }
@@ -1675,21 +1869,32 @@ namespace tools::types {
                                     sz = e->x->ptrsize > 0 ? static_cast<size_t>(e->x->ptrsize) : e->x->type.get_size();
                                     is_field_write = true;
                                 } else if ((e->x->op == cot_memptr || e->x->op == cot_memref) && e->x->x && is_target(is_target, e->x->x, off)) {
-                                    off += e->x->m;
+                                    int64_t combined = 0;
+                                    if (static_cast<uint64_t>(e->x->m) > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+                                        !add_signed(off, static_cast<int64_t>(e->x->m), combined)) {
+                                        truncated = true;
+                                        return 0;
+                                    }
+                                    off = combined;
                                     sz = e->x->ptrsize > 0 ? static_cast<size_t>(e->x->ptrsize) : e->x->type.get_size();
                                     is_field_write = true;
                                 } else if (e->x->op == cot_idx && e->x->x && is_target(is_target, e->x->x, off) && e->x->y && e->x->y->op == cot_num) {
                                     size_t elem_sz = e->x->type.get_size();
                                     if (elem_sz <= 0 || elem_sz == BADSIZE) elem_sz = 1;
-                                    off += e->x->y->numval() * elem_sz;
+                                    int64_t index = 0, scaled = 0, combined = 0;
+                                    if (!get_signed(e->x->y, index) || !multiply_size(index, elem_sz, scaled) ||
+                                        !add_signed(off, scaled, combined)) {
+                                        truncated = true;
+                                        return 0;
+                                    }
+                                    off = combined;
                                     sz = elem_sz;
                                     is_field_write = true;
                                 }
 
                                 if (is_field_write) {
-                                    int64_t signed_final = static_cast<int64_t>(base_off) + off;
-                                    if (signed_final >= 0) {
-                                        uint64_t final_off = static_cast<uint64_t>(signed_final);
+                                    uint64_t final_off = 0;
+                                    if (apply_offset(base_off, off, final_off)) {
                                         const cexpr_t* r = e->y;
                                         while (r && r->op == cot_cast) r = r->x;
 
@@ -1702,10 +1907,24 @@ namespace tools::types {
                                         if (vtbl_ea != BADADDR) {
                                             bool is_vtbl = false;
                                             segment_t* seg = getseg(vtbl_ea);
-                                            if (seg && !(seg->perm & SEGPERM_WRITE)) {
-                                                ea_t first_method = get_qword(vtbl_ea);
-                                                if (first_method != 0 && first_method != BADADDR && get_func(first_method)) {
-                                                    is_vtbl = true;
+                                            const size_t pointer_size = inf_is_64bit() ? 8 : 4;
+                                            if (seg && !(seg->perm & SEGPERM_WRITE) && vtbl_ea <= BADADDR - pointer_size &&
+                                                vtbl_ea + pointer_size <= seg->end_ea) {
+                                                bool pointer_loaded = true;
+                                                for (size_t byte_idx = 0; byte_idx < pointer_size; ++byte_idx) {
+                                                    sync::Checkpoint();
+                                                    if (!is_loaded(vtbl_ea + byte_idx)) {
+                                                        pointer_loaded = false;
+                                                        break;
+                                                    }
+                                                }
+                                                if (pointer_loaded) {
+                                                    ea_t first_method = inf_is_64bit()
+                                                        ? get_qword(vtbl_ea)
+                                                        : static_cast<ea_t>(get_dword(vtbl_ea));
+                                                    if (first_method != 0 && first_method != BADADDR && get_func(first_method)) {
+                                                        is_vtbl = true;
+                                                    }
                                                 }
                                             }
                                             qstring sym_name;
@@ -1738,24 +1957,41 @@ namespace tools::types {
                                         std::string cname = get_cname(rhs_call);
                                         if (!cname.empty()) {
                                             std::string lc = cname;
-                                            for (char& c : lc) c = static_cast<char>(std::tolower(c));
+                                            lc = mcp::LowerAscii(std::move(lc));
                                             uint64_t alloc_sz = 0;
                                             if (lc.find("new") != std::string::npos || lc.find("malloc") != std::string::npos) {
                                                 if (!rhs_call->a->empty() && (*rhs_call->a)[0].op == cot_num) {
-                                                    alloc_sz = (*rhs_call->a)[0].numval();
+                                                    int64_t parsed_size = 0;
+                                                    if (get_signed(&(*rhs_call->a)[0], parsed_size) && parsed_size > 0)
+                                                        alloc_sz = static_cast<uint64_t>(parsed_size);
                                                 }
                                             } else if (lc.find("calloc") != std::string::npos) {
                                                 if (rhs_call->a->size() >= 2 && (*rhs_call->a)[0].op == cot_num && (*rhs_call->a)[1].op == cot_num) {
-                                                    alloc_sz = (*rhs_call->a)[0].numval() * (*rhs_call->a)[1].numval();
+                                                    int64_t count = 0, element_size = 0;
+                                                    if (get_signed(&(*rhs_call->a)[0], count) &&
+                                                        get_signed(&(*rhs_call->a)[1], element_size) &&
+                                                        count > 0 && element_size > 0 &&
+                                                        static_cast<uint64_t>(count) <= kMaxInferredStructSize / static_cast<uint64_t>(element_size)) {
+                                                        alloc_sz = static_cast<uint64_t>(count) * static_cast<uint64_t>(element_size);
+                                                    } else {
+                                                        truncated = true;
+                                                    }
                                                 }
                                             } else if (lc.find("heapalloc") != std::string::npos) {
                                                 if (rhs_call->a->size() >= 3 && (*rhs_call->a)[2].op == cot_num) {
-                                                    alloc_sz = (*rhs_call->a)[2].numval();
+                                                    int64_t parsed_size = 0;
+                                                    if (get_signed(&(*rhs_call->a)[2], parsed_size) && parsed_size > 0)
+                                                        alloc_sz = static_cast<uint64_t>(parsed_size);
                                                 }
                                             }
-                                            if (alloc_sz > 0 && alloc_sz < 0x200000) {
-                                                total_sz = std::max(total_sz, base_off + alloc_sz);
-                                                total_sz_src = "allocation (" + cname + ")";
+                                            if (alloc_sz > 0) {
+                                                uint64_t allocation_end = 0;
+                                                if (add_bounded(base_off, alloc_sz, allocation_end)) {
+                                                    total_sz = std::max(total_sz, allocation_end);
+                                                    total_sz_src = "allocation (" + cname + ")";
+                                                } else {
+                                                    truncated = true;
+                                                }
                                             }
                                         }
                                     }
@@ -1767,7 +2003,7 @@ namespace tools::types {
                                 std::string call_name = get_cname(e);
                                 if (!call_name.empty()) {
                                     std::string lc = call_name;
-                                    for (char& c : lc) c = static_cast<char>(std::tolower(c));
+                                    lc = mcp::LowerAscii(std::move(lc));
 
                                     if (lc.find("memset") != std::string::npos ||
                                         lc.find("memzero") != std::string::npos ||
@@ -1778,9 +2014,14 @@ namespace tools::types {
                                             if (is_target(is_target, &(*e->a)[0], off)) {
                                                 if ((*e->a)[2].op == cot_num) {
                                                     uint64_t set_sz = (*e->a)[2].numval();
-                                                    if (set_sz > 0 && set_sz < 0x200000) {
-                                                        total_sz = std::max(total_sz, static_cast<uint64_t>(base_off + off + set_sz));
-                                                        total_sz_src = "memset";
+                                                    if (set_sz > 0) {
+                                                        uint64_t start_off = 0, end_off = 0;
+                                                        if (apply_offset(base_off, off, start_off) && add_bounded(start_off, set_sz, end_off)) {
+                                                            total_sz = std::max(total_sz, end_off);
+                                                            total_sz_src = "memset";
+                                                        } else {
+                                                            truncated = true;
+                                                        }
                                                     }
                                                 }
                                             }
@@ -1793,17 +2034,27 @@ namespace tools::types {
                                             if (is_target(is_target, &(*e->a)[0], off_dst)) {
                                                 if ((*e->a)[2].op == cot_num) {
                                                     uint64_t cpy_sz = (*e->a)[2].numval();
-                                                    if (cpy_sz > 0 && cpy_sz < 0x200000) {
-                                                        total_sz = std::max(total_sz, static_cast<uint64_t>(base_off + off_dst + cpy_sz));
-                                                        total_sz_src = "memcpy";
+                                                    if (cpy_sz > 0) {
+                                                        uint64_t start_off = 0, end_off = 0;
+                                                        if (apply_offset(base_off, off_dst, start_off) && add_bounded(start_off, cpy_sz, end_off)) {
+                                                            total_sz = std::max(total_sz, end_off);
+                                                            total_sz_src = "memcpy";
+                                                        } else {
+                                                            truncated = true;
+                                                        }
                                                     }
                                                 }
                                             } else if (is_target(is_target, &(*e->a)[1], off_src)) {
                                                 if ((*e->a)[2].op == cot_num) {
                                                     uint64_t cpy_sz = (*e->a)[2].numval();
-                                                    if (cpy_sz > 0 && cpy_sz < 0x200000) {
-                                                        total_sz = std::max(total_sz, static_cast<uint64_t>(base_off + off_src + cpy_sz));
-                                                        total_sz_src = "memcpy";
+                                                    if (cpy_sz > 0) {
+                                                        uint64_t start_off = 0, end_off = 0;
+                                                        if (apply_offset(base_off, off_src, start_off) && add_bounded(start_off, cpy_sz, end_off)) {
+                                                            total_sz = std::max(total_sz, end_off);
+                                                            total_sz_src = "memcpy";
+                                                        } else {
+                                                            truncated = true;
+                                                        }
                                                     }
                                                 }
                                             }
@@ -1822,8 +2073,9 @@ namespace tools::types {
                                             sync::Checkpoint();
                                             int64_t off = 0;
                                             if (is_target(is_target, &(*e->a)[a_idx], off)) {
-                                                int64_t next_base = static_cast<int64_t>(base_off) + off;
-                                                if (next_base >= 0) {
+                                                uint64_t next_base = 0;
+                                                const bool have_next_base = apply_offset(base_off, off, next_base);
+                                                if (have_next_base && next_base <= kMaxInferredStructSize) {
                                                     hexrays_failure_t c_hf;
                                                     cfuncptr_t callee_cf = decompile(callee_fn, &c_hf, DECOMP_WARNINGS | DECOMP_NO_WAIT);
                                                     if (callee_cf) {
@@ -1834,7 +2086,7 @@ namespace tools::types {
                                                                 sync::Checkpoint();
                                                                 if ((*callee_lvars)[k].is_arg_var()) {
                                                                     if (arg_counter == a_idx) {
-                                                                        recurse_fn(callee_fn, static_cast<int>(k), depth + 1, static_cast<uint64_t>(next_base));
+                                                                        recurse_fn(callee_fn, static_cast<int>(k), depth + 1, next_base);
                                                                         break;
                                                                     }
                                                                     arg_counter++;
@@ -1842,6 +2094,8 @@ namespace tools::types {
                                                             }
                                                         }
                                                     }
+                                                } else if (have_next_base) {
+                                                    truncated = true;
                                                 }
                                             }
                                         }
@@ -1858,7 +2112,8 @@ namespace tools::types {
                 };
 
                 StructVisitor visitor(local_cf, is_alias_base, parse_hexrays_helper, get_callee_name,
-                                      observed_fields, current_depth, max_depth, base_offset,
+                                      add_i64, mul_i64_size, get_signed_number, apply_relative_offset, add_bounded_size,
+                                      observed_fields, scan_truncated, current_depth, max_depth, base_offset,
                                       inferred_total_size, inferred_size_source, scan_fn);
                 visitor.apply_to(&local_cf->body, nullptr);
                 sync::Checkpoint();
@@ -1872,6 +2127,9 @@ namespace tools::types {
         }
         if (!decompiled_ok) {
             return tools::utils::MakeToolErrorJson(id, "Decompilation failed for function", "decompile_failed");
+        }
+        if (!target_selection_error.empty()) {
+            return tools::utils::MakeToolErrorJson(id, target_selection_error, "variable_not_found");
         }
 
         // Reconcile overlapping fields: split larger primitives when sub-accesses occur inside them
@@ -2058,6 +2316,7 @@ namespace tools::types {
             res["size_source"] = inferred_size_source;
         }
         res["applied"] = applied_ok;
+        if (scan_truncated) res["truncated"] = true;
         if (!apply_error.empty()) {
             res["apply_error"] = apply_error;
         }

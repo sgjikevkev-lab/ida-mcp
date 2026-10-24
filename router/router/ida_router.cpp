@@ -52,7 +52,8 @@ namespace router {
                 {"description", "List all currently open binaries across active IDA Pro instances and show active selection."},
                 {"inputSchema", {
                     {"type", "object"},
-                    {"properties", mcp::json::object()}
+                    {"properties", mcp::json::object()},
+                    {"additionalProperties", false}
                 }}
             },
             {
@@ -66,7 +67,8 @@ namespace router {
                             {"description", "Target binary filename to activate (e.g. 'target.exe')"}
                         }}
                     }},
-                    {"required", {"filename"}}
+                    {"required", {"filename"}},
+                    {"additionalProperties", false}
                 }}
             }
         });
@@ -387,6 +389,11 @@ namespace router {
             if (worker_thread_.joinable()) worker_thread_.join();
             RefreshInstances();
         }
+        // Generate the cancellation token before publishing busy state. A
+        // throwing random_device must not strand the router in a busy state.
+        std::random_device entropy;
+        const std::string cancel_token = std::to_string(entropy()) + "-" +
+            std::to_string(entropy()) + "-" + std::to_string(entropy());
         {
             std::lock_guard<std::mutex> lock(status_mtx_);
             if (is_busy_) {
@@ -414,8 +421,7 @@ namespace router {
             is_busy_ = true;
             active_tool_ = name;
             active_request_id_ = id;
-            std::random_device entropy;
-            active_cancel_token_ = std::to_string(entropy()) + "-" + std::to_string(entropy()) + "-" + std::to_string(entropy());
+            active_cancel_token_ = cancel_token;
             active_tool_args_ = (args.is_null() || args.empty()) ? "" : args.dump();
             if (active_tool_args_.size() > 200) {
                 active_tool_args_ = active_tool_args_.substr(0, 197) + "...";
@@ -423,7 +429,8 @@ namespace router {
             active_tool_start_ = std::chrono::steady_clock::now();
         }
 
-        worker_thread_ = std::thread([this, req, id, raw_tool_call]() {
+        try {
+            worker_thread_ = std::thread([this, req, id, raw_tool_call]() {
             try {
                 ForwardToolCall(req, id, raw_tool_call);
             } catch (const std::exception& e) {
@@ -454,7 +461,23 @@ namespace router {
                 active_tool_.clear();
                 active_tool_args_.clear();
             }
-        });
+            });
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lock(status_mtx_);
+                if (is_busy_ && active_request_id_ == id) {
+                    is_busy_ = false;
+                    active_tool_.clear();
+                    active_tool_args_.clear();
+                    active_cancel_token_.clear();
+                }
+            }
+            mcp::StdioTransport::Send(mcp::MakeSuccessResponse(id,
+                mcp::MakeToolCallResult(mcp::json({
+                    {"error_code", "worker_start_failed"},
+                    {"message", "Could not start the tool worker thread"}
+                }).dump(), true)));
+        }
     }
 
     void IdaRouter::HandleToolsCall(const mcp::json& req, const mcp::json& id, const std::string& raw_tool_call) {

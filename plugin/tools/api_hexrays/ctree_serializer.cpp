@@ -646,6 +646,8 @@ namespace tools::hexrays_ast {
                     if (!pattern["args"].is_array()) return false;
                     const auto& pat_args = pattern["args"];
                     size_t actual_count = e->a ? e->a->size() : 0;
+                    const bool allow_extra_args = !pat_args.empty() && pat_args.back().is_string() &&
+                        pat_args.back().get<std::string>() == "$_";
 
                     for (size_t ai = 0; ai < pat_args.size(); ++ai) {
                         sync::Checkpoint();
@@ -657,7 +659,7 @@ namespace tools::hexrays_ast {
                         const carg_t& arg = (*e->a)[ai];
                         if (!MatchPattern(&arg, cf, pat_args[ai], bindings)) return false;
                     }
-                    if (pat_args.size() < actual_count && !(pat_args.back().is_string() && pat_args.back().get<std::string>() == "$_")) {
+                    if (pat_args.size() < actual_count && !allow_extra_args) {
                         return false;
                     }
                 }
