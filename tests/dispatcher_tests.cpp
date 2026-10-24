@@ -28,6 +28,7 @@ int main() {
         server::MainThreadDispatcher dispatcher;
         auto first = dispatcher.Submit(1, "get_bytes", [] {
             Check(batch, "ordinary tools must suppress dialogs");
+            Check(test_ui_hook != nullptr, "ordinary tools must install the file-dialog guard");
             return std::string("first-result");
         });
         Check(!dispatcher.Submit(2, "get_bytes", [] { return std::string(); }), "must reject overlapping jobs");
@@ -36,6 +37,7 @@ int main() {
         Check(!batch && destroyed_requests == 0, "restore batch; retain request through IDA dispatch return");
         auto python = dispatcher.Submit(2, "py", [] {
             Check(!batch, "Python manual cancellation must stay interactive");
+            Check(test_ui_hook == nullptr, "Python must not install the file-dialog guard");
             throw std::runtime_error("test-failure");
             return std::string();
         });

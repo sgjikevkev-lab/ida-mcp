@@ -36,7 +36,7 @@ The router keeps protocol heartbeat requests responsive while a worker waits for
 
 The fixed operation deadline is **30 minutes**. Loops, recursive analysis and Python tracing check cancellation. MCP cancellation notifications are supported. The backend remains busy until an already-running operation actually stops; a timeout never falsely reports it idle. Native IDA calls and Python extensions cannot be forcibly interrupted safely in the GUI process.
 
-Ordinary tools run in the SDK's unattended `batch` scope, with decompiler wait boxes disabled. Python retains IDAPython's interactive cancellation behavior. A caught native fault quarantines the backend; restart IDA before running further database tools.
+Ordinary tools run in the SDK's unattended `batch` scope, with decompiler wait boxes disabled. IDA 9.2 does not suppress `ask_file` in batch mode, so ordinary tools also block that SDK request and return an empty path. Python retains IDAPython's interactive cancellation behavior. A caught native fault quarantines the backend; restart IDA before running further database tools.
 
 There is no guarantee against every native crash or unrelated third-party GUI callback. A hard stop for uninterruptible SDK code requires a separate process/database backend. See [architecture review](docs/architecture.md) for the ownership rules, discovered defects, changes and limits.
 
@@ -44,7 +44,7 @@ There is no guarantee against every native crash or unrelated third-party GUI ca
 
 Build outputs are in `bin/Release`:
 
-- Put `ida_mcp64.dll` in the IDA Pro 9.2 `plugins` directory, then restart IDA.
+- Put `ida_mcp64.dll` in the IDA Pro 9.2 `plugins` directory, then restart IDA. RAX is statically linked into the plugin.
 - Register the built `router.exe` as a stdio MCP server.
 
 ```json
@@ -97,11 +97,13 @@ The router discovers plugin pipes. If several databases are open, call `get_avai
 | `trace_data_flow` | Bounded interprocedural variable/data-flow analysis |
 | `py` | Run code or a script file with bounded stdout/stderr capture |
 
+RAX is available where its machine-level view removes work for the model: `disasm` and `insn_query` can return per-instruction effects, `analyze_function` can add a compact aggregate with `semantic_summary: true`, and `trace_data_flow` supports bounded x86-64 register def-use across CFG blocks with `machine_level: true`. Partial/unsupported lifts and machine-trace boundaries are reported; the machine trace does not model memory aliases, control dependencies, or calls. See [RAX integration notes](plugin/third_party/rax/README.md).
+
 The tool catalog supplies exact arguments, bounds and descriptions. Analytical heuristics and traversal limits are not proofs of exhaustive behavior.
 
 ## Build and checks
 
-Use Visual Studio with the v145 C++ toolset and Windows SDK. The solution contains the router and plugin; `shared/json.h` is their single vendored JSON dependency.
+Use Visual Studio with the v145 C++ toolset and Windows SDK. The solution contains the router and plugin; the plugin links the bundled Windows x86-64 RAX static library from `plugin/third_party/rax/lib/rax.lib` and does not need Git, Cargo/Rust, or network access to build.
 
 From a Visual Studio developer PowerShell:
 

@@ -6,6 +6,9 @@
 #include <set>
 #include <queue>
 #include <charconv>
+#include <array>
+#include <cctype>
+#include <deque>
 
 #pragma warning(push, 0)
 #include "json.h"
@@ -14,8 +17,10 @@
 #include "api_composite.h"
 #include "tools/utils/utils.h"
 #include "sync/sync.h"
+#include "third_party/rax/rax_bridge.h"
 
 #include <ida.hpp>
+#include <bytes.hpp>
 #include <bytes.hpp>
 #include <funcs.hpp>
 #include <name.hpp>
@@ -33,6 +38,475 @@
 
 namespace tools::composite {
     namespace { constexpr size_t kMaxTraceCollectedItems = 50000; }
+    namespace {
+        constexpr size_t kMaxRaxFunctionInstructions = 2048;
+
+        struct RaxFunctionSummary {
+            size_t instructions_seen = 0;
+            size_t analyzed = 0;
+            size_t complete = 0;
+            size_t partial = 0;
+            size_t unsupported = 0;
+            size_t invalid = 0;
+            size_t mismatched = 0;
+            size_t unavailable = 0;
+            size_t memory_reads = 0;
+            size_t memory_writes = 0;
+            bool truncated = false;
+            std::set<std::string> registers_read;
+            std::set<std::string> registers_written;
+            std::set<std::string> flags_read;
+            std::set<std::string> flags_written;
+            std::map<std::string, size_t> control_flow;
+
+            void Analyze(ea_t ea) {
+                sync::Checkpoint();
+                if (!is_code(get_full_flags(ea))) return;
+                if (++instructions_seen > kMaxRaxFunctionInstructions) {
+                    truncated = true;
+                    return;
+                }
+                const size_t item_size = get_item_size(ea);
+                segment_t* segment = getseg(ea);
+                if (item_size == 0 || item_size > 15 || !segment || ea > BADADDR - item_size ||
+                    ea + item_size > segment->end_ea) {
+                    ++unavailable;
+                    return;
+                }
+                std::array<uint8_t, 15> bytes{};
+                for (size_t i = 0; i < item_size; ++i) {
+                    if (!is_loaded(ea + i)) {
+                        ++unavailable;
+                        return;
+                    }
+                    bytes[i] = static_cast<uint8_t>(get_byte(ea + i));
+                }
+
+                ++analyzed;
+                nlohmann::ordered_json semantics = tools::rax::AnalyzeX64(ea, bytes.data(), item_size);
+                const std::string status = semantics.value("status", std::string("error"));
+                if (status == "complete") ++complete;
+                else if (status == "partial") ++partial;
+                else if (status == "unsupported") ++unsupported;
+                else if (status == "invalid_instruction") ++invalid;
+                else ++unavailable;
+
+                if (semantics.contains("size") && semantics["size"].is_number() &&
+                    semantics["size"].get<size_t>() != item_size) {
+                    ++mismatched;
+                    return;
+                }
+                if (semantics.contains("control_flow") && semantics["control_flow"].is_string())
+                    ++control_flow[semantics["control_flow"].get<std::string>()];
+                for (const auto& flag : semantics.value("flags_read", nlohmann::ordered_json::array()))
+                    if (flag.is_string()) flags_read.insert(flag.get<std::string>());
+                for (const auto& flag : semantics.value("flags_written", nlohmann::ordered_json::array()))
+                    if (flag.is_string()) flags_written.insert(flag.get<std::string>());
+                if (!semantics.contains("effects") || !semantics["effects"].is_array()) return;
+                for (const auto& effect : semantics["effects"]) {
+                    if (!effect.contains("access") || !effect["access"].is_array()) continue;
+                    const bool reads = std::find(effect["access"].begin(), effect["access"].end(), "read") != effect["access"].end();
+                    const bool writes = std::find(effect["access"].begin(), effect["access"].end(), "write") != effect["access"].end();
+                    if (effect.value("kind", std::string()) == "register" && effect.contains("register") && effect["register"].is_string()) {
+                        const auto reg = effect["register"].get<std::string>();
+                        if (reads) registers_read.insert(reg);
+                        if (writes) registers_written.insert(reg);
+                    } else if (effect.value("kind", std::string()) == "memory") {
+                        if (reads) ++memory_reads;
+                        if (writes) ++memory_writes;
+                    }
+                }
+            }
+
+            nlohmann::ordered_json ToJson() const {
+                auto string_array = [](const std::set<std::string>& values) {
+                    nlohmann::ordered_json out = nlohmann::ordered_json::array();
+                    for (const auto& value : values) out.push_back(value);
+                    return out;
+                };
+                nlohmann::ordered_json flows = nlohmann::ordered_json::object();
+                for (const auto& [kind, count] : control_flow) flows[kind] = count;
+                return {
+                    {"engine", "RAX"},
+                    {"architecture", "x86-64"},
+                    {"instructions_total", instructions_seen},
+                    {"instructions_analyzed", analyzed},
+                    {"instructions_complete", complete},
+                    {"instructions_partial", partial},
+                    {"instructions_unsupported", unsupported},
+                    {"instructions_invalid", invalid},
+                    {"instructions_unavailable", unavailable},
+                    {"decode_mismatches", mismatched},
+                    {"registers_read", string_array(registers_read)},
+                    {"registers_written", string_array(registers_written)},
+                    {"flags_read", string_array(flags_read)},
+                    {"flags_written", string_array(flags_written)},
+                    {"memory_reads", memory_reads},
+                    {"memory_writes", memory_writes},
+                    {"control_flow", std::move(flows)},
+                    {"truncated", truncated}
+                };
+            }
+        };
+
+        std::string CanonicalX64Register(std::string name) {
+            std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            if (name == "rflags" || name == "eflags" || name == "flags" ||
+                name == "rip" || name == "eip")
+                return name == "rip" || name == "eip" ? "rip" : "flags";
+            static const std::map<std::string, std::string> aliases = {
+                {"rax", "rax"}, {"eax", "rax"}, {"ax", "rax"}, {"al", "rax"}, {"ah", "rax"},
+                {"rcx", "rcx"}, {"ecx", "rcx"}, {"cx", "rcx"}, {"cl", "rcx"}, {"ch", "rcx"},
+                {"rdx", "rdx"}, {"edx", "rdx"}, {"dx", "rdx"}, {"dl", "rdx"}, {"dh", "rdx"},
+                {"rbx", "rbx"}, {"ebx", "rbx"}, {"bx", "rbx"}, {"bl", "rbx"}, {"bh", "rbx"},
+                {"rsp", "rsp"}, {"esp", "rsp"}, {"sp", "rsp"}, {"spl", "rsp"},
+                {"rbp", "rbp"}, {"ebp", "rbp"}, {"bp", "rbp"}, {"bpl", "rbp"},
+                {"rsi", "rsi"}, {"esi", "rsi"}, {"si", "rsi"}, {"sil", "rsi"},
+                {"rdi", "rdi"}, {"edi", "rdi"}, {"di", "rdi"}, {"dil", "rdi"}
+            };
+            auto found = aliases.find(name);
+            if (found != aliases.end()) return found->second;
+            if (name.size() >= 2 && name[0] == 'r') {
+                size_t digits_end = 1;
+                while (digits_end < name.size() && std::isdigit(static_cast<unsigned char>(name[digits_end])))
+                    ++digits_end;
+                if (digits_end > 1) {
+                    int index = 0;
+                    try { index = std::stoi(name.substr(1, digits_end - 1)); }
+                    catch (...) { return {}; }
+                    const std::string suffix = name.substr(digits_end);
+                    if (index >= 8 && index <= 31 &&
+                        (suffix.empty() || suffix == "d" || suffix == "w" || suffix == "b"))
+                        return "r" + std::to_string(index);
+                }
+            }
+            if (name.size() >= 4 && (name.rfind("xmm", 0) == 0 || name.rfind("ymm", 0) == 0 || name.rfind("zmm", 0) == 0)) {
+                const size_t digits_start = 3;
+                if (std::all_of(name.begin() + digits_start, name.end(), [](unsigned char c) { return std::isdigit(c); })) {
+                    try {
+                        const int index = std::stoi(name.substr(digits_start));
+                        if (index >= 0 && index <= 31) return "vec" + std::to_string(index);
+                    } catch (...) {
+                        return {};
+                    }
+                }
+            }
+            return {};
+        }
+
+        struct MachineInstruction {
+            ea_t address = BADADDR;
+            std::string control_flow = "unknown";
+            bool complete = false;
+            std::set<std::string> reads;
+            std::set<std::string> writes;
+            nlohmann::json memory = nlohmann::json::array();
+        };
+
+        MachineInstruction AnalyzeMachineInstruction(ea_t ea) {
+            MachineInstruction result;
+            result.address = ea;
+            const size_t item_size = get_item_size(ea);
+            segment_t* segment = getseg(ea);
+            if (!is_code(get_full_flags(ea)) || item_size == 0 || item_size > 15 || !segment ||
+                ea > BADADDR - item_size || ea + item_size > segment->end_ea)
+                return result;
+            std::array<uint8_t, 15> bytes{};
+            for (size_t i = 0; i < item_size; ++i) {
+                if (!is_loaded(ea + i)) return result;
+                bytes[i] = static_cast<uint8_t>(get_byte(ea + i));
+            }
+
+            nlohmann::ordered_json semantics = tools::rax::AnalyzeX64(ea, bytes.data(), item_size);
+            result.control_flow = semantics.value("control_flow", std::string("unknown"));
+            result.complete = semantics.value("status", std::string()) == "complete" &&
+                (!semantics.contains("size") || !semantics["size"].is_number() ||
+                 semantics["size"].get<size_t>() == item_size);
+            if (!result.complete) return result;
+
+            auto add_read = [&](const std::string& reg) {
+                const std::string canonical = CanonicalX64Register(reg);
+                if (!canonical.empty()) result.reads.insert(canonical);
+            };
+            auto add_write = [&](const std::string& reg) {
+                const std::string canonical = CanonicalX64Register(reg);
+                if (!canonical.empty()) result.writes.insert(canonical);
+            };
+            for (const auto& flag : semantics.value("flags_read", nlohmann::ordered_json::array()))
+                if (flag.is_string()) add_read("flags");
+            for (const auto& flag : semantics.value("flags_written", nlohmann::ordered_json::array()))
+                if (flag.is_string()) add_write("flags");
+            if (semantics.contains("effects") && semantics["effects"].is_array()) {
+                for (const auto& effect : semantics["effects"]) {
+                    const std::string kind = effect.value("kind", std::string());
+                    const bool reads = effect.contains("access") && effect["access"].is_array() &&
+                        std::find(effect["access"].begin(), effect["access"].end(), "read") != effect["access"].end();
+                    const bool writes = effect.contains("access") && effect["access"].is_array() &&
+                        std::find(effect["access"].begin(), effect["access"].end(), "write") != effect["access"].end();
+                    if (kind == "register" && effect.contains("register") && effect["register"].is_string()) {
+                        const std::string reg = effect["register"].get<std::string>();
+                        if (reads) add_read(reg);
+                        if (writes) add_write(reg);
+                        if (effect.contains("source_register") && effect["source_register"].is_string())
+                            add_read(effect["source_register"].get<std::string>());
+                    } else if (kind == "memory") {
+                        if (reads || writes) result.memory.push_back(effect);
+                        if (effect.contains("address") && effect["address"].is_object()) {
+                            for (const char* field : {"base", "index"})
+                                if (effect["address"].contains(field) && effect["address"][field].is_string())
+                                    add_read(effect["address"][field].get<std::string>());
+                        }
+                        if (effect.contains("source_register") && effect["source_register"].is_string())
+                            add_read(effect["source_register"].get<std::string>());
+                    }
+                }
+            }
+            return result;
+        }
+
+        struct MachineBlock {
+            std::vector<MachineInstruction> instructions;
+            std::vector<int> successors;
+            std::vector<int> predecessors;
+        };
+
+        bool BuildMachineRegisterFlow(func_t* fn, ea_t requested_ea, const std::string& requested_register,
+                                      const std::string& direction, nlohmann::json& flow,
+                                      nlohmann::json& analysis, std::string& error_code,
+                                      std::string& error_message) {
+            constexpr size_t kMaxMachineBlocks = 256;
+            constexpr size_t kMaxMachineInstructions = 4096;
+            constexpr size_t kMaxMachineFlowNodes = 200;
+            constexpr size_t kMaxMachineWorkItems = 8192;
+            const std::string root_register = CanonicalX64Register(requested_register);
+            if (root_register.empty()) {
+                error_code = "invalid_machine_register";
+                error_message = "Machine-level trace requires an x86-64 register name such as rax, rcx, r8, xmm0, or eflags";
+                return false;
+            }
+            char proc_name[32]{};
+            inf_get_procname(proc_name, sizeof(proc_name));
+            if (!fn || !inf_is_64bit() || std::string(proc_name) != "metapc") {
+                error_code = "machine_trace_requires_x64_function";
+                error_message = "Machine-level trace requires an address inside an x86-64 function";
+                return false;
+            }
+            const ea_t root_ea = get_item_head(requested_ea);
+            if (root_ea < fn->start_ea || root_ea >= fn->end_ea || !is_code(get_full_flags(root_ea))) {
+                error_code = "machine_trace_requires_instruction";
+                error_message = "Machine-level trace address must resolve to an instruction inside a function";
+                return false;
+            }
+
+            qflow_chart_t chart("", fn, fn->start_ea, fn->end_ea, FC_NOEXT);
+            if (chart.size() == 0 || chart.size() > kMaxMachineBlocks) {
+                error_code = "machine_trace_block_limit";
+                error_message = "Machine-level trace supports functions with 1 to 256 basic blocks";
+                return false;
+            }
+            std::vector<MachineBlock> blocks(chart.size());
+            int root_block = -1;
+            size_t instruction_count = 0;
+            size_t complete_count = 0;
+            for (size_t block_index = 0; block_index < chart.size(); ++block_index) {
+                sync::Checkpoint();
+                const auto& range = chart.blocks[block_index];
+                ea_t cur = range.start_ea;
+                while (cur < range.end_ea) {
+                    sync::Checkpoint();
+                    if (is_code(get_full_flags(cur))) {
+                        if (++instruction_count > kMaxMachineInstructions) {
+                            error_code = "machine_trace_instruction_limit";
+                            error_message = "Machine-level trace is limited to 4096 instructions per function";
+                            return false;
+                        }
+                        MachineInstruction instruction = AnalyzeMachineInstruction(cur);
+                        if (instruction.complete) ++complete_count;
+                        if (cur == root_ea) root_block = static_cast<int>(block_index);
+                        blocks[block_index].instructions.push_back(std::move(instruction));
+                        const size_t size = get_item_size(cur);
+                        if (size == 0 || cur > BADADDR - size || cur + size > range.end_ea) break;
+                        cur += size;
+                    } else {
+                        ea_t next = next_head(cur, range.end_ea);
+                        if (next == BADADDR || next <= cur) break;
+                        cur = next;
+                    }
+                }
+            }
+            if (root_block < 0) {
+                error_code = "machine_trace_instruction_unavailable";
+                error_message = "IDA did not expose the requested instruction in the function flow graph";
+                return false;
+            }
+            for (size_t block_index = 0; block_index < chart.size(); ++block_index) {
+                for (int i = 0; i < chart.nsucc(static_cast<int>(block_index)); ++i) {
+                    int successor = chart.succ(static_cast<int>(block_index), i);
+                    if (successor >= 0 && successor < static_cast<int>(chart.size())) {
+                        blocks[block_index].successors.push_back(successor);
+                        blocks[successor].predecessors.push_back(static_cast<int>(block_index));
+                    }
+                }
+            }
+            auto root_it = std::find_if(blocks[root_block].instructions.begin(), blocks[root_block].instructions.end(),
+                [&](const MachineInstruction& instruction) { return instruction.address == root_ea; });
+            if (root_it == blocks[root_block].instructions.end()) {
+                error_code = "machine_trace_instruction_unavailable";
+                error_message = "IDA did not expose the requested instruction in the function flow graph";
+                return false;
+            }
+            const size_t root_instruction = static_cast<size_t>(std::distance(blocks[root_block].instructions.begin(), root_it));
+
+            using RegisterSet = std::set<std::string>;
+            const bool forward = direction == "forward";
+            std::vector<RegisterSet> block_states(blocks.size());
+            std::vector<bool> reachable(blocks.size(), false);
+            block_states[root_block].insert(root_register);
+            reachable[root_block] = true;
+            std::deque<int> worklist{root_block};
+            size_t work_items = 0;
+            bool incomplete = false;
+            bool incomplete_lift_boundary = false;
+            bool call_boundary = false;
+            bool worklist_limit = false;
+            bool flow_limit = false;
+            auto transfer_block = [&](int block_index, RegisterSet& registers, bool collect,
+                                      size_t& node_visits) {
+                const auto& instructions = blocks[block_index].instructions;
+                auto process = [&](size_t instruction_index) {
+                    const auto& instruction = instructions[instruction_index];
+                    if (!instruction.complete) {
+                        if (!registers.empty()) {
+                            incomplete = true;
+                            incomplete_lift_boundary = true;
+                        }
+                        registers.clear();
+                        return;
+                    }
+                    const RegisterSet& sources = forward ? instruction.reads : instruction.writes;
+                    const bool dependent = std::any_of(sources.begin(), sources.end(),
+                        [&](const std::string& reg) { return registers.count(reg) != 0; });
+                    if (collect && dependent) {
+                        nlohmann::json node = {
+                            {"address", tools::utils::FormatAddress(instruction.address)},
+                            {"type", forward ? "register_use" : "register_definition"},
+                            {"registers_read", nlohmann::json::array()},
+                            {"registers_written", nlohmann::json::array()},
+                            {"memory", instruction.memory},
+                            {"control_flow", instruction.control_flow}
+                        };
+                        for (const auto& reg : instruction.reads) node["registers_read"].push_back(reg);
+                        for (const auto& reg : instruction.writes) node["registers_written"].push_back(reg);
+                        if (node_visits < kMaxMachineFlowNodes) flow.push_back(std::move(node));
+                        else { incomplete = true; flow_limit = true; }
+                        ++node_visits;
+                    }
+                    if (instruction.control_flow == "call" || instruction.control_flow == "indirect_call") {
+                        const bool has_live_registers = !registers.empty();
+                        registers.clear(); // Unknown callee side effects are an interprocedural boundary.
+                        if (has_live_registers) { incomplete = true; call_boundary = true; }
+                        return;
+                    }
+                    const RegisterSet& definitions = forward ? instruction.writes : instruction.writes;
+                    for (const auto& reg : definitions) registers.erase(reg);
+                    if (dependent) {
+                        const RegisterSet& propagated = forward ? instruction.writes : instruction.reads;
+                        registers.insert(propagated.begin(), propagated.end());
+                    }
+                };
+                if (forward) {
+                    const size_t first = block_index == root_block ? root_instruction : 0;
+                    for (size_t i = first; i < instructions.size(); ++i) process(i);
+                } else {
+                    size_t i = block_index == root_block ? root_instruction + 1 : instructions.size();
+                    while (i > 0) process(--i);
+                }
+            };
+
+            while (!worklist.empty()) {
+                sync::Checkpoint();
+                if (++work_items > kMaxMachineWorkItems) {
+                    incomplete = true;
+                    worklist_limit = true;
+                    break;
+                }
+                const int block_index = worklist.front();
+                worklist.pop_front();
+                RegisterSet output = block_states[block_index];
+                size_t ignored_nodes = 0;
+                transfer_block(block_index, output, false, ignored_nodes);
+                if (output.empty()) continue;
+                const auto& next_blocks = forward ? blocks[block_index].successors : blocks[block_index].predecessors;
+                for (int next : next_blocks) {
+                    RegisterSet merged = block_states[next];
+                    merged.insert(output.begin(), output.end());
+                    if (!reachable[next] || merged != block_states[next]) {
+                        reachable[next] = true;
+                        block_states[next] = std::move(merged);
+                        worklist.push_back(next);
+                    }
+                }
+            }
+
+            std::vector<int> block_depth(blocks.size(), -1);
+            std::queue<int> breadth_first;
+            block_depth[root_block] = 0;
+            breadth_first.push(root_block);
+            while (!breadth_first.empty()) {
+                const int block_index = breadth_first.front();
+                breadth_first.pop();
+                const auto& next_blocks = forward ? blocks[block_index].successors : blocks[block_index].predecessors;
+                for (int next : next_blocks) {
+                    if (block_depth[next] < 0) {
+                        block_depth[next] = block_depth[block_index] + 1;
+                        breadth_first.push(next);
+                    }
+                }
+            }
+            flow = nlohmann::json::array();
+            flow.push_back({{"address", tools::utils::FormatAddress(root_ea)}, {"type", "machine_root"},
+                            {"register", root_register}, {"direction", direction}});
+            size_t node_visits = 0;
+            for (size_t block_index = 0; block_index < blocks.size(); ++block_index) {
+                if (!reachable[block_index]) continue;
+                const size_t first_flow_node = flow.size();
+                RegisterSet state = block_states[block_index];
+                transfer_block(static_cast<int>(block_index), state, true, node_visits);
+                for (size_t i = first_flow_node; i < flow.size(); ++i)
+                    flow[i]["depth"] = std::max(0, block_depth[block_index]);
+            }
+            if (flow.size() > kMaxMachineFlowNodes + 1) {
+                while (flow.size() > kMaxMachineFlowNodes + 1) flow.erase(flow.end() - 1);
+                incomplete = true;
+                flow_limit = true;
+            }
+            nlohmann::json incomplete_reasons = nlohmann::json::array();
+            if (incomplete_lift_boundary) incomplete_reasons.push_back("RAX lift was incomplete on a live register path; propagation stopped there");
+            if (call_boundary) incomplete_reasons.push_back("Unknown function calls stop interprocedural register propagation");
+            if (worklist_limit) incomplete_reasons.push_back("CFG worklist step limit reached");
+            if (flow_limit) incomplete_reasons.push_back("Flow output limit reached");
+            analysis = {
+                {"engine", "RAX"},
+                {"mode", "x86-64 register def-use"},
+                {"scope", "intraprocedural CFG; block inputs merged conservatively"},
+                {"root_address", tools::utils::FormatAddress(root_ea)},
+                {"instructions_total", instruction_count},
+                {"instructions_complete", complete_count},
+                {"instructions_unmodeled", instruction_count - complete_count},
+                {"basic_blocks", blocks.size()},
+                {"worklist_steps", work_items},
+                {"interprocedural", false},
+                {"memory_aliases_tracked", false},
+                {"control_dependencies_tracked", false},
+                {"dataflow_complete", !incomplete},
+                {"incomplete_reasons", std::move(incomplete_reasons)},
+                {"truncated", flow_limit || worklist_limit}
+            };
+            return true;
+        }
+    }
     nlohmann::json ApiComposite::Dispatch(const nlohmann::json& id, const std::string& name, const nlohmann::json& args) {
         if (name == "survey_binary") return SurveyBinary(id, args);
         if (name == "analyze_function") return AnalyzeFunction(id, args);
@@ -104,11 +578,26 @@ namespace tools::composite {
         if (max_callers > 500) max_callers = 500;
         size_t max_callees = static_cast<size_t>(tools::utils::GetIntArg(args, "max_callees", 100));
         if (max_callees > 500) max_callees = 500;
+        const bool semantic_summary = tools::utils::GetBoolArg(args, "semantic_summary", false);
+        if (semantic_summary) {
+            std::string rax_error;
+            if (!tools::rax::Available(rax_error))
+                return tools::utils::MakeToolErrorJson(id, rax_error, "rax_unavailable");
+        }
 
         nlohmann::ordered_json res;
         bool found = false;
+        bool semantic_arch_unsupported = false;
 
         sync::SyncRead([&]() {
+            if (semantic_summary) {
+                char proc_name[32]{};
+                inf_get_procname(proc_name, sizeof(proc_name));
+                if (!inf_is_64bit() || std::string(proc_name) != "metapc") {
+                    semantic_arch_unsupported = true;
+                    return;
+                }
+            }
             func_t* fn = get_func(target_ea);
             if (!fn) return;
             found = true;
@@ -143,10 +632,12 @@ namespace tools::composite {
             size_t blocks_count = fc.size();
 
             size_t insn_count = 0;
+            RaxFunctionSummary rax_summary;
             func_item_iterator_t fii_insn;
             for (bool ok = fii_insn.set(fn, fn->start_ea); ok; ok = fii_insn.next_head()) {
                 sync::Checkpoint();
                 insn_count++;
+                if (semantic_summary) rax_summary.Analyze(fii_insn.current());
             }
 
             // Type information & Prototype
@@ -321,6 +812,7 @@ namespace tools::composite {
             res["size"] = fn->size();
             res["instructions_count"] = insn_count;
             res["basic_blocks_count"] = blocks_count;
+            if (semantic_summary) res["semantic_summary"] = rax_summary.ToJson();
             res["flags"] = std::move(flags_obj);
             res["frame"] = std::move(frame_obj);
             if (!proto.empty()) res["prototype"] = proto;
@@ -339,6 +831,10 @@ namespace tools::composite {
             if (references_truncated) res["references_truncated"] = true;
         });
 
+        if (semantic_arch_unsupported) {
+            return tools::utils::MakeToolErrorJson(
+                id, "semantic_summary is available only for x86-64 IDBs", "rax_arch_unsupported");
+        }
         if (!found) {
             return tools::utils::MakeToolErrorJson(
                 id,
@@ -366,8 +862,18 @@ namespace tools::composite {
         if (max_depth > 5) max_depth = 5;
 
         bool include_calls = tools::utils::GetBoolArg(args, "include_calls", true);
+        const bool machine_level = tools::utils::GetBoolArg(args, "machine_level", false);
+        if (machine_level) {
+            std::string rax_error;
+            if (!tools::rax::Available(rax_error))
+                return tools::utils::MakeToolErrorJson(id, rax_error, "rax_unavailable");
+            if (target_var.empty())
+                return tools::utils::MakeToolErrorJson(
+                    id, "Machine-level trace requires 'var' to name an x86-64 register", "machine_register_required");
+        }
 
         nlohmann::json flow_arr = nlohmann::json::array();
+        nlohmann::json machine_analysis;
         std::string root_var_name = target_var;
         bool used_hexrays = false;
         std::string error_code;
@@ -376,6 +882,17 @@ namespace tools::composite {
 
         sync::SyncToMainThread([&]() {
             func_t* pfn = get_func(start_ea);
+            if (machine_level) {
+                if (!pfn) {
+                    error_code = "machine_trace_requires_function";
+                    error_msg = "Machine-level trace requires an instruction inside a function";
+                    return;
+                }
+                BuildMachineRegisterFlow(pfn, start_ea, target_var, direction,
+                    flow_arr, machine_analysis, error_code, error_msg);
+                root_var_name = CanonicalX64Register(target_var);
+                return;
+            }
             // If Hex-Rays is available and we are inside a function, perform ctree-based data flow analysis
             if (pfn && init_hexrays_plugin()) {
                 hexrays_failure_t hf;
@@ -676,8 +1193,27 @@ namespace tools::composite {
                                         sync::Checkpoint();
                                         if (flow.size() >= 200) { truncated = true; return 1; }
 
-                                        if (e->op == cot_asg || e->op == cot_asgbor || e->op == cot_asgband ||
-                                            e->op == cot_asgadd || e->op == cot_asgsub || e->op == cot_asgmul) {
+                                        if (e->op == cot_asg || e->op == cot_asgbor || e->op == cot_asgxor ||
+                                            e->op == cot_asgband || e->op == cot_asgadd || e->op == cot_asgsub ||
+                                            e->op == cot_asgmul || e->op == cot_asgsshr || e->op == cot_asgushr ||
+                                            e->op == cot_asgshl) {
+
+                                            // Capture dependencies before killing the previous value of the LHS.
+                                            // Compound assignments read the old LHS as well as the RHS.
+                                            VarRef rhs_used;
+                                            bool rhs_is_active = UsesActiveVar(e->y, rhs_used);
+                                            VarRef lhs_used;
+                                            bool compound_lhs_is_active = e->op != cot_asg && UsesActiveVar(e->x, lhs_used);
+                                            if (!rhs_is_active && compound_lhs_is_active) {
+                                                rhs_used = lhs_used;
+                                                rhs_is_active = true;
+                                            }
+
+                                            if (e->x && e->x->op == cot_var) {
+                                                // A new value invalidates both old taint and an old pointer alias.
+                                                active_lvars.erase(e->x->v.idx);
+                                                pointer_aliases.erase(e->x->v.idx);
+                                            }
 
                                             // Alias creation (p = &x)
                                             if (e->x && e->x->op == cot_var && e->y) {
@@ -727,8 +1263,10 @@ namespace tools::composite {
 
                                             // Abstract memory store (obj->field = val)
                                             std::string mem_loc = get_mem_loc_fn(e->x, cf);
-                                            VarRef rhs_used;
-                                            if (UsesActiveVar(e->y, rhs_used)) {
+                                            if (!mem_loc.empty() && e->op == cot_asg) {
+                                                active_mem_locs.erase(mem_loc);
+                                            }
+                                            if (rhs_is_active) {
                                                 if (!mem_loc.empty()) {
                                                     active_mem_locs.insert(mem_loc);
                                                     nlohmann::ordered_json item = {
@@ -781,7 +1319,7 @@ namespace tools::composite {
                                             }
 
                                             // Standard variable assignment (y = x)
-                                            if (UsesActiveVar(e->y, rhs_used)) {
+                                            if (rhs_is_active) {
                                                 if (e->x && e->x->op == cot_var) {
                                                     const lvars_t* lvs = const_cast<cfunc_t*>(cf)->get_lvars();
                                                     if (lvs && e->x->v.idx >= 0 && e->x->v.idx < static_cast<int>(lvs->size())) {
@@ -801,6 +1339,7 @@ namespace tools::composite {
                                                     }
                                                 }
                                             }
+
                                         }
 
                                         // Call arguments
@@ -1072,8 +1611,10 @@ namespace tools::composite {
                                     cexpr_t* e = static_cast<cexpr_t*>(item);
 
                                     // 1. Assignments: lhs = rhs
-                                    if (e->op == cot_asg || e->op == cot_asgbor || e->op == cot_asgband ||
-                                        e->op == cot_asgadd || e->op == cot_asgsub || e->op == cot_asgmul) {
+                                    if (e->op == cot_asg || e->op == cot_asgbor || e->op == cot_asgxor ||
+                                        e->op == cot_asgband || e->op == cot_asgadd || e->op == cot_asgsub ||
+                                        e->op == cot_asgmul || e->op == cot_asgsshr || e->op == cot_asgushr ||
+                                        e->op == cot_asgshl) {
                                         bool matched = false;
                                         std::string def_target;
 
@@ -1109,9 +1650,23 @@ namespace tools::composite {
                                         }
 
                                         if (matched) {
+                                            // Walking backwards, the current assignment kills the value
+                                            // being queried. A compound assignment also reads its old LHS.
+                                            if (e->x && e->x->op == cot_var) {
+                                                active_lvars.erase(e->x->v.idx);
+                                            }
                                             std::vector<VarRef> src_vars;
                                             std::vector<std::string> src_globals;
                                             ExtractSources(e->y, src_vars, src_globals);
+                                            if (e->op != cot_asg && e->x && e->x->op == cot_var) {
+                                                const lvars_t* lvs = local_cf->get_lvars();
+                                                int lhs_idx = e->x->v.idx;
+                                                if (lvs && lhs_idx >= 0 && lhs_idx < static_cast<int>(lvs->size())) {
+                                                    VarRef lhs_ref{ local_cf->entry_ea, lhs_idx, (*lvs)[lhs_idx].name.c_str() };
+                                                    if (std::find(src_vars.begin(), src_vars.end(), lhs_ref) == src_vars.end())
+                                                        src_vars.push_back(lhs_ref);
+                                                }
+                                            }
 
                                             std::vector<std::string> src_var_names;
                                             for (const auto& sv : src_vars) {
@@ -1444,6 +1999,7 @@ namespace tools::composite {
 
                 std::set<ea_t> visited;
                 std::queue<std::pair<ea_t, int>> q;
+                std::map<ea_t, nlohmann::json> incoming_edges;
                 constexpr size_t MAX_FALLBACK_NODES = 100;
                 constexpr size_t MAX_FALLBACK_XREF_VISITS = 50000;
                 size_t fallback_xref_visits = 0;
@@ -1462,32 +2018,47 @@ namespace tools::composite {
                     qstring name_buf;
                     get_ea_name(&name_buf, cur_ea);
 
-                    flow_arr.push_back({
+                    nlohmann::json node = {
                         {"depth", depth},
                         {"address", tools::utils::FormatAddress(cur_ea)},
                         {"name", name_buf.c_str()}
-                    });
+                    };
+                    auto incoming = incoming_edges.find(cur_ea);
+                    if (incoming != incoming_edges.end()) node["edge"] = incoming->second;
+                    flow_arr.push_back(std::move(node));
 
                     if (depth >= max_depth) continue;
 
                     xrefblk_t xb;
-                    for (bool ok = xb.first_from(cur_ea, XREF_DATA); ok; ok = xb.next_from()) {
+                    bool has_xref = direction == "forward"
+                        ? xb.first_from(cur_ea, XREF_DATA)
+                        : xb.first_to(cur_ea, XREF_DATA);
+                    for (bool ok = has_xref; ok; ok = direction == "forward" ? xb.next_from() : xb.next_to()) {
                         sync::Checkpoint();
                         if (++fallback_xref_visits > MAX_FALLBACK_XREF_VISITS) {
                             flow_truncated = true;
                             break;
                         }
-                        if (xb.to != BADADDR && is_mapped(xb.to) && visited.find(xb.to) == visited.end()) {
+                        const ea_t neighbor = direction == "forward" ? xb.to : xb.from;
+                        if (neighbor != BADADDR && is_mapped(neighbor) && visited.find(neighbor) == visited.end()) {
                             if (visited.size() >= MAX_FALLBACK_NODES) {
                                 flow_truncated = true;
                                 break;
                             }
-                            visited.insert(xb.to);
-                            q.push({xb.to, depth + 1});
+                            visited.insert(neighbor);
+                            q.push({neighbor, depth + 1});
+                            incoming_edges[neighbor] = {
+                                {"via", "data_xref"},
+                                {"from", tools::utils::FormatAddress(direction == "forward" ? cur_ea : neighbor)},
+                                {"to", tools::utils::FormatAddress(direction == "forward" ? neighbor : cur_ea)}
+                            };
                         }
                     }
                     if (flow_truncated) break;
 
+                    // Pointer dereferences are outgoing edges; do not traverse
+                    // them while walking backward through the xref graph.
+                    if (direction != "forward") continue;
                     ea_t deref = BADADDR;
                     const size_t ptr_size = inf_is_64bit() ? 8 : 4;
                     segment_t* memory_segment = getseg(cur_ea);
@@ -1508,6 +2079,11 @@ namespace tools::composite {
                         }
                         visited.insert(deref);
                         q.push({deref, depth + 1});
+                        incoming_edges[deref] = {
+                            {"via", "pointer_deref"},
+                            {"from", tools::utils::FormatAddress(cur_ea)},
+                            {"to", tools::utils::FormatAddress(deref)}
+                        };
                     }
                 }
             }
@@ -1527,7 +2103,13 @@ namespace tools::composite {
             {"flow_count", flow_arr.size()},
             {"flow", flow_arr}
         };
+        if (machine_level) {
+            res["root"]["address"] = machine_analysis["root_address"];
+            machine_analysis.erase("root_address");
+            res["analysis"] = std::move(machine_analysis);
+        }
         if (flow_truncated) res["truncated"] = true;
+        if (machine_level && res["analysis"].value("truncated", false)) res["truncated"] = true;
         return tools::utils::MakeToolSuccessJson(id, res);
     }
 }

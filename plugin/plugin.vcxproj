@@ -69,8 +69,8 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalLibraryDirectories>$(ProjectDir)!ibs\ida_92\lib;$(ProjectDir)!ibs\ida_92\lib\x64_win_vc_64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>ida.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(ProjectDir)third_party\rax\lib;$(ProjectDir)!ibs\ida_92\lib;$(ProjectDir)!ibs\ida_92\lib\x64_win_vc_64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>rax.lib;ntdll.lib;ida.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -94,12 +94,15 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalLibraryDirectories>$(ProjectDir)!ibs\ida_92\lib;$(ProjectDir)!ibs\ida_92\lib\x64_win_vc_64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>ida.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(ProjectDir)third_party\rax\lib;$(ProjectDir)!ibs\ida_92\lib;$(ProjectDir)!ibs\ida_92\lib\x64_win_vc_64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>rax.lib;ntdll.lib;ida.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <None Include="third_party\rax\lib\rax.lib" />
     <ClInclude Include="..\shared\json.h" />
+    <ClInclude Include="third_party\rax\include\rax.h" />
+    <ClInclude Include="third_party\rax\rax_bridge.h" />
     <ClInclude Include="server\pipe_server.h" />
     <ClInclude Include="server\status_tracker.h" />
     <ClInclude Include="sync\sync.h" />
@@ -125,6 +128,7 @@
     <ClCompile Include="main.cpp" />
     <ClCompile Include="server\pipe_server.cpp" />
     <ClCompile Include="tools\api_analysis\api_analysis.cpp" />
+    <ClCompile Include="third_party\rax\rax_bridge.cpp" />
     <ClCompile Include="tools\api_composite\api_composite.cpp" />
     <ClCompile Include="tools\api_core\api_core.cpp" />
     <ClCompile Include="tools\api_memory\api_memory.cpp" />

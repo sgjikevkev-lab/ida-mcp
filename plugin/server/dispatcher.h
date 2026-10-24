@@ -6,11 +6,56 @@
 #include <vector>
 #include <map>
 #include <excpt.h>
+#include <ida.hpp>
+#include <kernwin.hpp>
 #include "sync/sync.h"
 #include "status_tracker.h"
 #include "sync/cache_manager.h"
 
 namespace server {
+    // batch mode handles IDA's standard unattended behavior, but ui_ask_file
+    // can still reach the UI dispatcher. Return an empty, IDA-allocated path
+    // for that request while a non-Python MCP operation is active.
+    class UnattendedUiScope {
+        std::atomic<bool> active_{false};
+        bool enabled_ = false;
+        bool hooked_ = false;
+        bool previous_batch_ = false;
+
+        static ssize_t idaapi BlockModalUi(void* user_data, int notification_code, va_list) {
+            auto* scope = static_cast<UnattendedUiScope*>(user_data);
+            if (!scope || !scope->active_.load(std::memory_order_acquire)) return 0;
+            if (notification_code != ui_ask_file) return 0;
+            // A nonzero HT_UI return value becomes the callui() result. For
+            // ui_ask_file that result is a char*, so return a valid empty
+            // string rather than an integer sentinel (which can crash callers).
+            return reinterpret_cast<ssize_t>(qstrdup(""));
+        }
+
+    public:
+        explicit UnattendedUiScope(bool enabled) {
+            if (!enabled) return;
+            enabled_ = true;
+            previous_batch_ = batch;
+            batch = true;
+            active_.store(true, std::memory_order_release);
+            hooked_ = hook_to_notification_point(HT_UI, BlockModalUi, this);
+            if (!hooked_) {
+                active_.store(false, std::memory_order_release);
+                batch = previous_batch_;
+            }
+        }
+
+        ~UnattendedUiScope() {
+            if (!enabled_) return;
+            active_.store(false, std::memory_order_release);
+            if (hooked_) unhook_from_notification_point(HT_UI, BlockModalUi, this);
+            batch = previous_batch_;
+        }
+
+        bool IsActive() const { return hooked_; }
+    };
+
     struct ToolJob {
         sync::Operation operation;
         std::atomic<bool> done{false};
@@ -86,9 +131,17 @@ namespace server {
             }
             job->started.store(true, std::memory_order_release);
             sync::OperationScope operation(&job->operation);
-            const bool previous_batch = batch;
             // Python intentionally retains IDAPython's interactive cancellation.
-            if (job->name != "py") batch = true;
+            // Other tools get both IDA batch mode and an SDK notification guard.
+            UnattendedUiScope unattended_ui(job->name != "py");
+            if (job->name != "py" && !unattended_ui.IsActive()) {
+                job->response = tools::utils::MakeToolErrorJson(job->id,
+                    "Could not enforce unattended IDA UI mode", "ui_guard_unavailable").dump();
+                job->work = {};
+                PluginStatusTracker::Instance().EndTool();
+                job->done.store(true, std::memory_order_release);
+                return;
+            }
             auto invoke = [&]() {
                 try {
                     sync::Checkpoint();
@@ -106,7 +159,6 @@ namespace server {
             };
             FaultInfo fault_info;
             const DWORD fault = InvokeNative(invoke, &fault_info);
-            batch = previous_batch;
             if (fault) {
                 // Keep native diagnostics in IDA's log, out of ordinary model responses.
                 msg("[IDA MCP] Native fault %08lX at %p\n", fault, fault_info.address);

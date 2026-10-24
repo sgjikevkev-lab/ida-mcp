@@ -265,7 +265,7 @@ namespace mcp {
   },
   {
     "name": "insn_query",
-    "description": "Search instructions by mnemonic (e.g. 'call', 'syscall', 'xor') and/or disassembly text pattern ('*eax, eax*') with cursor pagination. For sequential disassembly of a function, use 'disasm'.",
+    "description": "Search instructions by mnemonic and/or disassembly text pattern with cursor pagination. Optional x86-64 semantic effects can be included for up to 100 results. For sequential disassembly, use 'disasm'.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -315,6 +315,10 @@ namespace mcp {
           "description": "Maximum instructions to scan in one pass before returning (default 250000)",
           "minimum": 0,
           "maximum": 1000000
+        },
+        "semantic_effects": {
+          "type": "boolean",
+          "description": "Include RAX x86-64 register/memory/flag/control-flow effects for each result (max count 100, default false)"
         }
       },
       "additionalProperties": false
@@ -450,7 +454,7 @@ namespace mcp {
   },
   {
     "name": "disasm",
-    "description": "Disassemble sequential instructions starting from address, or batch disassemble at multiple target addresses. Supports mnemonic filtering ('mnemonic': 'call'), optional opcode bytes, function metadata, and pagination cursor. To search for instructions across binary, use 'insn_query'.",
+    "description": "Disassemble sequential instructions starting from an address, or batch disassemble at multiple target addresses. Supports mnemonic filtering, opcode bytes, function metadata, and pagination. For one address, 'semantic_effects': true adds opt-in x86-64 register, memory, flag, and control-flow effects from the RAX emulator analysis. To search across the binary, use 'insn_query'.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -491,6 +495,10 @@ namespace mcp {
         "detailed": {
           "type": "boolean",
           "description": "Include structured 'items' array with address, size, bytes, and disasm (default false)"
+        },
+        "semantic_effects": {
+          "type": "boolean",
+          "description": "For a single addr target, include RAX x86-64 register/memory/flag/control-flow effects per instruction. Implies detailed output; unsupported or partial instructions are labeled (default false)."
         }
       },
       "oneOf": [
@@ -1048,7 +1056,7 @@ namespace mcp {
   },
   {
     "name": "analyze_function",
-    "description": "Comprehensive summary of a single function: address range, demangled symbol, segment, calling convention, argument details, stack frame layout, basic block count, instruction count, callers count and call sites, and unique callees list. To discover or filter multiple functions, use 'list_funcs'.",
+    "description": "Comprehensive summary of a single function: address range, demangled symbol, segment, calling convention, argument details, stack frame layout, basic block count, instruction count, callers count and call sites, and unique callees list. Set 'semantic_summary': true to add a compact x86-64 RAX summary of register, flag, memory, and control-flow effects. To discover or filter multiple functions, use 'list_funcs'.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1068,6 +1076,10 @@ namespace mcp {
           "description": "Maximum number of callee functions to return in callees array (default 100, max 500)",
           "minimum": 0,
           "maximum": 500
+        },
+        "semantic_summary": {
+          "type": "boolean",
+          "description": "Include a bounded aggregate of x86-64 RAX instruction effects (default false; analyzes at most 2048 instructions)"
         }
       },
       "required": [
@@ -1078,7 +1090,7 @@ namespace mcp {
   },
   {
     "name": "trace_data_flow",
-    "description": "Deep inter-procedural data flow propagation starting from an address using Hex-Rays AST decompilation (or memory/XREF data flow if outside a function). Supports 'forward' (def->use: propagates into stores, callee arguments, conditions, returns) and 'backward' (use->def: reverse-AST evaluation, transitive sources, memory loads, callee return values, out-parameters, and caller argument origins).",
+    "description": "Trace data flow using Hex-Rays AST analysis or memory/XREF traversal. Set 'machine_level': true to use RAX for bounded x86-64 register def-use tracing through a function CFG; specify a register in 'var'. Machine-level mode merges branches conservatively, stops at unknown calls or incomplete instruction lifts, and reports that it does not track memory aliases, control dependencies, or cross function calls.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1089,7 +1101,7 @@ namespace mcp {
         },
         "var": {
           "type": "string",
-          "description": "Optional variable name (lvar name), index ('0', '1'), or argument ('arg0') to trace. If omitted, deduced from address or function arguments",
+          "description": "Hex-Rays mode: optional variable, index, or argument such as 'arg0'. Machine-level mode: required x86-64 register such as 'rax', 'rcx', 'r8', 'xmm0', or 'eflags'.",
           "maxLength": 2097152
         },
         "direction": {
@@ -1103,12 +1115,16 @@ namespace mcp {
         },
         "depth": {
           "type": "integer",
-          "description": "Max inter-procedural call traversal depth (default 2, max 5)",
+          "description": "Hex-Rays mode: max inter-procedural call traversal depth (default 2, max 5); ignored in machine-level mode",
           "minimum": 0
         },
         "include_calls": {
           "type": "boolean",
-          "description": "Whether to follow data flow across function boundaries: into called functions (forward/backward) and caller call sites (backward) (default true)"
+          "description": "Hex-Rays mode: whether to follow data flow across function boundaries (default true); machine-level mode always stops at calls"
+        },
+        "machine_level": {
+          "type": "boolean",
+          "description": "Use bounded RAX register def-use analysis over the x86-64 function CFG instead of Hex-Rays AST or data xrefs (default false)"
         }
       },
       "required": [

@@ -44,7 +44,7 @@ The backend does not use `TerminateThread` or mark itself idle while code is sti
 
 ## Dialog policy and native failures
 
-Ordinary tool execution temporarily sets the IDA SDK's `batch` flag and restores its previous value afterward. Decompiler calls also use `DECOMP_NO_WAIT`. The SDK documents `batch` as the unattended mode: warning/info dialogs are redirected and input dialogs immediately return their default values. The plugin's own informational message uses `msg()`.
+Ordinary tool execution temporarily sets the IDA SDK's `batch` flag and restores its previous value afterward. Decompiler calls also use `DECOMP_NO_WAIT`. The SDK documents `batch` as the unattended mode: warning/info dialogs are redirected and input dialogs immediately return their default values. IDA 9.2 does not apply this behavior to `ask_file`, so non-Python tool execution also installs a scoped UI-notification handler that returns an IDA-allocated empty path for `ui_ask_file`. The empty path represents cancellation without displaying a picker. The plugin's own informational message uses `msg()`.
 
 Python is the intentional exception. Its execution retains the previous interactive mode and chains/restores the existing trace, allowing IDAPython's manual cancellation mechanism to remain available. The wrapper also polls the MCP cancellation state. Python user variables live in a dedicated persistent namespace; capture state does not occupy that namespace. Stream, argv, path, file and trace state are restored on ordinary Python exceptions, `SystemExit`, cancellation and deadline errors.
 

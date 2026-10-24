@@ -1,5 +1,7 @@
 #include <string>
 #include <vector>
+#include <array>
+#include <cstdint>
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
@@ -15,6 +17,7 @@
 
 #include "api_analysis.h"
 #include "tools/utils/utils.h"
+#include "third_party/rax/rax_bridge.h"
 #include "sync/sync.h"
 #include "sync/cache_manager.h"
 
@@ -66,6 +69,26 @@ namespace tools::analysis {
                 hex += byte_text;
             }
             return hex;
+        }
+
+        nlohmann::ordered_json AnalyzeItemEffects(ea_t ea, size_t item_size) {
+            if (item_size == 0 || item_size > 15)
+                return {{"status", "instruction_size_unsupported"}};
+            std::array<uint8_t, 15> bytes{};
+            segment_t* segment = getseg(ea);
+            for (size_t index = 0; index < item_size; ++index) {
+                sync::Checkpoint();
+                if (index > BADADDR - ea || !segment || ea + index >= segment->end_ea || !is_loaded(ea + index))
+                    return {{"status", "bytes_unavailable"}};
+                bytes[index] = static_cast<uint8_t>(get_byte(ea + index));
+            }
+            nlohmann::ordered_json result = tools::rax::AnalyzeX64(ea, bytes.data(), item_size);
+            if (result.contains("size") && result["size"].is_number_unsigned() &&
+                result["size"].get<size_t>() != item_size) {
+                return {{"status", "decode_mismatch"}, {"ida_size", item_size},
+                        {"rax_size", result["size"]}};
+            }
+            return result;
         }
 
         struct PathEdge {
@@ -498,6 +521,10 @@ namespace tools::analysis {
     nlohmann::json ApiAnalysis::Disasm(const nlohmann::json& id, const nlohmann::json& args) {
         // 1. Batch disassembly support
         const bool batched = args.contains("targets");
+        const bool semantic_effects = tools::utils::GetBoolArg(args, "semantic_effects", false);
+        if (semantic_effects && batched)
+            return tools::utils::MakeToolErrorJson(id,
+                "semantic_effects currently requires a single addr target", "semantic_batch_unsupported");
         if (batched) {
             if (!args["targets"].is_array() || args["targets"].empty() || args["targets"].size() > 64)
                 return tools::utils::MakeToolErrorJson(id, "targets must contain between 1 and 64 addresses", "invalid_targets");
@@ -619,7 +646,12 @@ namespace tools::analysis {
 
         bool show_bytes = tools::utils::GetBoolArg(args, "bytes", false);
         bool stop_at_func_end = tools::utils::GetBoolArg(args, "stop_at_func_end", true);
-        bool detailed = tools::utils::GetBoolArg(args, "detailed", false);
+        bool detailed = tools::utils::GetBoolArg(args, "detailed", false) || semantic_effects;
+        if (semantic_effects) {
+            std::string rax_error;
+            if (!tools::rax::Available(rax_error))
+                return tools::utils::MakeToolErrorJson(id, rax_error, "rax_unavailable");
+        }
         std::string mnem_filter = tools::utils::GetStringArg(args, "mnemonic");
         if (mnem_filter.size() > 1024)
             return tools::utils::MakeToolErrorJson(id, "mnemonic must not exceed 1024 characters", "invalid_mnemonic");
@@ -704,6 +736,7 @@ namespace tools::analysis {
                             item["size"] = item_size;
                             item["bytes"] = hex_str;
                             item["disasm"] = dis;
+                            if (semantic_effects) item["semantics"] = AnalyzeItemEffects(cur, static_cast<size_t>(item_size));
                             if (item_bytes_truncated) item["bytes_truncated"] = true;
                             items.push_back(std::move(item));
                         }
@@ -773,6 +806,7 @@ namespace tools::analysis {
                             item["size"] = item_size;
                             item["bytes"] = hex_str;
                             item["disasm"] = dis;
+                            if (semantic_effects) item["semantics"] = AnalyzeItemEffects(cur, static_cast<size_t>(item_size));
                             if (item_bytes_truncated) item["bytes_truncated"] = true;
                             items.push_back(std::move(item));
                         }
@@ -1754,6 +1788,7 @@ namespace tools::analysis {
 
     nlohmann::json ApiAnalysis::InsnQuery(const nlohmann::json& id, const nlohmann::json& args) {
         std::string mnem_filter = tools::utils::GetStringArg(args, "mnemonic", "*");
+        const bool semantic_effects = tools::utils::GetBoolArg(args, "semantic_effects", false);
         if (mnem_filter.empty()) mnem_filter = "*";
 
         std::string query_filter = tools::utils::GetStringArg(args, "query");
@@ -1778,6 +1813,13 @@ namespace tools::analysis {
         if (count_arg < 0 || count_arg > 1000)
             return tools::utils::MakeToolErrorJson(id, "count must be between 0 and 1000", "invalid_count");
         const size_t count = count_arg == 0 ? 50 : static_cast<size_t>(count_arg);
+        if (semantic_effects && count > 100)
+            return tools::utils::MakeToolErrorJson(id, "semantic_effects limits count to 100 instructions", "semantic_count_too_large");
+        if (semantic_effects) {
+            std::string rax_error;
+            if (!tools::rax::Available(rax_error))
+                return tools::utils::MakeToolErrorJson(id, rax_error, "rax_unavailable");
+        }
 
         int64_t max_scan_arg = 250000;
         if (args.contains("max_scan")) {
@@ -1912,6 +1954,11 @@ namespace tools::analysis {
                             item["address"] = tools::utils::FormatAddress(cur);
                             item["mnemonic"] = mnem.c_str();
                             item["disasm"] = disasm;
+                            if (semantic_effects) {
+                                const ea_t item_size = get_item_size(cur);
+                                item["semantics"] = AnalyzeItemEffects(cur,
+                                    item_size == 0 ? 1 : static_cast<size_t>(item_size));
+                            }
 
                             func_t* fn = get_func(cur);
                             if (fn) {

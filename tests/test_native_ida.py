@@ -270,6 +270,50 @@ def main():
                 'addr': data_segment['start'], 'depth': 1
             }))
             assert fallback_flow['flow_count'] >= 1 and fallback_flow['flow'][0]['address'] == data_segment['start'], fallback_flow
+        backward_data_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': 'mcp_fixture_global', 'direction': 'backward', 'depth': 1
+        }))
+        assert any(
+            item.get('edge', {}).get('via') == 'data_xref'
+            and item.get('edge', {}).get('to') == backward_data_flow['root']['address']
+            for item in backward_data_flow['flow']
+        ), backward_data_flow
+        forward_pointer_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': 'mcp_fixture_global_ptr', 'direction': 'forward', 'depth': 1
+        }))
+        assert any(
+            item.get('edge', {}).get('via') == 'data_xref'
+            and item.get('edge', {}).get('from') == forward_pointer_flow['root']['address']
+            for item in forward_pointer_flow['flow']
+        ), forward_pointer_flow
+        xrefs_to = decode_tool_text(successful('xref_query', {
+            'addr': 'mcp_fixture_global_ptr', 'direction': 'to'
+        }))
+        xrefs_from = decode_tool_text(successful('xref_query', {
+            'addr': 'mcp_fixture_global_ptr', 'direction': 'from'
+        }))
+        xrefs_both = decode_tool_text(successful('xref_query', {
+            'addr': 'mcp_fixture_global_ptr', 'direction': 'both'
+        }))
+        assert any(item.get('function', '').startswith('mcp_fixture_read_pointer') for item in xrefs_to['xrefs']), xrefs_to
+        assert any(item.get('to_name') == 'mcp_fixture_global' for item in xrefs_from['xrefs']), xrefs_from
+        assert {item['direction'] for item in xrefs_both['xrefs']} == {'to', 'from'}, xrefs_both
+        forward_variable_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': 'mcp_fixture_add', 'var': 'arg0', 'direction': 'forward', 'depth': 1
+        }))
+        assert any(item.get('type') == 'return' for item in forward_variable_flow['flow']), forward_variable_flow
+        overwritten_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': 'mcp_fixture_overwrite_0', 'var': 'arg0', 'direction': 'forward', 'depth': 1
+        }))
+        assert not any(item.get('type') == 'return' for item in overwritten_flow['flow']), overwritten_flow
+        compound_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': 'mcp_fixture_accumulate_0', 'var': 'arg0', 'direction': 'forward', 'depth': 1
+        }))
+        assert any(item.get('type') == 'return' for item in compound_flow['flow']), compound_flow
+        xor_compound_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': 'mcp_fixture_xor_accumulate_0', 'var': 'arg0', 'direction': 'forward', 'depth': 1
+        }))
+        assert any(item.get('type') == 'return' for item in xor_compound_flow['flow']), xor_compound_flow
         one_byte_signature = call('make_signature', {'addr': 'mcp_fixture_add', 'max_length': 1})
         if not one_byte_signature['result'].get('isError', False):
             signature_data = json.loads(text(one_byte_signature))
@@ -280,6 +324,40 @@ def main():
             'addr': 'mcp_fixture_add', 'include_lvars': True
         }))
         assert decompiled_with_lvars['lvars'] and all('index' in item for item in decompiled_with_lvars['lvars']), decompiled_with_lvars
+        semantic_function = decode_tool_text(successful('analyze_function', {
+            'addr': 'mcp_fixture_add_0', 'semantic_summary': True
+        }))
+        semantic_summary = semantic_function['semantic_summary']
+        assert semantic_summary['engine'] == 'RAX' and semantic_summary['architecture'] == 'x86-64', semantic_summary
+        assert semantic_summary['instructions_analyzed'] > 0, semantic_summary
+        assert semantic_summary['instructions_complete'] > 0, semantic_summary
+        assert semantic_summary['registers_read'] and semantic_summary['registers_written'], semantic_summary
+        assert semantic_summary['control_flow'], semantic_summary
+        machine_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': 'mcp_fixture_add_0', 'var': 'rcx', 'direction': 'forward',
+            'machine_level': True
+        }))
+        assert machine_flow['analysis']['engine'] == 'RAX', machine_flow
+        assert machine_flow['analysis']['scope'].startswith('intraprocedural CFG'), machine_flow
+        assert machine_flow['root']['var'] == 'rcx', machine_flow
+        assert any(item.get('type') == 'register_use' for item in machine_flow['flow']), machine_flow
+        backward_machine_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': 'mcp_fixture_add_0', 'var': 'rax', 'direction': 'backward',
+            'machine_level': True
+        }))
+        assert any(item.get('type') == 'register_definition' for item in backward_machine_flow['flow']), backward_machine_flow
+        assert backward_machine_flow['analysis']['instructions_complete'] > 0, backward_machine_flow
+        branch_machine_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': 'mcp_fixture_update_0', 'var': 'rcx', 'direction': 'forward',
+            'machine_level': True
+        }))
+        assert branch_machine_flow['analysis']['basic_blocks'] > 1, branch_machine_flow
+        assert branch_machine_flow['analysis']['worklist_steps'] > 1, branch_machine_flow
+        assert any(item.get('depth', 0) > 0 for item in branch_machine_flow['flow']), branch_machine_flow
+        assert branch_machine_flow['analysis']['scope'].endswith('merged conservatively'), branch_machine_flow
+        assert call('trace_data_flow', {
+            'addr': 'mcp_fixture_add_0', 'var': 'not_a_register', 'machine_level': True
+        })['result']['isError']
         decompile_batch = decode_tool_text(successful('decompile', {
             'addrs': ['mcp_fixture_add', '__missing_fixture_function__']
         }))
@@ -289,6 +367,26 @@ def main():
             'addr': 'mcp_fixture_add', 'count': 2, 'bytes': True, 'detailed': True
         }))
         assert detailed_disasm['items'] and 'bytes' in detailed_disasm['items'][0], detailed_disasm
+        rax_disasm = decode_tool_text(successful('disasm', {
+            'addr': 'mcp_fixture_add_0', 'semantic_effects': True
+        }))
+        assert rax_disasm['items'] and all('semantics' in item for item in rax_disasm['items']), rax_disasm
+        assert any(item['semantics'].get('status') == 'complete' for item in rax_disasm['items']), rax_disasm
+        assert any(
+            effect.get('kind') == 'register' and 'write' in effect.get('access', [])
+            for item in rax_disasm['items']
+            for effect in item['semantics'].get('effects', [])
+        ), rax_disasm
+        rax_instruction_query = decode_tool_text(successful('insn_query', {
+            'func': 'mcp_fixture_add_0', 'count': 10, 'semantic_effects': True
+        }))
+        assert rax_instruction_query['instructions'] and all(
+            'semantics' in item for item in rax_instruction_query['instructions']
+        ), rax_instruction_query
+        assert call('insn_query', {
+            'func': 'mcp_fixture_add_0', 'count': 101, 'semantic_effects': True
+        })['result']['isError']
+        assert call('disasm', {'targets': ['mcp_fixture_add'], 'semantic_effects': True})['result']['isError']
         batch_disasm = decode_tool_text(successful('disasm', {
             'targets': ['__missing_fixture_function__', 'mcp_fixture_add'], 'count': 1
         }))
@@ -407,7 +505,6 @@ def main():
             assert bounded_analysis.get('callees_truncated') is True, bounded_analysis
         for name, arguments in [
             ('trace_data_flow', {'addr': 'mcp_fixture_update', 'var': 'arg0', 'depth': 2}),
-            ('trace_data_flow', {'addr': 'mcp_fixture_call', 'var': 'arg0', 'direction': 'backward', 'depth': 2}),
             ('reconstruct_struct', {'addr': 'mcp_fixture_update', 'scan_depth': 1}),
             ('rtti', {'pattern': '*MCPFixture*', 'count': 10}),
             ('rtti', {'name': 'MCPFixtureDerived'}),
@@ -417,6 +514,36 @@ def main():
             ('get_ast', {'addr': 'mcp_fixture_update', 'pattern': {'op': 'cot_asg'}, 'max_matches': 5}),
         ]:
             successful(name, arguments)
+        backward_interprocedural_flow = decode_tool_text(successful('trace_data_flow', {
+            'addr': 'mcp_fixture_call', 'var': 'arg0', 'direction': 'backward', 'depth': 2
+        }))
+        assert any(
+            item.get('type') == 'caller_arg_passed' and item.get('caller') == 'mcp_fixture_outer'
+            for item in backward_interprocedural_flow['flow']
+        ), backward_interprocedural_flow
+        direct_update_calls = decode_tool_text(successful('xref_query', {
+            'addr': 'mcp_fixture_update', 'direction': 'to', 'type': 'call'
+        }))
+        callgraph_callee_root = next(item['function'] for item in direct_update_calls['xrefs'])
+        callgraph_callees = decode_tool_text(successful('callgraph', {
+            'addr': callgraph_callee_root, 'direction': 'callees', 'depth': 1
+        }))
+        callgraph_callers = decode_tool_text(successful('callgraph', {
+            'addr': 'mcp_fixture_update', 'direction': 'callers', 'depth': 1
+        }))
+        callgraph_both = decode_tool_text(successful('callgraph', {
+            'addr': 'mcp_fixture_update', 'direction': 'both', 'depth': 1
+        }))
+        callees = {node['name'] for node in callgraph_callees['nodes']}
+        callers = {node['name'] for node in callgraph_callers['nodes']}
+        both = {node['name'] for node in callgraph_both['nodes']}
+        assert 'mcp_fixture_update' in callees, callgraph_callees
+        assert any(name.startswith('mcp_fixture_call') for name in callers), callgraph_callers
+        assert any(name.startswith('mcp_fixture_call') for name in both), callgraph_both
+        forward_call_path = decode_tool_text(successful('find_path', {
+            'from': 'mcp_fixture_call', 'to': 'mcp_fixture_update', 'max_depth': 5, 'budget': 1000
+        }))
+        assert forward_call_path['found'] and forward_call_path['paths'], forward_call_path
         bounded_path = decode_tool_text(successful('find_path', {
             'from': 'mcp_fixture_call', 'to': 'mcp_fixture_update', 'budget': 1, 'max_paths': 10, 'max_depth': 1
         }))
@@ -525,7 +652,7 @@ qa_hooks.hook()
             'code': 'qa_hooks.unhook()\n(qa_warning_seen, qa_dialog_results)'
         }))['result']
         assert dialog_results[0] is True, dialog_results
-        assert dialog_results[1]['ask_yn'] == 0 and dialog_results[1]['ask_file'] is None, dialog_results
+        assert dialog_results[1]['ask_yn'] == 0 and dialog_results[1]['ask_file'] == '', dialog_results
         assert all(name in dialog_results[1] for name in ('ask_str', 'ask_text', 'ask_addr', 'ask_seg', 'ask_long')), dialog_results
         assert covered == {tool['name'] for tool in catalog}, covered
         print(f'Native IDA 9.2 checks passed; artifacts: {directory}', flush=True)
