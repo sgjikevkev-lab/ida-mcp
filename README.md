@@ -155,3 +155,15 @@ The checks cover response contracts, bounds, request lifetime, queued cancellati
 ## Contributors
 
 - [OpenAI Codex](https://github.com/codex)
+
+### AI co-author trailer reference
+
+These are GitHub attribution formats for use when the named tool actually contributed to a commit. Their presence here does not imply that these tools contributed to this repository. GitHub links a co-author when the trailer email is associated with that account ([GitHub documentation](https://docs.github.com/en/pull-requests/how-tos/commit-changes/creating-a-commit-with-multiple-authors)).
+
+| Tool | Commit trailer |
+| --- | --- |
+| [Claude Code](https://code.claude.com/docs/en/settings#attribution-settings) | `Co-authored-by: Claude <noreply@anthropic.com>` |
+| [GitHub Copilot CLI](https://github.com/github/copilot-cli/issues/975) | `Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>` |
+| [Gemini Code Assist](https://github.com/google-gemini/gemini-cli/discussions/11447) | `Co-authored-by: gemini-code-assist[bot] <176961590+gemini-code-assist[bot]@users.noreply.github.com>` |
+
+The Gemini Code Assist address is observed in public GitHub usage; Google does not publish it as a canonical commit-attribution format.
