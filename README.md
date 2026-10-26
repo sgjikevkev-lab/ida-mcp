@@ -151,3 +151,7 @@ python tests/test_native_ida.py --ida "C:\Program Files\IDA Professional 9.2\ida
 ```
 
 The checks cover response contracts, bounds, request lifetime, queued cancellation, native fault quarantine, Python recovery, real Named Pipe routing and selected real IDA SDK paths. They do not establish crash freedom for all binaries.
+
+## Contributors
+
+- [OpenAI Codex](https://github.com/codex)
