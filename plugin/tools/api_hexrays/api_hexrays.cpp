@@ -862,7 +862,9 @@ namespace tools::hexrays_ast {
                 plan_and_wait(pfn->start_ea, pfn->end_ea);
             }
 
+#if IDA_SDK_VERSION >= 920
             cf->recalc_item_addresses();
+#endif
             cf->remove_unused_labels();
             cf->refresh_func_ctext();
 

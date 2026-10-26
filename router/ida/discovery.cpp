@@ -41,7 +41,7 @@ namespace ida {
         // The find handle MUST be closed BEFORE connecting to any pipe so that NPFS directory mutations
         // cannot corrupt enumeration or cause duplicate / missed instances.
         std::vector<std::pair<DWORD, std::wstring>> candidates;
-        std::set<DWORD> seen_pids;
+        std::set<std::wstring> seen_pipes;
 
         WIN32_FIND_DATAW find_data{};
         HANDLE hFind = FindFirstFileW(L"\\\\.\\pipe\\ida_mcp_*", &find_data);
@@ -51,9 +51,15 @@ namespace ida {
                 std::wstring pipe_file = find_data.cFileName;
                 if (pipe_file.rfind(prefix, 0) != 0) continue;
 
+                const std::wstring suffix = pipe_file.substr(prefix.size());
+                const size_t separator = suffix.find(L'_');
+                const std::wstring pid_text = suffix.substr(0, separator);
                 DWORD pid = 0;
                 try {
-                    pid = std::stoul(pipe_file.substr(prefix.size()));
+                    size_t parsed = 0;
+                    const unsigned long value = std::stoul(pid_text, &parsed);
+                    if (parsed != pid_text.size() || value > MAXDWORD) continue;
+                    pid = static_cast<DWORD>(value);
                 } catch (...) {
                     continue;
                 }
@@ -62,7 +68,7 @@ namespace ida {
                     continue;
                 }
 
-                if (seen_pids.insert(pid).second) {
+                if (seen_pipes.insert(pipe_file).second) {
                     candidates.push_back({pid, L"\\\\.\\pipe\\" + pipe_file});
                 }
             } while (FindNextFileW(hFind, &find_data));
@@ -76,7 +82,9 @@ namespace ida {
 
         // Sort by PID for stable, deterministic ordering
         std::sort(candidates.begin(), candidates.end(),
-            [](const auto& a, const auto& b) { return a.first < b.first; });
+            [](const auto& a, const auto& b) {
+                return a.first != b.first ? a.first < b.first : a.second < b.second;
+            });
 
         // Phase 2: Query metadata from each candidate pipe
         const std::string req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"get_instance_info\"}\n";
@@ -109,6 +117,8 @@ namespace ida {
                 inst.binary = result.value("binary", "");
                 inst.idb_path = result.value("idb_path", "");
                 inst.backend = result.value("backend", "gui");
+                inst.ida_version = result.value("ida_version", "");
+                inst.enabled = result.value("enabled", true);
 
                 if (inst.binary.empty() && !inst.idb_path.empty()) {
                     inst.binary = fs::path(inst.idb_path).filename().string();

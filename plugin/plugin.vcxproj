@@ -33,6 +33,9 @@
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <IdaSdkRoot>$(ProjectDir)!ibs\ida_91</IdaSdkRoot>
+  </PropertyGroup>
   <ImportGroup Label="ExtensionSettings">
   </ImportGroup>
   <ImportGroup Label="Shared">
@@ -60,7 +63,7 @@
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
-      <AdditionalIncludeDirectories>$(ProjectDir)!ibs;$(ProjectDir)!ibs\ida_92\include;$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)!ibs;$(IdaSdkRoot)\include;$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
       <DisableAnalyzeExternalHeader>true</DisableAnalyzeExternalHeader>
       <DisableSpecificWarnings>4267;4244;4018;4005;4996</DisableSpecificWarnings>
@@ -69,8 +72,8 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalLibraryDirectories>$(ProjectDir)third_party\rax\lib;$(ProjectDir)!ibs\ida_92\lib;$(ProjectDir)!ibs\ida_92\lib\x64_win_vc_64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>rax.lib;ntdll.lib;ida.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(ProjectDir)third_party\rax\lib;$(IdaSdkRoot)\lib;$(IdaSdkRoot)\lib\x64_win_vc_64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>rax.lib;ntdll.lib;ida.lib;ws2_32.lib;gdiplus.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -85,7 +88,7 @@
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
-      <AdditionalIncludeDirectories>$(ProjectDir)!ibs;$(ProjectDir)!ibs\ida_92\include;$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)!ibs;$(IdaSdkRoot)\include;$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
       <DisableAnalyzeExternalHeader>true</DisableAnalyzeExternalHeader>
       <DisableSpecificWarnings>4267;4244;4018;4005;4996</DisableSpecificWarnings>
@@ -94,8 +97,8 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalLibraryDirectories>$(ProjectDir)third_party\rax\lib;$(ProjectDir)!ibs\ida_92\lib;$(ProjectDir)!ibs\ida_92\lib\x64_win_vc_64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>rax.lib;ntdll.lib;ida.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(ProjectDir)third_party\rax\lib;$(IdaSdkRoot)\lib;$(IdaSdkRoot)\lib\x64_win_vc_64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>rax.lib;ntdll.lib;ida.lib;ws2_32.lib;gdiplus.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -105,6 +108,7 @@
     <ClInclude Include="third_party\rax\rax_bridge.h" />
     <ClInclude Include="server\pipe_server.h" />
     <ClInclude Include="server\status_tracker.h" />
+    <ClInclude Include="ui\settings_window.h" />
     <ClInclude Include="sync\sync.h" />
     <ClInclude Include="sync\cache_manager.h" />
     <ClInclude Include="tools\api_analysis\api_analysis.h" />
@@ -126,6 +130,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="ui\settings_window.cpp" />
     <ClCompile Include="server\pipe_server.cpp" />
     <ClCompile Include="tools\api_analysis\api_analysis.cpp" />
     <ClCompile Include="tools\api_analysis\api_emulation.cpp" />

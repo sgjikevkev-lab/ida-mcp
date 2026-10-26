@@ -460,33 +460,50 @@ namespace tools::sigmaker {
                     if (seg->type == SEG_XTRN || seg->type == SEG_NULL || seg->type == SEG_BSS) continue;
                     if (seg->size() == 0) continue;
 
-                    const auto segment_size = seg->size();
-                    if (segment_size > MAX_SIGNATURE_SNAPSHOT_BYTES - snapshot_bytes) {
-                        err_code = "binary_too_large";
-                        err_msg = "Signature scanning is limited to a 256 MiB readable-segment snapshot";
-                        return;
-                    }
-
-                    ScanSegment ss;
-                    ss.start_ea = seg->start_ea;
-                    ss.end_ea = seg->end_ea;
-                    ss.size = static_cast<size_t>(segment_size);
-                    ss.data.resize(ss.size, 0);
                     constexpr size_t READ_CHUNK_BYTES = 1024 * 1024;
-                    for (size_t offset = 0; offset < ss.size; ) {
+                    std::vector<uint8_t> chunk_data(READ_CHUNK_BYTES);
+                    ea_t cursor = seg->start_ea;
+                    while (cursor < seg->end_ea) {
                         sync::Checkpoint();
-                        const size_t chunk = std::min(READ_CHUNK_BYTES, ss.size - offset);
-                        const ssize_t got = get_bytes(ss.data.data() + offset, chunk,
-                            ss.start_ea + static_cast<ea_t>(offset), GMB_READALL);
-                        if (got != static_cast<ssize_t>(chunk)) {
-                            err_code = "incomplete_snapshot";
-                            err_msg = "IDA could not read every byte in the signature scan range";
+                        if (!is_loaded(cursor)) {
+                            cursor = next_inited(cursor, seg->end_ea);
+                            if (cursor == BADADDR || cursor >= seg->end_ea) break;
+                        }
+                        if (segs->size() >= 65536) {
+                            err_code = "snapshot_too_fragmented";
+                            err_msg = "Signature scanning supports up to 65536 initialized byte ranges";
                             return;
                         }
-                        offset += chunk;
+                        ScanSegment ss;
+                        ss.start_ea = cursor;
+                        while (cursor < seg->end_ea) {
+                            sync::Checkpoint();
+                            const size_t budget = MAX_SIGNATURE_SNAPSHOT_BYTES - snapshot_bytes;
+                            if (budget == 0) {
+                                if (!is_loaded(cursor)) break;
+                                err_code = "binary_too_large";
+                                err_msg = "Signature scanning is limited to 256 MiB of initialized bytes";
+                                return;
+                            }
+                            const size_t chunk = static_cast<size_t>(std::min<uint64_t>(
+                                std::min(READ_CHUNK_BYTES, budget), seg->end_ea - cursor));
+                            // Stop at the first uninitialized byte. Never scan invented
+                            // zeroes or allow a signature to span an IDB hole.
+                            const ssize_t got = get_bytes(chunk_data.data(), chunk, cursor, 0);
+                            if (got < 0 || (got == 0 && is_loaded(cursor))) {
+                                err_code = "snapshot_read_failed";
+                                err_msg = "IDA could not read initialized bytes for signature scanning";
+                                return;
+                            }
+                            ss.data.insert(ss.data.end(), chunk_data.begin(), chunk_data.begin() + got);
+                            snapshot_bytes += static_cast<size_t>(got);
+                            cursor += static_cast<ea_t>(got);
+                            if (got < static_cast<ssize_t>(chunk)) break;
+                        }
+                        ss.end_ea = cursor;
+                        ss.size = ss.data.size();
+                        if (!ss.data.empty()) segs->push_back(std::move(ss));
                     }
-                    snapshot_bytes += ss.size;
-                    segs->push_back(std::move(ss));
                 }
                 if (!err_code.empty()) return;
                 SegmentSnapshotCache::Instance().SetSegments(segs);

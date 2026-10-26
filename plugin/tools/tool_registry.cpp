@@ -255,12 +255,16 @@ namespace tools {
 
     nlohmann::json ToolRegistry::DispatchToolCall(const nlohmann::json& id, const std::string& name, const nlohmann::json& args) {
         sync::Checkpoint();
+        auto normalized = args;
+        auto normalization_error = mcp::NormalizeToolArguments(name, normalized);
+        if (!normalization_error.empty())
+            return tools::utils::MakeToolErrorJson(id, normalization_error, "invalid_params");
         bool schema_found = false;
         for (const auto& tool : GetToolsSchema()) {
             sync::Checkpoint();
             if (tool["name"] != name) continue;
             schema_found = true;
-            auto error = mcp::ValidateArguments(tool["inputSchema"], args);
+            auto error = mcp::ValidateArguments(tool["inputSchema"], normalized);
             if (!error.empty()) return tools::utils::MakeToolErrorJson(id, error, "invalid_params");
             break;
         }
@@ -268,7 +272,7 @@ namespace tools {
             return tools::utils::MakeToolErrorJson(id, "Tool not found: " + name, "tool_not_found");
         auto it = handlers_.find(name);
         if (it != handlers_.end()) {
-            return it->second(id, args);
+            return it->second(id, normalized);
         }
 
         return tools::utils::MakeToolErrorJson(id, "Tool not found: " + name, "tool_not_found");

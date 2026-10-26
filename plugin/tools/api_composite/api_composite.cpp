@@ -1198,7 +1198,7 @@ namespace tools::composite {
                             ret_type = tools::utils::SanitizeUtf8(ret_buf.c_str());
                         }
 
-                        callcnv_t cc = ftd.get_cc() & CM_CC_MASK;
+                        cm_t cc = ftd.get_cc() & CM_CC_MASK;
                         if (cc == CM_CC_FASTCALL) calling_conv = "__fastcall";
                         else if (cc == CM_CC_CDECL) calling_conv = "__cdecl";
                         else if (cc == CM_CC_STDCALL) calling_conv = "__stdcall";

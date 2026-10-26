@@ -11,6 +11,33 @@
 #include "shared/runtime_limits.h"
 
 namespace router {
+    namespace {
+        mcp::json GetFileNames(const std::map<std::string, ida::IdaInstance>& instances) {
+            mcp::json files = mcp::json::array();
+            for (const auto& entry : instances) files.push_back(entry.first);
+            return files;
+        }
+
+        mcp::json GetInstanceSummaries(
+            const std::map<std::string, ida::IdaInstance>& instances,
+            const std::string& active_file
+        ) {
+            mcp::json result = mcp::json::array();
+            for (const auto& [name, instance] : instances) {
+                result.push_back({
+                    {"filename", name},
+                    {"status", instance.enabled ? "active" : "inactive"},
+                    {"enabled", instance.enabled},
+                    {"selected", name == active_file},
+                    {"ida_version", instance.ida_version},
+                    {"idb_path", instance.idb_path},
+                    {"pid", instance.pid}
+                });
+            }
+            return result;
+        }
+    }
+
     void IdaRouter::RefreshInstances(bool force) {
         auto now = std::chrono::steady_clock::now();
         if (!force && !instances_.empty() && !active_file_.empty()) {
@@ -26,14 +53,24 @@ namespace router {
 
         instances_ = ida::InstanceDiscovery::Discover(active_pipe, &active_client_);
 
-        if (!cur.empty() && instances_.find(cur) != instances_.end()) {
+        if (!cur.empty() && instances_.contains(cur) && instances_.at(cur).enabled) {
             active_file_ = cur;
-        } else if (cur.empty() && !selection_required_ && instances_.size() == 1) {
-            active_file_ = instances_.begin()->first;
         } else {
             if (!cur.empty()) selection_required_ = true;
-            active_file_.clear();
-            active_client_.Disconnect();
+            std::string only_enabled;
+            size_t enabled_count = 0;
+            for (const auto& [name, instance] : instances_) {
+                if (instance.enabled) {
+                    only_enabled = name;
+                    ++enabled_count;
+                }
+            }
+            if (cur.empty() && !selection_required_ && enabled_count == 1) {
+                active_file_ = only_enabled;
+            } else {
+                active_file_.clear();
+                active_client_.Disconnect();
+            }
         }
 
         if (!active_file_.empty()) {
@@ -49,7 +86,7 @@ namespace router {
         return mcp::json::array({
             {
                 {"name", "get_available_files"},
-                {"description", "List all currently open binaries across active IDA Pro instances and show active selection."},
+                {"description", "List open binaries, including databases where MCP is disabled, with MCP state and IDA version."},
                 {"inputSchema", {
                     {"type", "object"},
                     {"properties", mcp::json::object()},
@@ -111,13 +148,11 @@ namespace router {
             busy_now = is_busy_;
         }
         if (!busy_now) {
-            RefreshInstances();
+            RefreshInstances(true);
         }
 
-        mcp::json files_arr = mcp::json::array();
-        for (const auto& kv : instances_) {
-            files_arr.push_back(kv.first);
-        }
+        const mcp::json files_arr = GetFileNames(instances_);
+        const mcp::json instance_summaries = GetInstanceSummaries(instances_, active_file_);
         auto t1 = std::chrono::steady_clock::now();
         double elapsed_sec = std::round(std::chrono::duration<double>(t1 - t0).count() * 1000.0) / 1000.0;
 
@@ -125,6 +160,7 @@ namespace router {
             {"status", "success"},
             {"active_file", active_file_.empty() ? nullptr : mcp::json(active_file_)},
             {"files", files_arr},
+            {"instances", instance_summaries},
             {"elapsed_sec", elapsed_sec}
         };
         mcp::StdioTransport::Send(mcp::MakeSuccessResponse(id, mcp::MakeToolCallResult(res.dump(2))));
@@ -199,6 +235,20 @@ namespace router {
         double elapsed_sec = std::round(std::chrono::duration<double>(t1 - t0).count() * 1000.0) / 1000.0;
 
         if (!matched_key.empty()) {
+            const auto& target_instance = instances_.at(matched_key);
+            if (!target_instance.enabled) {
+                const mcp::ordered_json res = {
+                    {"error_code", "file_inactive"},
+                    {"message", "MCP is disabled for this database in IDA"},
+                    {"filename", matched_key},
+                    {"ida_version", target_instance.ida_version},
+                    {"available_files", GetFileNames(instances_)},
+                    {"instances", GetInstanceSummaries(instances_, active_file_)}
+                };
+                mcp::StdioTransport::Send(mcp::MakeSuccessResponse(
+                    id, mcp::MakeToolCallResult(res.dump(2), true)));
+                return;
+            }
             if (active_file_ != matched_key || !active_client_.IsConnected()) {
                 active_client_.Disconnect();
                 if (!active_client_.Connect(instances_[matched_key].pipe_name, 3000)) {
@@ -213,6 +263,7 @@ namespace router {
             mcp::ordered_json res = {
                 {"status", "success"},
                 {"active_file", matched_key},
+                {"ida_version", target_instance.ida_version},
                 {"elapsed_sec", elapsed_sec}
             };
             mcp::StdioTransport::Send(mcp::MakeSuccessResponse(
@@ -240,11 +291,8 @@ namespace router {
     void IdaRouter::ForwardToolCall(const mcp::json& req, const mcp::json& id, const std::string& raw_tool_call) {
         std::string previous_active = active_file_;
 
-        if (active_file_.empty() || instances_.find(active_file_) == instances_.end()) {
-            mcp::json files_arr = mcp::json::array();
-            for (const auto& kv : instances_) {
-                files_arr.push_back(kv.first);
-            }
+        if (active_file_.empty() || instances_.find(active_file_) == instances_.end() || !instances_.at(active_file_).enabled) {
+            const mcp::json files_arr = GetFileNames(instances_);
 
             std::string msg = previous_active.empty()
                 ? "No active IDA Pro file selected. Please call switch_file to select an open file."
@@ -254,7 +302,8 @@ namespace router {
                 {"status", "error"},
                 {"error_code", "no_active_file"},
                 {"message", msg},
-                {"available_files", files_arr}
+                {"available_files", files_arr},
+                {"instances", GetInstanceSummaries(instances_, active_file_)}
             };
 
             mcp::StdioTransport::Send(mcp::MakeSuccessResponse(
@@ -350,6 +399,13 @@ namespace router {
     }
 
     void IdaRouter::HandleGetStatus(const mcp::json& id) {
+        bool busy_snapshot = false;
+        {
+            std::lock_guard<std::mutex> lock(status_mtx_);
+            busy_snapshot = is_busy_;
+        }
+        if (!busy_snapshot) RefreshInstances();
+
         mcp::json result;
         {
             std::lock_guard<std::mutex> lock(status_mtx_);
@@ -360,6 +416,18 @@ namespace router {
                     std::chrono::steady_clock::now() - active_tool_start_).count();
             }
         }
+        if (instances_.contains(active_file_)) {
+            const auto& instance = instances_.at(active_file_);
+            result["ida_version"] = instance.ida_version;
+            result["enabled"] = instance.enabled;
+            result["idb_path"] = instance.idb_path;
+        } else if (instances_.size() == 1) {
+            const auto& instance = instances_.begin()->second;
+            result["ida_version"] = instance.ida_version;
+            result["enabled"] = instance.enabled;
+            result["idb_path"] = instance.idb_path;
+        }
+        result["instances"] = GetInstanceSummaries(instances_, active_file_);
         if (!result["busy"].get<bool>() && !active_file_.empty() && instances_.contains(active_file_)) {
             std::string response;
             const mcp::json request = {{"jsonrpc", "2.0"}, {"id", id}, {"method", "tools/call"},
@@ -367,7 +435,20 @@ namespace router {
             if (ipc::PipeClient::CallOnce(instances_.at(active_file_).pipe_name, request.dump(), response, 500)) {
                 auto parsed = mcp::json::parse(response, nullptr, false);
                 if (!parsed.is_discarded() && parsed.is_object() && parsed.contains("result")) {
+                    const auto& content = parsed["result"].value("content", mcp::json::array());
+                    if (!content.empty() && content[0].contains("text") && content[0]["text"].is_string()) {
+                        auto backend = mcp::json::parse(content[0]["text"].get<std::string>(), nullptr, false);
+                        if (backend.is_object()) {
+                            for (auto item = backend.begin(); item != backend.end(); ++item)
+                                result[item.key()] = item.value();
+                            mcp::StdioTransport::Send(mcp::MakeSuccessResponse(id, mcp::MakeToolCallResult(result.dump())));
+                            return;
+                        }
+                    }
                     parsed["id"] = id;
+                    // Preserve both diagnostics and routing context for older
+                    // plugins whose status text is not compact JSON.
+                    parsed["result"]["content"].push_back({{"type", "text"}, {"text", result.dump()}});
                     mcp::StdioTransport::Send(parsed);
                     return;
                 }
@@ -485,6 +566,13 @@ namespace router {
         std::string name = params.value("name", "");
         mcp::json args = params.value("arguments", mcp::json::object());
 
+        auto normalization_error = mcp::NormalizeToolArguments(name, args);
+        if (!normalization_error.empty()) {
+            mcp::StdioTransport::Send(mcp::MakeSuccessResponse(id,
+                mcp::MakeToolCallResult(mcp::json({{"error_code", "invalid_params"}, {"message", normalization_error}}).dump(), true)));
+            return;
+        }
+
         auto schemas = GetCustomTools();
         for (const auto& tool : mcp::GetDefaultIdaToolsSchema()) schemas.push_back(tool);
         bool found = false;
@@ -511,7 +599,9 @@ namespace router {
         } else if (name == "switch_file") {
             HandleSwitchFile(id, args);
         } else {
-            DispatchToolCallAsync(req, id, raw_tool_call, name, args);
+            auto forwarded = req;
+            forwarded["params"]["arguments"] = args;
+            DispatchToolCallAsync(forwarded, id, forwarded.dump(), name, args);
         }
     }
 

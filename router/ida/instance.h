@@ -11,5 +11,7 @@ namespace ida {
         std::string binary;
         std::string idb_path;
         std::string backend;
+        std::string ida_version;
+        bool enabled = true;
     };
 }

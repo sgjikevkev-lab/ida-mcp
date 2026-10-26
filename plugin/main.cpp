@@ -1,13 +1,28 @@
 #include "server/pipe_server.h"
 #include <string>
 #include <memory>
+#include "ui/settings_window.h"
 
 #include <ida.hpp>
 #include <idp.hpp>
 #include <loader.hpp>
 #include <kernwin.hpp>
+#include <netnode.hpp>
 
 namespace {
+    constexpr char kMcpSettingsNode[] = "$ ida_mcp";
+    constexpr nodeidx_t kMcpEnabledIndex = 0;
+
+    bool LoadMcpEnabled() {
+        netnode settings(kMcpSettingsNode);
+        return settings == BADNODE || settings.altval(kMcpEnabledIndex) != 2;
+    }
+
+    bool SaveMcpEnabled(bool enabled) {
+        netnode settings(kMcpSettingsNode, 0, true);
+        return settings != BADNODE && settings.altset(kMcpEnabledIndex, enabled ? 1 : 2);
+    }
+
     ssize_t idaapi DatabaseChanged(void*, int event, va_list) {
         switch (event) {
             case idb_event::byte_patched:
@@ -34,8 +49,9 @@ namespace {
     }
     class McpPluginSession : public plugmod_t {
     public:
-        McpPluginSession() {
+        McpPluginSession() : enabled_(LoadMcpEnabled()) {
             hook_to_notification_point(HT_IDB, DatabaseChanged, this);
+            server_.SetEnabled(enabled_);
             if (!server_.Start()) {
                 unhook_from_notification_point(HT_IDB, DatabaseChanged, this);
                 throw std::runtime_error("Cannot start MCP pipe server");
@@ -48,11 +64,24 @@ namespace {
         }
 
         virtual bool idaapi run(size_t) override {
-            msg("[IDA MCP] Native Named Pipe server is active on \\\\.\\pipe\\ida_mcp_%lu\n", GetCurrentProcessId());
+            char version[64]{};
+            get_kernel_version(version, sizeof(version));
+            version[sizeof(version) - 1] = '\0';
+            if (!ui::ShowMcpSettings(enabled_, version, [this](bool requested) {
+                const bool saved = SaveMcpEnabled(requested);
+                enabled_ = requested;
+                server_.SetEnabled(enabled_);
+                msg("[IDA MCP] MCP for this database is now %s\n", enabled_ ? "enabled" : "disabled");
+                if (!saved)
+                    msg("[IDA MCP] Setting applies for this session but could not be saved with the database.\n");
+                return saved;
+            }))
+                warning("IDA MCP: could not open the settings window.");
             return true;
         }
 
     private:
+        bool enabled_ = true;
         server::PipeServer server_;
     };
 
@@ -67,12 +96,12 @@ namespace {
 
 plugin_t PLUGIN = {
     IDP_INTERFACE_VERSION,
-    PLUGIN_MULTI | PLUGIN_HIDE,
+    PLUGIN_MULTI,
     init,
     nullptr,
     nullptr,
-    "IDA Pro MCP Server",
-    "",
-    "ida_mcp",
+    "Control MCP for this database",
+    "Toggle MCP availability for the current database",
+    "IDA MCP",
     ""
 };

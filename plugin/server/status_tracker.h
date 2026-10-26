@@ -13,11 +13,29 @@
 namespace server {
 
 class PluginStatusTracker {
+    inline static thread_local PluginStatusTracker* current_tracker_ = nullptr;
+
 public:
+    PluginStatusTracker() = default;
+    ~PluginStatusTracker() = default;
+
     static PluginStatusTracker& Instance() {
+        if (current_tracker_) return *current_tracker_;
         static PluginStatusTracker tracker;
         return tracker;
     }
+
+    class Scope {
+    public:
+        explicit Scope(PluginStatusTracker& tracker) : previous_(current_tracker_) {
+            current_tracker_ = &tracker;
+        }
+        ~Scope() { current_tracker_ = previous_; }
+        Scope(const Scope&) = delete;
+        Scope& operator=(const Scope&) = delete;
+    private:
+        PluginStatusTracker* previous_;
+    };
 
     void BeginTool(const std::string& tool, const std::string& args_summary = "") {
         std::lock_guard<std::mutex> lock(mtx_);
@@ -28,6 +46,11 @@ public:
         total_steps_ = 0;
         progress_message_.clear();
         is_busy_.store(true, std::memory_order_release);
+    }
+
+    void SetIdaVersion(const std::string& version) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        ida_version_ = version;
     }
 
     void UpdateProgress(uint64_t current, uint64_t total, const std::string& msg = "") {
@@ -53,20 +76,34 @@ public:
         return is_busy_.load(std::memory_order_acquire);
     }
 
-    void Quarantine() { quarantined_.store(true, std::memory_order_release); }
+    void Quarantine(nlohmann::json fault) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        last_fault_ = std::move(fault);
+        quarantined_.store(true, std::memory_order_release);
+    }
+
+    void ResetQuarantine() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        quarantined_.store(false, std::memory_order_release);
+        ++quarantine_resets_;
+    }
 
     std::string GetCurrentTool() const {
         std::lock_guard<std::mutex> lock(mtx_);
         return current_tool_;
     }
 
-    nlohmann::json GetStatusJson(const nlohmann::json& id) {
+    nlohmann::json GetStatusJson(const nlohmann::json& id, bool enabled = true) {
         std::lock_guard<std::mutex> lock(mtx_);
         bool busy = is_busy_.load(std::memory_order_acquire);
         nlohmann::json res = {
-            {"busy", busy}
+            {"busy", busy},
+            {"enabled", enabled},
+            {"ida_version", ida_version_}
         };
         if (quarantined_.load(std::memory_order_acquire)) res["quarantined"] = true;
+        if (!last_fault_.is_null()) res["last_fault"] = last_fault_;
+        if (quarantine_resets_ != 0) res["quarantine_resets"] = quarantine_resets_;
 
         if (busy) {
             auto now = std::chrono::steady_clock::now();
@@ -94,15 +131,16 @@ public:
     }
 
 private:
-    PluginStatusTracker() = default;
-    ~PluginStatusTracker() = default;
     PluginStatusTracker(const PluginStatusTracker&) = delete;
     PluginStatusTracker& operator=(const PluginStatusTracker&) = delete;
 
     mutable std::mutex mtx_;
     std::atomic<bool> is_busy_{false};
     std::atomic<bool> quarantined_{false};
+    nlohmann::json last_fault_;
+    uint64_t quarantine_resets_ = 0;
     std::string current_tool_;
+    std::string ida_version_;
     std::string args_summary_;
     std::chrono::steady_clock::time_point start_time_;
     uint64_t current_step_{0};

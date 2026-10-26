@@ -2,16 +2,27 @@
 #pragma warning(push, 0)
 #pragma warning(disable: 26819 26495 26812 26451 6001 6011)
 #include "json.h"
+#include "tool_arguments.h"
 #pragma warning(pop)
 
 namespace mcp {
     using json = nlohmann::json;
 
     inline const json& GetDefaultIdaToolsSchema() {
-        static const json kIdaTools = json::parse(R"schema([
+        static const json kIdaTools = [] {
+            auto tools = json::parse(R"schema([
   {
     "name": "get_status",
-    "description": "Check IDA Pro availability and active database status.",
+    "description": "Check IDA Pro version, active database, MCP availability, and execution status.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "reset_quarantine",
+    "description": "Explicitly clear an idle backend's native-fault quarantine and invalidate plugin caches. Never retries the failed request. Cannot repair process corruption; heap/stack or noncontinuable faults require restarting IDA. Inspect get_status for the retained last fault.",
     "inputSchema": {
       "type": "object",
       "properties": {},
@@ -362,7 +373,7 @@ namespace mcp {
           "type": "integer",
           "description": "Max functions to return (default 100, max 2000)",
           "minimum": 0,
-          "maximum": 4096
+          "maximum": 2000
         }
       },
       "additionalProperties": false
@@ -405,7 +416,7 @@ namespace mcp {
           "type": "integer",
           "description": "Max symbols to return (default 100, max 2000)",
           "minimum": 0,
-          "maximum": 4096
+          "maximum": 2000
         }
       },
       "additionalProperties": false
@@ -947,9 +958,9 @@ namespace mcp {
         },
         "count": {
           "type": "integer",
-          "description": "Max results to return (default 50)",
+          "description": "Max results to return (default 50, max 2000)",
           "minimum": 0,
-          "maximum": 4096
+          "maximum": 2000
         }
       },
       "additionalProperties": false
@@ -1017,7 +1028,7 @@ namespace mcp {
           "type": "integer",
           "description": "Max classes to return per page (default 50, max 500)",
           "minimum": 0,
-          "maximum": 4096
+          "maximum": 500
         },
         "offset": {
           "type": "integer",
@@ -1116,7 +1127,8 @@ namespace mcp {
         "depth": {
           "type": "integer",
           "description": "Hex-Rays mode: max inter-procedural call traversal depth (default 2, max 5); ignored in machine-level mode",
-          "minimum": 0
+          "minimum": 0,
+          "maximum": 5
         },
         "include_calls": {
           "type": "boolean",
@@ -1490,7 +1502,8 @@ namespace mcp {
         "scan_depth": {
           "type": "integer",
           "description": "Inter-procedural scan depth into called functions passing this pointer (default 2, max 5)",
-          "minimum": 0
+          "minimum": 0,
+          "maximum": 5
         },
         "apply": {
           "type": "boolean",
@@ -1549,6 +1562,9 @@ namespace mcp {
     }
   }
 ])schema");
+            AddSearchAliases(tools);
+            return tools;
+        }();
         return kIdaTools;
     }
 }

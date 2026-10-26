@@ -336,7 +336,7 @@ namespace tools::analysis {
             function_type.get_func_details(&function_details);
         if (has_prototype && function_details.is_vararg_cc())
             return tools::utils::MakeToolErrorJson(id, "Variadic function prototypes are not supported by emulate_function", "unsupported_prototype");
-        if (has_prototype && function_details.is_user_cc())
+        if (has_prototype && is_user_cc(function_details.get_cc()))
             return tools::utils::MakeToolErrorJson(id, "Custom __usercall prototypes need explicit register-location support", "unsupported_prototype");
 
         std::vector<CallArgument> arguments;
@@ -495,14 +495,30 @@ namespace tools::analysis {
 
         struct SegmentCopy { ea_t start; size_t size; std::vector<uint8_t> before; };
         std::vector<SegmentCopy> originals;
+        size_t uninitialized_bytes_zeroed = 0;
         for (segment_t* seg : segments) {
             sync::Checkpoint();
             const uint64_t size64 = static_cast<uint64_t>(seg->end_ea - seg->start_ea);
             if (size64 == 0 || size64 > max_memory_bytes) continue;
             SegmentCopy copy{seg->start_ea, static_cast<size_t>(size64), std::vector<uint8_t>(static_cast<size_t>(size64), 0)};
-            const ssize_t read_size = get_bytes(copy.before.data(), static_cast<ssize_t>(copy.before.size()), copy.start, GMB_READALL);
-            if (read_size != static_cast<ssize_t>(copy.before.size()))
-                return tools::utils::MakeToolErrorJson(id, "Could not read the full IDB segment into guest memory", "memory_copy_failed");
+            std::vector<uint8_t> initialized((copy.size + 7) / 8, 0);
+            const ssize_t read_size = get_bytes(copy.before.data(), static_cast<ssize_t>(copy.before.size()),
+                copy.start, GMB_READALL, initialized.data());
+            if (read_size < 0 || static_cast<size_t>(read_size) > copy.size)
+                return tools::utils::MakeToolErrorJson(id, "Could not read IDB memory for emulation", "memory_copy_failed");
+            if (static_cast<size_t>(read_size) != copy.size) {
+                size_t missing = 0;
+                for (size_t byte = 0; byte < copy.size; ++byte) {
+                    if ((byte & 4095) == 0) sync::Checkpoint();
+                    if ((initialized[byte / 8] & (1u << (byte % 8))) == 0) {
+                        copy.before[byte] = 0;
+                        ++missing;
+                    }
+                }
+                if (missing != copy.size - static_cast<size_t>(read_size))
+                    return tools::utils::MakeToolErrorJson(id, "Inconsistent IDB initialization mask", "memory_copy_failed");
+                uninitialized_bytes_zeroed += missing;
+            }
             status = rax_mem_write(guard.engine, copy.start, copy.before.data(), copy.before.size());
             if (status != RAX_OK)
                 return tools::utils::MakeToolErrorJson(id, std::string("Could not copy IDB segment into guest memory: ") + rax_strerror(status), "memory_copy_failed");
@@ -607,6 +623,10 @@ namespace tools::analysis {
             {"stopped_at", Hex64(final_pc)},
             {"mapped_bytes", pages.size() * kPage + kStackSize}
         };
+        if (uninitialized_bytes_zeroed != 0) {
+            result["uninitialized_bytes_zeroed"] = uninitialized_bytes_zeroed;
+            result["memory_assumption"] = "Uninitialized IDB bytes are modeled as zero; runtime initialization is not simulated.";
+        }
         if (!has_prototype || !function_details.rettype.is_floating())
             result["return_value"] = Hex64(return_value);
         if (!changed.empty()) result["memory_writes"] = std::move(changed);

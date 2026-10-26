@@ -5,6 +5,7 @@
 #include <mutex>
 #include <vector>
 #include <map>
+#include <sstream>
 #include <excpt.h>
 #include <ida.hpp>
 #include <kernwin.hpp>
@@ -63,6 +64,7 @@ namespace server {
         nlohmann::json id;
         std::string name;
         std::string cancel_token;
+        nlohmann::json diagnostic_arguments = nlohmann::json::object();
         std::function<std::string()> work;
         std::string response;
     };
@@ -79,9 +81,12 @@ namespace server {
             }
         };
         std::mutex mutex_;
+        PluginStatusTracker status_tracker_;
         std::vector<std::unique_ptr<Request>> requests_;
         std::shared_ptr<ToolJob> active_;
         std::atomic<bool> quarantined_{false};
+        std::atomic<bool> reset_available_{false};
+        std::atomic<bool> enabled_{true};
         bool stopping_ = false;
         std::map<std::string, nlohmann::json> early_cancellations_;
         bool CancelQueuedLocked(const std::shared_ptr<ToolJob>& job) {
@@ -95,7 +100,7 @@ namespace server {
                     timeout ? "execution_timeout" : "cancelled").dump();
                 job->work = {};
                 job->done.store(true, std::memory_order_release);
-                PluginStatusTracker::Instance().EndTool();
+                status_tracker_.EndTool();
                 return true;
             }
             return false;
@@ -103,6 +108,10 @@ namespace server {
 
         struct FaultInfo {
             void* address = nullptr;
+            DWORD flags = 0;
+            DWORD parameter_count = 0;
+            ULONG_PTR access_type = 0;
+            ULONG_PTR access_address = 0;
             void* stack[32] = {};
             USHORT count = 0;
         };
@@ -110,6 +119,12 @@ namespace server {
             // Let ordinary C++ exceptions unwind normally.
             if (exception->ExceptionRecord->ExceptionCode == 0xE06D7363) return EXCEPTION_CONTINUE_SEARCH;
             info->address = exception->ExceptionRecord->ExceptionAddress;
+            info->flags = exception->ExceptionRecord->ExceptionFlags;
+            info->parameter_count = exception->ExceptionRecord->NumberParameters;
+            if (info->parameter_count >= 2) {
+                info->access_type = exception->ExceptionRecord->ExceptionInformation[0];
+                info->access_address = exception->ExceptionRecord->ExceptionInformation[1];
+            }
             info->count = CaptureStackBackTrace(0, 32, info->stack, nullptr);
             return EXCEPTION_EXECUTE_HANDLER;
         }
@@ -129,6 +144,15 @@ namespace server {
                     return r.get() != &request && r->job->done.load(std::memory_order_acquire);
                 });
             }
+            if (!enabled_.load(std::memory_order_acquire) && job->name != "reset_quarantine") {
+                job->response = tools::utils::MakeToolErrorJson(job->id,
+                    "MCP is disabled for this IDA database", "file_inactive").dump();
+                job->work = {};
+                status_tracker_.EndTool();
+                job->done.store(true, std::memory_order_release);
+                return;
+            }
+            PluginStatusTracker::Scope status_scope(status_tracker_);
             job->started.store(true, std::memory_order_release);
             sync::OperationScope operation(&job->operation);
             // Python intentionally retains IDAPython's interactive cancellation.
@@ -138,7 +162,7 @@ namespace server {
                 job->response = tools::utils::MakeToolErrorJson(job->id,
                     "Could not enforce unattended IDA UI mode", "ui_guard_unavailable").dump();
                 job->work = {};
-                PluginStatusTracker::Instance().EndTool();
+                status_tracker_.EndTool();
                 job->done.store(true, std::memory_order_release);
                 return;
             }
@@ -172,17 +196,64 @@ namespace server {
                         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(fault_info.stack[i]) - reinterpret_cast<uintptr_t>(module)));
                 }
                 quarantined_.store(true, std::memory_order_release);
-                PluginStatusTracker::Instance().Quarantine();
+                const bool can_reset = fault == EXCEPTION_ACCESS_VIOLATION &&
+                    (fault_info.flags & EXCEPTION_NONCONTINUABLE) == 0 &&
+                    (fault_info.parameter_count < 2 || fault_info.access_type == 0);
+                reset_available_.store(can_reset, std::memory_order_release);
+                auto hex = [](uint64_t value) {
+                    std::ostringstream output;
+                    output << "0x" << std::uppercase << std::hex << value;
+                    return output.str();
+                };
+                nlohmann::json diagnostic = {{"tool", job->name}, {"exception_code", hex(fault)},
+                    {"exception_address", hex(reinterpret_cast<uintptr_t>(fault_info.address))}, {"reset_available", can_reset}};
+                if (!job->diagnostic_arguments.empty()) diagnostic["arguments"] = job->diagnostic_arguments;
+                if (fault == EXCEPTION_ACCESS_VIOLATION && fault_info.parameter_count >= 2) {
+                    diagnostic["access"] = fault_info.access_type == 0 ? "read" : fault_info.access_type == 1 ? "write" : "execute";
+                    diagnostic["access_address"] = hex(fault_info.access_address);
+                }
+                status_tracker_.Quarantine(std::move(diagnostic));
                 job->response = tools::utils::MakeToolErrorJson(job->id,
-                    "Native IDA fault; backend quarantined. Restart IDA before further tools.",
+                    can_reset ? "Native fault; backend quarantined. Inspect get_status, then explicitly reset_quarantine or restart IDA."
+                              : "Native fault; backend quarantined. Restart IDA before further tools.",
                     "native_fault", static_cast<int>(fault)).dump();
             }
             job->work = {};
-            PluginStatusTracker::Instance().EndTool();
+            status_tracker_.EndTool();
             job->done.store(true, std::memory_order_release);
         }
     public:
+        void SetIdaVersion(const std::string& version) { status_tracker_.SetIdaVersion(version); }
+        nlohmann::json GetStatusJson(const nlohmann::json& id, bool enabled) {
+            return status_tracker_.GetStatusJson(id, enabled);
+        }
+        void SetEnabled(bool enabled) { enabled_.store(enabled, std::memory_order_release); }
         bool Quarantined() const { return quarantined_.load(std::memory_order_acquire); }
+        nlohmann::json ResetQuarantine(const nlohmann::json& id) {
+            if (!is_main_thread())
+                return tools::utils::MakeToolErrorJson(id, "Recovery requires the IDA main thread", "internal_error");
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (stopping_ || !active_ || active_->name != "reset_quarantine" ||
+                    !active_->started.load(std::memory_order_acquire) || active_->done.load(std::memory_order_acquire))
+                    return tools::utils::MakeToolErrorJson(id, "Recovery must be submitted through the dispatcher", "busy");
+            }
+            if (!Quarantined())
+                return tools::utils::MakeToolSuccessJson(id, {{"quarantined", false}, {"reset", false}});
+            if (!reset_available_.load(std::memory_order_acquire))
+                return tools::utils::MakeToolErrorJson(id,
+                    "This native fault cannot be reset; restart IDA", "restart_required");
+            // Only an explicitly submitted recovery job reaches here, after the
+            // failed callback has returned. Never repeat the failed operation.
+            cache::InvalidateIDBDependentCaches();
+            sync::callback_exception = {};
+            sync::recursion_depth = 0;
+            status_tracker_.ResetQuarantine();
+            quarantined_.store(false, std::memory_order_release);
+            reset_available_.store(false, std::memory_order_release);
+            return tools::utils::MakeToolSuccessJson(id, {{"quarantined", false}, {"reset", true},
+                {"warning", "Reset does not repair process memory; restart IDA if further faults occur."}});
+        }
         bool Cancel(const nlohmann::json& id, const std::string& token) {
             std::lock_guard<std::mutex> lock(mutex_);
             if (token.empty()) return false;
@@ -202,9 +273,10 @@ namespace server {
             CancelQueuedLocked(job);
         }
         std::shared_ptr<ToolJob> Submit(const nlohmann::json& id, const std::string& name,
-                                       std::function<std::string()> work, const std::string& token = {}) {
+                                       std::function<std::string()> work, const std::string& token = {},
+                                       const nlohmann::json& arguments = nlohmann::json::object()) {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (stopping_ || Quarantined() || (active_ && !active_->done.load(std::memory_order_acquire)))
+            if (stopping_ || (Quarantined() && name != "reset_quarantine") || (active_ && !active_->done.load(std::memory_order_acquire)))
                 return {};
             std::erase_if(requests_, [](const auto& request) {
                 return request->job->done.load(std::memory_order_acquire) &&
@@ -213,6 +285,8 @@ namespace server {
             auto job = std::make_shared<ToolJob>();
             job->id = id;
             job->name = name;
+            if (arguments.is_object()) for (const char* key : {"addr", "var", "scan_depth"})
+                if (arguments.contains(key)) job->diagnostic_arguments[key] = arguments[key];
             job->cancel_token = token;
             auto early = early_cancellations_.find(token);
             if (early != early_cancellations_.end()) {
@@ -224,14 +298,14 @@ namespace server {
             Request* ptr = req.get();
             requests_.push_back(std::move(req));
             active_ = job;
-            PluginStatusTracker::Instance().BeginTool(name);
+            status_tracker_.BeginTool(name);
             // All tools, including decompilation, can update IDA metadata.
             ptr->request_id = execute_sync(*ptr, MFF_WRITE | MFF_NOWAIT);
             if (ptr->request_id < 0) {
                 job->response = tools::utils::MakeToolErrorJson(id, "IDA rejected execution request", "dispatch_failed").dump();
                 job->work = {};
                 job->done.store(true, std::memory_order_release);
-                PluginStatusTracker::Instance().EndTool();
+                status_tracker_.EndTool();
             }
             return job;
         }

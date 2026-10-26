@@ -5,6 +5,7 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <vector>
 #include "tools/tool_registry.h"
@@ -17,6 +18,8 @@ namespace server {
         ~PipeServer();
         bool Start();
         void Stop();
+        void SetEnabled(bool enabled);
+        bool IsEnabled() const { return enabled_.load(std::memory_order_acquire); }
         std::wstring GetPipeName() const { return pipe_name_; }
     private:
         struct Client {
@@ -25,6 +28,8 @@ namespace server {
         };
         std::wstring pipe_name_;
         std::atomic<bool> running_{false};
+        std::atomic<bool> enabled_{true};
+        uint32_t pipe_slot_ = 0;
         std::thread server_thread_;
         std::vector<Client> clients_;
         std::shared_ptr<tools::ToolRegistry> tool_registry_;

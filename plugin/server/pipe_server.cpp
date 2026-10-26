@@ -1,10 +1,18 @@
 #include "pipe_server.h"
 #include "shared/pipe_io.h"
 #include "shared/json_parse.h"
+#include "shared/ida_tools_schema.h"
+#include "shared/argument_validation.h"
 #include <nalt.hpp>
 #include <loader.hpp>
+#include <kernwin.hpp>
+#include <atomic>
 
 namespace server {
+    namespace {
+        std::atomic<uint32_t> next_pipe_slot{0};
+    }
+
     PipeServer::PipeServer() : tool_registry_(std::make_shared<tools::ToolRegistry>()) {}
     PipeServer::~PipeServer() { Stop(); }
 
@@ -13,9 +21,16 @@ namespace server {
         char binary[QMAXPATH] = {};
         get_root_filename(binary, sizeof(binary));
         const char* path = get_path(PATH_TYPE_IDB);
+        char ida_version[64] = {};
+        get_kernel_version(ida_version, sizeof(ida_version));
+        ida_version[sizeof(ida_version) - 1] = '\0';
         instance_info_ = {{"pid", GetCurrentProcessId()}, {"binary", binary},
-                          {"idb_path", path ? path : ""}, {"backend", "gui"}};
+                          {"idb_path", path ? path : ""}, {"backend", "gui"},
+                          {"ida_version", ida_version}, {"enabled", IsEnabled()}};
+        dispatcher_.SetIdaVersion(ida_version);
         pipe_name_ = L"\\\\.\\pipe\\ida_mcp_" + std::to_wstring(GetCurrentProcessId());
+        if (pipe_slot_ == 0) pipe_slot_ = next_pipe_slot.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (pipe_slot_ > 1) pipe_name_ += L"_" + std::to_wstring(pipe_slot_);
         shutdown_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (!shutdown_event_) return false;
         try {
@@ -37,6 +52,11 @@ namespace server {
         }
         msg("[IDA MCP] Named pipe server started\n");
         return true;
+    }
+
+    void PipeServer::SetEnabled(bool enabled) {
+        enabled_.store(enabled, std::memory_order_release);
+        dispatcher_.SetEnabled(enabled);
     }
 
     void PipeServer::Stop() {
@@ -163,7 +183,9 @@ namespace server {
                 }
                 if (!request.contains("id")) continue;
                 if (method == "get_instance_info" || method == "ida/info") {
-                    if (!send(nlohmann::json({{"jsonrpc", "2.0"}, {"id", id}, {"result", instance_info_}}).dump())) return;
+                    auto info = instance_info_;
+                    info["enabled"] = IsEnabled();
+                    if (!send(nlohmann::json({{"jsonrpc", "2.0"}, {"id", id}, {"result", info}}).dump())) return;
                     continue;
                 }
                 if (method != "tools/call") {
@@ -176,21 +198,42 @@ namespace server {
                     continue;
                 }
                 const std::string name = tools::utils::GetStringArg(params, "name");
+                const bool recovery = name == "reset_quarantine";
+                if (name == "get_status" || recovery) {
+                    const auto arguments = params.value("arguments", nlohmann::json::object());
+                    std::string validation_error;
+                    for (const auto& tool : mcp::GetDefaultIdaToolsSchema()) {
+                        if (tool["name"] == name) {
+                            validation_error = mcp::ValidateArguments(tool["inputSchema"], arguments);
+                            break;
+                        }
+                    }
+                    if (!validation_error.empty()) {
+                        if (!error(id, validation_error, "invalid_params")) return;
+                        continue;
+                    }
+                }
                 if (name == "get_status") {
-                    if (!send(PluginStatusTracker::Instance().GetStatusJson(id).dump())) return;
+                    if (!send(dispatcher_.GetStatusJson(id, IsEnabled()).dump())) return;
+                    continue;
+                }
+                if (!IsEnabled() && !recovery) {
+                    if (!error(id, "MCP is disabled for this IDA database", "file_inactive")) return;
                     continue;
                 }
                 if (pending) {
                     if (!error(id, "A tool is already running; use get_status", "busy")) return;
                     continue;
                 }
-                if (dispatcher_.Quarantined()) {
-                    if (!error(id, "Backend quarantined after a native fault; restart IDA", "backend_quarantined")) return;
+                if (dispatcher_.Quarantined() && !recovery) {
+                    if (!error(id, "Backend quarantined after a native fault; inspect get_status and reset_quarantine or restart IDA", "backend_quarantined")) return;
                     continue;
                 }
                 auto registry = tool_registry_;
-                pending = dispatcher_.Submit(id, name, [registry, line] { return registry->HandleRequest(line); },
-                    tools::utils::GetStringArg(request, "_cancel_token"));
+                auto work = recovery ? std::function<std::string()>([this, id] { return dispatcher_.ResetQuarantine(id).dump(); })
+                                     : std::function<std::string()>([registry, line] { return registry->HandleRequest(line); });
+                pending = dispatcher_.Submit(id, name, std::move(work),
+                    tools::utils::GetStringArg(request, "_cancel_token"), params.value("arguments", nlohmann::json::object()));
                 if (!pending && !error(id, "IDA is busy; use get_status", "busy")) return;
             }
         }

@@ -1601,8 +1601,31 @@ namespace tools::types {
                         }
                         return false;
                     }
-                    if ((e->op == cot_cast || e->op == cot_ref) && e->x) {
+                    if (e->op == cot_cast && e->x) {
                         return self(self, e->x, out_off);
+                    }
+                    if (e->op == cot_ref && e->x) {
+                        const cexpr_t* object = e->x;
+                        if (object->op == cot_ptr && object->x)
+                            return self(self, object->x, out_off); // &*pointer
+                        if (object->op == cot_var && !object->type.is_ptr())
+                            return self(self, object, out_off); // address of a local object
+                        int64_t base = 0;
+                        if (object->op == cot_idx && object->x && object->y &&
+                            self(self, object->x, base)) {
+                            int64_t index = 0, scaled = 0;
+                            size_t element_size = object->type.get_size();
+                            if (element_size == 0 || element_size == BADSIZE) return false;
+                            return get_signed_number(object->y, index) &&
+                                mul_i64_size(index, element_size, scaled) && add_i64(base, scaled, out_off);
+                        }
+                        if ((object->op == cot_memptr || object->op == cot_memref) && object->x &&
+                            self(self, object->x, base)) {
+                            tinfo_t aggregate = object->x->type;
+                            if (aggregate.is_ptr()) aggregate = aggregate.get_pointed_object();
+                            return add_i64(base, aggregate.is_union() ? 0 : static_cast<int64_t>(object->m), out_off);
+                        }
+                        return false;
                     }
                     if (e->op == cot_add && e->x && e->y) {
                         int64_t sub_off = 0;
@@ -1684,6 +1707,10 @@ namespace tools::types {
                     if (!new_alias) break;
                 }
 
+                // Finish each traversal before decompiling callees. Hex-Rays must not
+                // be re-entered from a live ctree visitor.
+                std::set<std::tuple<ea_t, size_t, uint64_t>> pending_calls;
+
                 // Pass 2: Extract field accesses
                 struct StructVisitor : public ctree_visitor_t {
                     const cfunc_t* cf;
@@ -1702,7 +1729,7 @@ namespace tools::types {
                     uint64_t base_off;
                     uint64_t& total_sz;
                     std::string& total_sz_src;
-                    std::function<void(func_t*, int, int, uint64_t)> recurse_fn;
+                    std::set<std::tuple<ea_t, size_t, uint64_t>>& pending;
 
                     StructVisitor(const cfunc_t* f, decltype(is_alias_base)& it,
                                   decltype(parse_hexrays_helper)& ph, decltype(get_callee_name)& gc,
@@ -1710,14 +1737,15 @@ namespace tools::types {
                                   decltype(apply_relative_offset)& ao, decltype(add_bounded_size)& ab,
                                   std::map<uint64_t, InferredField>& flds, bool& tr,
                                   int d, int md, uint64_t bo, uint64_t& tsz, std::string& tsrc,
-                                  std::function<void(func_t*, int, int, uint64_t)> rf)
-                        : ctree_visitor_t(CV_FAST), cf(f), is_target(it), parse_helper(ph), get_cname(gc),
+                                  std::set<std::tuple<ea_t, size_t, uint64_t>>& calls)
+                        : ctree_visitor_t(CV_PARENTS), cf(f), is_target(it), parse_helper(ph), get_cname(gc),
                           add_signed(as), multiply_size(ms), get_signed(gs), apply_offset(ao), add_bounded(ab),
                           fields(flds), truncated(tr), depth(d), max_d(md), base_off(bo), total_sz(tsz), total_sz_src(tsrc),
-                          recurse_fn(rf) {}
+                          pending(calls) {}
 
                     void record_access(uint64_t f_off, size_t sz, tinfo_t tif, bool is_write,
-                                       const std::string& type_override = "", ea_t vtbl_ea = BADADDR) {
+                                       const std::string& type_override = "", ea_t vtbl_ea = BADADDR,
+                                       bool also_read = false) {
                         if (sz == 0 || sz > 128) sz = inf_is_64bit() ? 8 : 4;
                         if (f_off >= kMaxInferredStructSize || sz > kMaxInferredStructSize - f_off) {
                             truncated = true;
@@ -1734,7 +1762,7 @@ namespace tools::types {
                             f.size = sz;
                             f.access_count = 1;
                             if (is_write) f.has_write = true;
-                            else f.has_read = true;
+                            if (!is_write || also_read) f.has_read = true;
 
                             if (!type_override.empty()) {
                                 f.type_name = type_override;
@@ -1762,7 +1790,7 @@ namespace tools::types {
                         } else {
                             fit->second.access_count++;
                             if (is_write) fit->second.has_write = true;
-                            else fit->second.has_read = true;
+                            if (!is_write || also_read) fit->second.has_read = true;
                             if (sz > fit->second.size) fit->second.size = sz;
                             if (vtbl_ea != BADADDR) {
                                 fit->second.is_vftable = true;
@@ -1784,10 +1812,16 @@ namespace tools::types {
                         try {
                             sync::Checkpoint();
                             bool is_write = false;
-                            const citem_t* p = parent_expr();
-                            if (p && p->is_expr() && p->op == cot_asg) {
+                            bool also_read = false;
+                            const citem_t* p = parents.empty() ? nullptr : parents.back();
+                            if (p && p->is_expr() && (is_assignment(p->op) ||
+                                p->op == cot_preinc || p->op == cot_predec ||
+                                p->op == cot_postinc || p->op == cot_postdec)) {
                                 const cexpr_t* asg = reinterpret_cast<const cexpr_t*>(p);
-                                if (asg->x == e) is_write = true;
+                                if (asg->x == e) {
+                                    is_write = true;
+                                    also_read = p->op != cot_asg;
+                                }
                             }
 
                             // 1. Pointer dereference: *(type*)(var + offset)
@@ -1797,7 +1831,7 @@ namespace tools::types {
                                     uint64_t final_off = 0;
                                     if (apply_offset(base_off, off, final_off)) {
                                         size_t sz = e->ptrsize > 0 ? static_cast<size_t>(e->ptrsize) : e->type.get_size();
-                                        record_access(final_off, sz, e->type, is_write);
+                                        record_access(final_off, sz, e->type, is_write, "", BADADDR, also_read);
                                     } else {
                                         truncated = true;
                                     }
@@ -1813,8 +1847,9 @@ namespace tools::types {
                                     if (static_cast<uint64_t>(e->m) <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) &&
                                         add_signed(off, static_cast<int64_t>(e->m), relative_off) &&
                                         apply_offset(base_off, relative_off, final_off)) {
-                                        size_t sz = e->ptrsize > 0 ? static_cast<size_t>(e->ptrsize) : e->type.get_size();
-                                        record_access(final_off, sz, e->type, is_write);
+                                        size_t sz = e->op == cot_memptr && e->ptrsize > 0
+                                            ? static_cast<size_t>(e->ptrsize) : e->type.get_size();
+                                        record_access(final_off, sz, e->type, is_write, "", BADADDR, also_read);
                                     } else {
                                         truncated = true;
                                     }
@@ -1831,7 +1866,7 @@ namespace tools::types {
                                     uint64_t final_off = 0;
                                     if (get_signed(e->y, index) && multiply_size(index, elem_sz, scaled) &&
                                         add_signed(off, scaled, relative_off) && apply_offset(base_off, relative_off, final_off)) {
-                                        record_access(final_off, elem_sz, e->type, is_write);
+                                        record_access(final_off, elem_sz, e->type, is_write, "", BADADDR, also_read);
                                     } else {
                                         truncated = true;
                                     }
@@ -1851,7 +1886,7 @@ namespace tools::types {
                                             add_signed(off, static_cast<int64_t>(h_off), relative_off) &&
                                             apply_offset(base_off, relative_off, final_off)) {
                                             std::string t = h_signed ? ("int" + std::to_string(h_sz * 8) + "_t") : ("uint" + std::to_string(h_sz * 8) + "_t");
-                                            record_access(final_off, h_sz, tinfo_t(), is_write, t);
+                                            record_access(final_off, h_sz, tinfo_t(), is_write, t, BADADDR, also_read);
                                         } else {
                                             truncated = true;
                                         }
@@ -1876,7 +1911,8 @@ namespace tools::types {
                                         return 0;
                                     }
                                     off = combined;
-                                    sz = e->x->ptrsize > 0 ? static_cast<size_t>(e->x->ptrsize) : e->x->type.get_size();
+                                    sz = e->x->op == cot_memptr && e->x->ptrsize > 0
+                                        ? static_cast<size_t>(e->x->ptrsize) : e->x->type.get_size();
                                     is_field_write = true;
                                 } else if (e->x->op == cot_idx && e->x->x && is_target(is_target, e->x->x, off) && e->x->y && e->x->y->op == cot_num) {
                                     size_t elem_sz = e->x->type.get_size();
@@ -2076,24 +2112,10 @@ namespace tools::types {
                                                 uint64_t next_base = 0;
                                                 const bool have_next_base = apply_offset(base_off, off, next_base);
                                                 if (have_next_base && next_base <= kMaxInferredStructSize) {
-                                                    hexrays_failure_t c_hf;
-                                                    cfuncptr_t callee_cf = decompile(callee_fn, &c_hf, DECOMP_WARNINGS | DECOMP_NO_WAIT);
-                                                    if (callee_cf) {
-                                                        const lvars_t* callee_lvars = callee_cf->get_lvars();
-                                                        if (callee_lvars) {
-                                                            size_t arg_counter = 0;
-                                                            for (size_t k = 0; k < callee_lvars->size(); ++k) {
-                                                                sync::Checkpoint();
-                                                                if ((*callee_lvars)[k].is_arg_var()) {
-                                                                    if (arg_counter == a_idx) {
-                                                                        recurse_fn(callee_fn, static_cast<int>(k), depth + 1, next_base);
-                                                                        break;
-                                                                    }
-                                                                    arg_counter++;
-                                                                }
-                                                            }
-                                                        }
-                                                    }
+                                                    if (pending.size() < 128)
+                                                        pending.emplace(callee_fn->start_ea, a_idx, next_base);
+                                                    else
+                                                        truncated = true;
                                                 } else if (have_next_base) {
                                                     truncated = true;
                                                 }
@@ -2114,9 +2136,38 @@ namespace tools::types {
                 StructVisitor visitor(local_cf, is_alias_base, parse_hexrays_helper, get_callee_name,
                                       add_i64, mul_i64_size, get_signed_number, apply_relative_offset, add_bounded_size,
                                       observed_fields, scan_truncated, current_depth, max_depth, base_offset,
-                                      inferred_total_size, inferred_size_source, scan_fn);
+                                      inferred_total_size, inferred_size_source, pending_calls);
                 visitor.apply_to(&local_cf->body, nullptr);
                 sync::Checkpoint();
+                for (const auto& [callee_ea, argument, next_base] : pending_calls) {
+                    sync::Checkpoint();
+                    func_t* callee_fn = get_func(callee_ea);
+                    if (!callee_fn) continue;
+                    std::set<ea_t> thunk_chain;
+                    while ((callee_fn->flags & FUNC_THUNK) != 0 && thunk_chain.size() < 16) {
+                        if (!thunk_chain.insert(callee_fn->start_ea).second) break;
+                        const ea_t target = calc_thunk_func_target(callee_fn, nullptr);
+                        func_t* target_fn = target == BADADDR ? nullptr : get_func(target);
+                        if (!target_fn || target_fn == callee_fn) break;
+                        callee_fn = target_fn;
+                    }
+                    cfuncptr_t callee_cf(nullptr);
+                    auto cached = cfunc_cache.find(callee_fn->start_ea);
+                    if (cached != cfunc_cache.end()) {
+                        callee_cf = *cached->second;
+                    } else {
+                        hexrays_failure_t failure;
+                        callee_cf = decompile(callee_fn, &failure, DECOMP_WARNINGS | DECOMP_NO_WAIT);
+                        if (callee_cf)
+                            cfunc_cache[callee_fn->start_ea] = std::make_shared<cfuncptr_t>(callee_cf);
+                    }
+                    if (!callee_cf) continue;
+                    const lvars_t* vars = callee_cf->get_lvars();
+                    if (argument >= callee_cf->argidx.size()) continue;
+                    const int index = callee_cf->argidx[argument];
+                    if (vars && index >= 0 && static_cast<size_t>(index) < vars->size())
+                        scan_fn(callee_fn, index, current_depth + 1, next_base);
+                }
             };
 
             scan_fn(pfn, target_idx, 0, 0);

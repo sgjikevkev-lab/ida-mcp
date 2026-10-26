@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
+    <Filter Include="ui">
+      <UniqueIdentifier>{33b32a57-a595-48c4-82de-8bc732e461af}</UniqueIdentifier>
+    </Filter>
     <Filter Include="!ibs">
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
     </Filter>
@@ -111,9 +114,15 @@
     <ClInclude Include="..\shared\ida_tools_schema.h">
     </ClInclude>
     <ClInclude Include="server\status_tracker.h" />
+    <ClInclude Include="ui\settings_window.h">
+      <Filter>ui</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="ui\settings_window.cpp">
+      <Filter>ui</Filter>
+    </ClCompile>
     <ClCompile Include="server\pipe_server.cpp">
       <Filter>server</Filter>
     </ClCompile>

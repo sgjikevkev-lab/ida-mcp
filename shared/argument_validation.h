@@ -27,6 +27,10 @@ namespace mcp {
         if (value.is_string() && schema.contains("maxLength") && UnicodeLength(value.get_ref<const std::string&>()) > schema["maxLength"].get<size_t>())
             return path + ": string too long";
         if (value.is_object()) {
+            if (schema.contains("minProperties") && value.size() < schema["minProperties"].get<size_t>())
+                return path + ": too few properties";
+            if (schema.contains("maxProperties") && value.size() > schema["maxProperties"].get<size_t>())
+                return path + ": too many properties";
             if (schema.contains("required")) for (const auto& key : schema["required"])
                 if (!value.contains(key.get<std::string>())) return path + ": missing " + key.get<std::string>();
             const auto properties = schema.value("properties", nlohmann::json::object());
@@ -34,8 +38,15 @@ namespace mcp {
                 if (properties.contains(it.key())) {
                     auto error = ValidateArguments(properties[it.key()], it.value(), path + "." + it.key(), depth + 1);
                     if (!error.empty()) return error;
-                } else if (schema.value("additionalProperties", true) == false)
-                    return path + ": unknown parameter " + it.key();
+                } else if (schema.contains("additionalProperties")) {
+                    const auto& additional = schema["additionalProperties"];
+                    if (additional.is_boolean() && !additional.get<bool>())
+                        return path + ": unknown parameter " + it.key();
+                    if (additional.is_object()) {
+                        auto error = ValidateArguments(additional, it.value(), path + "." + it.key(), depth + 1);
+                        if (!error.empty()) return error;
+                    }
+                }
             }
         }
         if (value.is_array()) {
