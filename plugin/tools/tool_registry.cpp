@@ -191,7 +191,7 @@ namespace tools {
                     {"protocolVersion", "2024-11-05"},
                     {"serverInfo", {
                         {"name", "ida-pro-mcp"},
-                        {"version", "2.2.0"}
+                        {"version", "2.3.0"}
                     }},
                     {"capabilities", {
                         {"tools", nlohmann::json::object()}

@@ -6,7 +6,7 @@ Original ida-mcp code is licensed under MIT; third-party components remain
 under their own terms. See [LICENSE](LICENSE) and [NOTICE](NOTICE.md),
 especially for the IDA SDK and statically linked RAX dependency.
 
-The current release is **2.2.0**. It adds isolated x86-64 function emulation through the bundled RAX engine alongside machine-level register flow. The plugin targets Windows x64 and builds one DLL against the **IDA Pro 9.1 SDK** for the shared 9.1/9.2 API. SDK 9.2 is bundled in `plugin/!ibs/ida_92`; the local IDA 9.1 SDK belongs in `plugin/!ibs/ida_91` and is ignored by Git.
+The current release is **2.3.0**. It adds support for **IDA Pro 9.1 and 9.2** with one universal plugin DLL built against the 9.1 SDK, plus per-database MCP settings, quarantine recovery, and fixes for large-binary analysis. The plugin targets Windows x64. SDK 9.2 is bundled in `plugin/!ibs/ida_92`; the local IDA 9.1 SDK belongs in `plugin/!ibs/ida_91` and is ignored by Git.
 
 ## Model interface
 
@@ -42,7 +42,7 @@ The fixed operation deadline is **30 minutes**. Loops, recursive analysis and Py
 
 Ordinary tools run in the SDK's unattended `batch` scope, with decompiler wait boxes disabled. IDA 9.2 does not suppress `ask_file` in batch mode, so ordinary tools also block that SDK request and return an empty path. Python retains IDAPython's interactive cancellation behavior. A caught native fault quarantines the backend. Inspect `get_status.last_fault`, then explicitly call `reset_quarantine` for a resettable read access violation, or restart IDA. Reset never retries the failed request and cannot repair corrupted process memory. Write/execute access violations, noncontinuable exceptions and other native fault classes require restarting IDA.
 
-There is no guarantee against every native crash or unrelated third-party GUI callback. A hard stop for uninterruptible SDK code requires a separate process/database backend. See [architecture review](docs/architecture.md) for the ownership rules, discovered defects, changes and limits.
+There is no guarantee against every native crash or unrelated third-party GUI callback. A hard stop for uninterruptible SDK code requires a separate process/database backend.
 
 ## Install
 
